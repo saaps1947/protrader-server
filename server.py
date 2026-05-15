@@ -26,6 +26,9 @@ def nse_get(url):
     except: return None
 
 YAHOO = {"NIFTY":"^NSEI","BANKNIFTY":"^NSEBANK","SENSEX":"^BSESN","FINNIFTY":"NIFTY_FIN_SERVICE.NS","RELIANCE":"RELIANCE.NS","HDFCBANK":"HDFCBANK.NS","INDIGO":"INDIGO.NS","HAL":"HAL.NS","CRUDEOIL":"CL=F","GOLD":"GC=F"}
+# MCX commodities are USD-priced on Yahoo - multiply by INR rate for Indian prices
+MCX_SYMBOLS = {"CRUDEOIL", "GOLD"}
+INR_RATE = 84  # approximate USD/INR
 
 def yahoo(ticker, interval="5m", rng="1d"):
     try:
