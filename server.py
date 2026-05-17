@@ -1,7 +1,9 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests, json, time
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+IST = timezone(timedelta(hours=5, minutes=30))
+def now_ist(): return datetime.now(IST)
 
 app = Flask(__name__)
 CORS(app)
@@ -101,7 +103,7 @@ def calc_oi(sym):
 
 @app.route("/")
 def home():
-    return jsonify({"status":"PRO Trader Server","time":datetime.now().strftime("%d %b %Y %H:%M IST")})
+    return jsonify({"status":"PRO Trader Server","time":now_ist().strftime("%d %b %Y %H:%M IST")})
 
 @app.route("/market")
 def market():
@@ -121,7 +123,7 @@ def market():
         if sym in result:
             oi=calc_oi(sym)
             if oi: result[sym]["oi"]=oi
-    return jsonify({"ok":True,"data":result,"vix":vix_val,"time":datetime.now().strftime("%H:%M:%S")})
+    return jsonify({"ok":True,"data":result,"vix":vix_val,"time":now_ist().strftime("%H:%M:%S")})
 
 @app.route("/oi/<sym>")
 def oi(sym):
@@ -333,7 +335,7 @@ def smc_data(sym):
         "px": data.get("px", 0),
         "smc": smc,
         "candle_count": len(data.get("candles", [])),
-        "time": datetime.now().strftime("%H:%M:%S")
+        "time": now_ist().strftime("%H:%M:%S")
     })
 
 
@@ -358,6 +360,11 @@ def full_data(sym):
         "price": data,
         "smc": smc,
         "oi": oi,
-        "time": datetime.now().strftime("%H:%M:%S")
+        "time": now_ist().strftime("%H:%M:%S")
     })
 
+
+# ── Keep-alive endpoint ──
+@app.route("/ping")
+def ping():
+    return jsonify({"ok": True, "time": now_ist().strftime("%H:%M:%S IST")})
