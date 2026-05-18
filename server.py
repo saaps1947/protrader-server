@@ -70,7 +70,7 @@ def yahoo(ticker, interval="5m", rng="1d"):
     except Exception as e: return {"error":str(e),"px":0}
 
 def calc_oi(sym):
-    if sym in ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY"]:
+    if sym in ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX"]:
         url=f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
     else:
         url=f"https://www.nseindia.com/api/option-chain-equities?symbol={sym}"
