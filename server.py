@@ -89,6 +89,90 @@ def yahoo(ticker, interval="5m", rng="1d"):
                 "candles":candles[-20:]}
     except Exception as e: return {"error":str(e),"px":0}
 
+def calc_cpr(candles_daily):
+    """
+    Central Pivot Range from previous day's candles
+    CPR = (H + L + C) / 3
+    TC = (H + L) / 2 - CPR (top central)
+    BC = CPR - (H + L) / 2 (bottom central)
+    Narrow CPR = trending day, Wide CPR = sideways
+    """
+    if not candles_daily or len(candles_daily) < 2:
+        return None
+    # Use previous day's candle
+    prev = candles_daily[-2] if len(candles_daily) >= 2 else candles_daily[-1]
+    h, l, c = prev["h"], prev["l"], prev["c"]
+    pivot = (h + l + c) / 3
+    tc = (h + l) / 2
+    bc = 2 * pivot - tc
+    width = abs(tc - bc)
+    width_pct = width / pivot * 100
+    # Narrow = < 0.3% of price = trending day expected
+    is_narrow = width_pct < 0.3
+    today = candles_daily[-1]
+    px = today["c"]
+    return {
+        "pivot": round(pivot, 2),
+        "tc": round(tc, 2),
+        "bc": round(bc, 2),
+        "width": round(width, 2),
+        "width_pct": round(width_pct, 3),
+        "is_narrow": is_narrow,
+        "type": "NARROW" if is_narrow else "WIDE",
+        "bias": "BULLISH" if px > pivot else "BEARISH",
+        "px_vs_pivot": round(px - pivot, 2)
+    }
+
+def get_multi_tf(ticker):
+    """Get SMA data across 5min, 15min, 1hour timeframes"""
+    result = {}
+    try:
+        # 5-min (intraday)
+        d5 = yahoo(ticker, "5m", "1d")
+        if d5 and d5.get("sma20"):
+            result["tf5"] = {
+                "sma20": d5["sma20"], "sma50": d5["sma50"],
+                "rsi": d5["rsi"], "trend": d5["trend"],
+                "crossover": d5["crossover"],
+                "breakout": d5["breakout"], "breakdown": d5["breakdown"]
+            }
+        # 15-min (session)
+        d15 = yahoo(ticker, "15m", "5d")
+        if d15 and d15.get("sma20"):
+            result["tf15"] = {
+                "sma20": d15["sma20"], "sma50": d15["sma50"],
+                "rsi": d15["rsi"], "trend": d15["trend"],
+                "crossover": d15["crossover"]
+            }
+        # 1-hour (daily bias)
+        d1h = yahoo(ticker, "1h", "1mo")
+        if d1h and d1h.get("sma20"):
+            result["tf1h"] = {
+                "sma20": d1h["sma20"], "sma50": d1h["sma50"],
+                "sma200": d1h["sma200"], "rsi": d1h["rsi"],
+                "trend": d1h["trend"], "crossover": d1h["crossover"]
+            }
+        # CPR from daily candles
+        d1d = yahoo(ticker, "1d", "1mo")
+        if d1d and d1d.get("candles"):
+            cpr = calc_cpr(d1d["candles"])
+            if cpr:
+                result["cpr"] = cpr
+        # Alignment score
+        trends = [result.get("tf5",{}).get("trend",""),
+                  result.get("tf15",{}).get("trend",""),
+                  result.get("tf1h",{}).get("trend","")]
+        bulls = trends.count("BULLISH")
+        bears = trends.count("BEARISH")
+        if bulls == 3: result["alignment"] = "STRONG_BULL"
+        elif bulls == 2: result["alignment"] = "BULL"
+        elif bears == 3: result["alignment"] = "STRONG_BEAR"
+        elif bears == 2: result["alignment"] = "BEAR"
+        else: result["alignment"] = "MIXED"
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
 def calc_oi(sym):
     if sym in ["NIFTY","BANKNIFTY","FINNIFTY","MIDCPNIFTY","SENSEX"]:
         url=f"https://www.nseindia.com/api/option-chain-indices?symbol={sym}"
@@ -415,3 +499,14 @@ def ping():
 def usdinr():
     rate = get_usd_inr()
     return jsonify({"rate": rate, "time": now_ist().strftime("%H:%M:%S IST")})
+
+@app.route("/mtf/<sym>")
+def multi_tf(sym):
+    """Multi-timeframe SMA + CPR for a symbol"""
+    ticker = YAHOO.get(sym.upper())
+    if not ticker:
+        return jsonify({"error": "Unknown symbol"}), 400
+    data = get_multi_tf(ticker)
+    data["sym"] = sym.upper()
+    data["time"] = now_ist().strftime("%H:%M:%S IST")
+    return jsonify({"ok": True, "data": data})
