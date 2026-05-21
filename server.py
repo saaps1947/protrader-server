@@ -28,9 +28,29 @@ def nse_get(url):
     except: return None
 
 YAHOO = {"NIFTY":"^NSEI","BANKNIFTY":"^NSEBANK","SENSEX":"^BSESN","FINNIFTY":"NIFTY_FIN_SERVICE.NS","RELIANCE":"RELIANCE.NS","HDFCBANK":"HDFCBANK.NS","INDIGO":"INDIGO.NS","HAL":"HAL.NS","CRUDEOIL":"CL=F","GOLD":"GC=F"}
-# MCX commodities are USD-priced on Yahoo - multiply by INR rate for Indian prices
 MCX_SYMBOLS = {"CRUDEOIL", "GOLD"}
-INR_RATE = 84  # approximate USD/INR
+
+# Cache USD/INR rate — fetch live from Yahoo
+_usd_inr_cache = {"rate": 96.5, "ts": 0}
+
+def get_usd_inr():
+    """Fetch live USD/INR rate from Yahoo Finance"""
+    import time
+    if time.time() - _usd_inr_cache["ts"] < 300:  # cache 5 min
+        return _usd_inr_cache["rate"]
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/USDINR=X?interval=1m&range=1d",
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=5
+        ).json()
+        rate = r["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        if rate and 80 < rate < 110:  # sanity check
+            _usd_inr_cache["rate"] = rate
+            _usd_inr_cache["ts"] = time.time()
+            return rate
+    except:
+        pass
+    return _usd_inr_cache["rate"]  # fallback to cached
 
 def yahoo(ticker, interval="5m", rng="1d"):
     try:
@@ -108,11 +128,33 @@ def home():
 @app.route("/market")
 def market():
     result={}
+    usd_inr = get_usd_inr()
     for sym in ["NIFTY","BANKNIFTY","SENSEX","FINNIFTY","RELIANCE","HDFCBANK","CRUDEOIL","GOLD"]:
         ticker=YAHOO.get(sym)
         if ticker:
             d=yahoo(ticker)
-            if d and d.get("px"): result[sym]=d
+            if d and d.get("px"):
+                # Convert MCX commodity prices from USD to INR
+                if sym == "CRUDEOIL" and d["px"] < 500:
+                    # WTI price in USD -> MCX price in INR (per barrel)
+                    factor = usd_inr
+                    d["px"] = round(d["px"] * factor, 2)
+                    d["chg"] = round(d["chg"] * factor, 2)
+                    d["high"] = round(d["high"] * factor, 2) if d.get("high") else 0
+                    d["low"] = round(d["low"] * factor, 2) if d.get("low") else 0
+                    d["currency"] = "INR"
+                    d["note"] = f"MCX approx (WTI x {usd_inr:.1f})"
+                elif sym == "GOLD" and d["px"] < 5000:
+                    # Gold USD/oz -> MCX INR per 10g
+                    # 1 oz = 31.1g, MCX lot = 1kg = 1000g = per 10g unit
+                    factor = usd_inr / 31.1 * 10
+                    d["px"] = round(d["px"] * factor, 2)
+                    d["chg"] = round(d["chg"] * factor, 2)
+                    d["high"] = round(d["high"] * factor, 2) if d.get("high") else 0
+                    d["low"] = round(d["low"] * factor, 2) if d.get("low") else 0
+                    d["currency"] = "INR"
+                    d["note"] = f"MCX approx (COMEX x {factor:.1f})"
+                result[sym]=d
     vix_val=17.5
     vd=nse_get("https://www.nseindia.com/api/allIndices")
     if vd:
@@ -368,3 +410,8 @@ def full_data(sym):
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "time": now_ist().strftime("%H:%M:%S IST")})
+
+@app.route("/usdinr")
+def usdinr():
+    rate = get_usd_inr()
+    return jsonify({"rate": rate, "time": now_ist().strftime("%H:%M:%S IST")})
