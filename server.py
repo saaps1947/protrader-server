@@ -326,11 +326,24 @@ def market():
             if oi: result[sym]["oi"]=oi
     return jsonify({"ok":True,"data":result,"vix":vix_val,"time":now_ist().strftime("%H:%M:%S")})
 
+# OI data cache - serves last known data when NSE is unavailable
+_oi_cache = {}
+
 @app.route("/oi/<sym>")
 def oi(sym):
-    d=calc_oi(sym.upper())
-    if d: return jsonify({"ok":True,"sym":sym.upper(),"data":d})
-    return jsonify({"ok":False,"error":"NSE unavailable"}),503
+    sym = sym.upper()
+    d = calc_oi(sym)
+    if d:
+        _oi_cache[sym] = {"data": d, "ts": time.time()}
+        return jsonify({"ok": True, "sym": sym, "data": d, "source": "live"})
+    # Return cached data when NSE unavailable (market closed etc)
+    if sym in _oi_cache:
+        cached = _oi_cache[sym]
+        age = int((time.time() - cached["ts"]) / 60)
+        d2 = dict(cached["data"])
+        d2["note"] = "Cached ({} min ago)".format(age)
+        return jsonify({"ok": True, "sym": sym, "data": d2, "source": "cache", "age_min": age})
+    return jsonify({"ok": False, "error": "NSE unavailable and no cache yet"}), 503
 
 @app.route("/price/<sym>")
 def price(sym):
@@ -568,22 +581,28 @@ def full_data(sym):
 # ── Keep-alive endpoint ──
 @app.route("/kite_proxy")
 def kite_proxy():
-    """Proxy Kite API calls to avoid CORS issues"""
-    url = request.args.get("url","")
-    key = request.args.get("key","")
-    token = request.args.get("token","")
-    if not url or not key or not token:
-        return jsonify({"error":"missing params"}),400
-    if "kite.trade" not in url:
+    """Proxy Kite API calls to avoid browser CORS restrictions"""
+    from flask import request as req
+    url = req.args.get("url","")
+    key = req.args.get("key","")
+    token = req.args.get("token","")
+    if not url or "kite.trade" not in url:
         return jsonify({"error":"invalid url"}),400
+    if not key or not token:
+        return jsonify({"error":"missing auth"}),400
     try:
-        r = requests.get(url, headers={
-            "X-Kite-Version":"3",
-            "Authorization":"token "+key+":"+token
-        }, timeout=10)
-        return jsonify(r.json())
+        r = requests.get(url,
+            headers={
+                "X-Kite-Version":"3",
+                "Authorization":"token "+key+":"+token,
+                "User-Agent":"Mozilla/5.0"
+            },
+            timeout=15
+        )
+        data = r.json()
+        return jsonify(data)
     except Exception as e:
-        return jsonify({"error":str(e)}),503
+        return jsonify({"ok":False,"error":str(e)}),503
 
 @app.route("/ping")
 def ping():
