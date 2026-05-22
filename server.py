@@ -10,15 +10,28 @@ CORS(app)
 
 # NSE Session
 nse = requests.Session()
-nse.headers.update({"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Accept":"*/*","Referer":"https://www.nseindia.com/"})
+nse.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.nseindia.com/",
+    "X-Requested-With": "XMLHttpRequest",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin"
+})
 _nse_cookie_t = 0
 
 def nse_cookies():
     global _nse_cookie_t
-    if time.time()-_nse_cookie_t > 300:
+    if time.time()-_nse_cookie_t > 240:
         try:
-            nse.get("https://www.nseindia.com",timeout=8)
-            nse.get("https://www.nseindia.com/market-data/live-equity-market",timeout=8)
+            nse.get("https://www.nseindia.com", timeout=8)
+            time.sleep(0.5)
+            nse.get("https://www.nseindia.com/option-chain", timeout=8)
+            time.sleep(0.3)
             _nse_cookie_t = time.time()
         except: pass
 
@@ -52,7 +65,7 @@ def get_usd_inr():
         pass
     return _usd_inr_cache["rate"]  # fallback to cached
 
-def yahoo(ticker, interval="5m", rng="1d"):
+def yahoo(ticker, interval="5m", rng="2d"):
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={rng}&includePrePost=false"
         r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10).json()
@@ -202,8 +215,37 @@ def calc_oi(sym):
                 if iv: break
         ce_wall=max(strikes,key=lambda x:x["ce"])["s"] if strikes else 0
         pe_wall=max(strikes,key=lambda x:x["pe"])["s"] if strikes else 0
-        return {"ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,"pcr":pcr,"max_pain":mp,"iv":iv,"ce_wall":ce_wall,"pe_wall":pe_wall,"spot":spot,"interp":"Bullish" if pcr>1.1 else "Bearish" if pcr<0.9 else "Neutral"}
-    except: return None
+        # OI Buildup Analysis (most important for F&O)
+        buildup = "UNKNOWN"
+        if ce_chg > 0 and pe_chg > 0:
+            if pe_chg > ce_chg: buildup = "LONG_BUILDUP"      # Put writers dominant = bullish
+            else: buildup = "SHORT_BUILDUP"                     # Call writers dominant = bearish
+        elif ce_chg < 0 and pe_chg < 0:
+            if ce_chg < pe_chg: buildup = "SHORT_COVERING"    # Call longs exiting = bullish
+            else: buildup = "LONG_UNWINDING"                   # Put longs exiting = bearish
+        elif ce_chg > 0 and pe_chg < 0: buildup = "SHORT_BUILDUP"
+        elif ce_chg < 0 and pe_chg > 0: buildup = "LONG_BUILDUP"
+
+        # Top 3 CE and PE strikes by OI change
+        ce_strikes = sorted([{"s":x.get("strikePrice",0),"chg":x.get("CE",{}).get("changeinOpenInterest",0) or 0,"oi":x.get("CE",{}).get("openInterest",0) or 0,"iv":x.get("CE",{}).get("impliedVolatility",0) or 0} for x in f if x.get("CE")], key=lambda x:-x["chg"])[:3]
+        pe_strikes = sorted([{"s":x.get("strikePrice",0),"chg":x.get("PE",{}).get("changeinOpenInterest",0) or 0,"oi":x.get("PE",{}).get("openInterest",0) or 0,"iv":x.get("PE",{}).get("impliedVolatility",0) or 0} for x in f if x.get("PE")], key=lambda x:-x["chg"])[:3]
+
+        # PCR interpretation
+        if pcr > 1.4: pcr_interp = "EXTREME_BULL (contrarian — watch for reversal)"
+        elif pcr > 1.1: pcr_interp = "BULLISH — put writers active"
+        elif pcr > 0.9: pcr_interp = "NEUTRAL — watch for breakout"
+        elif pcr > 0.7: pcr_interp = "BEARISH — call writers active"
+        else: pcr_interp = "EXTREME_BEAR (contrarian — watch for bounce)"
+
+        return {"ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,
+                "pcr":pcr,"max_pain":mp,"iv":iv,"ce_wall":ce_wall,"pe_wall":pe_wall,
+                "spot":spot,"buildup":buildup,
+                "ce_top":ce_strikes,"pe_top":pe_strikes,
+                "pcr_interp":pcr_interp,
+                "mp_dist":round(spot-mp,2) if spot and mp else 0,
+                "interp":"Bullish" if pcr>1.1 else "Bearish" if pcr<0.9 else "Neutral"}
+    except Exception as e:
+        return None
 
 @app.route("/")
 def home():
