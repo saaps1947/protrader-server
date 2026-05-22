@@ -40,7 +40,38 @@ def nse_get(url):
     try: return nse.get(url,timeout=10).json()
     except: return None
 
-YAHOO = {"NIFTY":"^NSEI","BANKNIFTY":"^NSEBANK","SENSEX":"^BSESN","FINNIFTY":"NIFTY_FIN_SERVICE.NS","RELIANCE":"RELIANCE.NS","HDFCBANK":"HDFCBANK.NS","INDIGO":"INDIGO.NS","HAL":"HAL.NS","CRUDEOIL":"CL=F","GOLD":"GC=F"}
+YAHOO = {
+    # Indices
+    "NIFTY":"^NSEI","BANKNIFTY":"^NSEBANK","SENSEX":"^BSESN","FINNIFTY":"NIFTY_FIN_SERVICE.NS",
+    # Commodities
+    "CRUDEOIL":"CL=F","GOLD":"GC=F",
+    # Banking & Finance
+    "HDFCBANK":"HDFCBANK.NS","ICICIBANK":"ICICIBANK.NS","KOTAKBANK":"KOTAKBANK.NS",
+    "AXISBANK":"AXISBANK.NS","SBIN":"SBIN.NS","INDUSINDBK":"INDUSINDBK.NS",
+    "BAJFINANCE":"BAJFINANCE.NS","BAJAJFINSV":"BAJAJFINSV.NS",
+    # IT
+    "TCS":"TCS.NS","INFY":"INFY.NS","WIPRO":"WIPRO.NS","HCLTECH":"HCLTECH.NS",
+    "TECHM":"TECHM.NS","LTIM":"LTIM.NS",
+    # Energy
+    "RELIANCE":"RELIANCE.NS","ONGC":"ONGC.NS","BPCL":"BPCL.NS",
+    "POWERGRID":"POWERGRID.NS","NTPC":"NTPC.NS","COALINDIA":"COALINDIA.NS",
+    # Auto
+    "MARUTI":"MARUTI.NS","TATAMOTORS":"TATAMOTORS.NS","M&M":"M&M.NS",
+    "BAJAJ-AUTO":"BAJAJ-AUTO.NS","EICHERMOT":"EICHERMOT.NS","HEROMOTOCO":"HEROMOTOCO.NS",
+    # Pharma
+    "SUNPHARMA":"SUNPHARMA.NS","DRREDDY":"DRREDDY.NS","CIPLA":"CIPLA.NS",
+    "DIVISLAB":"DIVISLAB.NS","APOLLOHOSP":"APOLLOHOSP.NS",
+    # FMCG
+    "HINDUNILVR":"HINDUNILVR.NS","NESTLEIND":"NESTLEIND.NS","ITC":"ITC.NS",
+    "BRITANNIA":"BRITANNIA.NS","TITAN":"TITAN.NS","ASIANPAINT":"ASIANPAINT.NS",
+    "TATACONSUM":"TATACONSUM.NS","TRENT":"TRENT.NS",
+    # Metal
+    "TATASTEEL":"TATASTEEL.NS","HINDALCO":"HINDALCO.NS","JSWSTEEL":"JSWSTEEL.NS",
+    # Infra & Others
+    "LT":"LT.NS","ADANIPORTS":"ADANIPORTS.NS","ULTRACEMCO":"ULTRACEMCO.NS",
+    "GRASIM":"GRASIM.NS","BHARTIARTL":"BHARTIARTL.NS","SHRIRAMFIN":"SHRIRAMFIN.NS",
+    "BEL":"BEL.NS","INDIGO":"INDIGO.NS","HAL":"HAL.NS"
+}
 MCX_SYMBOLS = {"CRUDEOIL", "GOLD"}
 
 # Cache USD/INR rate — fetch live from Yahoo
@@ -255,7 +286,9 @@ def home():
 def market():
     result={}
     usd_inr = get_usd_inr()
-    for sym in ["NIFTY","BANKNIFTY","SENSEX","FINNIFTY","RELIANCE","HDFCBANK","CRUDEOIL","GOLD"]:
+    # Fetch all available instruments
+    all_syms = list(YAHOO.keys())
+    for sym in all_syms:
         ticker=YAHOO.get(sym)
         if ticker:
             d=yahoo(ticker)
