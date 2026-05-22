@@ -566,6 +566,25 @@ def full_data(sym):
 
 
 # ── Keep-alive endpoint ──
+@app.route("/kite_proxy")
+def kite_proxy():
+    """Proxy Kite API calls to avoid CORS issues"""
+    url = request.args.get("url","")
+    key = request.args.get("key","")
+    token = request.args.get("token","")
+    if not url or not key or not token:
+        return jsonify({"error":"missing params"}),400
+    if "kite.trade" not in url:
+        return jsonify({"error":"invalid url"}),400
+    try:
+        r = requests.get(url, headers={
+            "X-Kite-Version":"3",
+            "Authorization":"token "+key+":"+token
+        }, timeout=10)
+        return jsonify(r.json())
+    except Exception as e:
+        return jsonify({"error":str(e)}),503
+
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "time": now_ist().strftime("%H:%M:%S IST")})
