@@ -650,18 +650,29 @@ def zerodha_oi():
         if not spot:
             return jsonify({"ok":False,"error":"Could not get spot price"}),503
         
+        # Validate token first with a lightweight call
+        try:
+            profile_r = requests.get("https://api.kite.trade/user/profile", 
+                headers=headers, timeout=8)
+            if profile_r.status_code == 403:
+                return jsonify({"ok":False,"error":"Zerodha token expired. Please reconnect in Settings.","code":403}),403
+            elif profile_r.status_code != 200:
+                return jsonify({"ok":False,"error":f"Kite auth failed: {profile_r.status_code}","code":profile_r.status_code}),503
+        except Exception as e:
+            return jsonify({"ok":False,"error":f"Cannot reach Kite: {str(e)}"}),503
+        
         # Get nearest expiry instruments
         # Fetch NFO instruments dump (cached - only update if stale)
         now_ts = time.time()
-        if not hasattr(zerodha_oi,'_inst_cache') or (now_ts - getattr(zerodha_oi,'_inst_ts',0)) > 3600:
+        cache_key = f"inst_{sym}"
+        if not hasattr(zerodha_oi,'_caches'): zerodha_oi._caches={}
+        if cache_key not in zerodha_oi._caches or (now_ts - zerodha_oi._caches[cache_key].get('ts',0)) > 3600:
             r = requests.get("https://api.kite.trade/instruments/NFO",
                 headers=headers, timeout=30)
             if r.status_code != 200:
-                return jsonify({"ok":False,"error":f"Kite instruments: {r.status_code}"}),503
-            zerodha_oi._inst_cache = r.text
-            zerodha_oi._inst_ts = now_ts
-        
-        inst_csv = zerodha_oi._inst_cache
+                return jsonify({"ok":False,"error":f"Kite instruments failed: {r.status_code}"}),503
+            zerodha_oi._caches[cache_key] = {'data': r.text, 'ts': now_ts}
+        inst_csv = zerodha_oi._caches[cache_key]['data']
         lines = inst_csv.strip().split("\n")
         
         # Find ATM ± 10 strikes for nearest expiry
@@ -818,6 +829,35 @@ def zerodha_oi():
     except Exception as e:
         import traceback
         return jsonify({"ok":False,"error":str(e),"trace":traceback.format_exc()[-500:]}),503
+
+@app.route("/debug_oi")
+def debug_oi():
+    """Debug endpoint - shows exactly what OI fetch returns"""
+    from flask import request as req
+    sym = req.args.get("sym","NIFTY").upper()
+    key = req.args.get("key","")
+    token = req.args.get("token","")
+    result = {"sym":sym,"has_key":bool(key),"has_token":bool(token),
+              "key_prefix":key[:8]+"..." if key else "EMPTY",
+              "nse_test":None,"kite_test":None}
+    # Test Kite token validity
+    if key and token:
+        try:
+            h = {"X-Kite-Version":"3","Authorization":f"token {key}:{token}"}
+            r = requests.get("https://api.kite.trade/user/profile",headers=h,timeout=10)
+            result["kite_test"] = {"status":r.status_code,"ok":r.status_code==200,
+                                    "response":r.json() if r.status_code==200 else r.text[:200]}
+        except Exception as e:
+            result["kite_test"] = {"error":str(e)}
+    # Test NSE directly
+    try:
+        nse_cookies()
+        r2 = nse.get("https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",timeout=10)
+        result["nse_test"] = {"status":r2.status_code,"ok":r2.status_code==200,
+                               "has_data":bool(r2.status_code==200 and r2.json().get("filtered"))}
+    except Exception as e:
+        result["nse_test"] = {"error":str(e)}
+    return jsonify(result)
 
 @app.route("/ping")
 def ping():
