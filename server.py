@@ -607,131 +607,217 @@ def kite_proxy():
 
 @app.route("/zerodha_oi")
 def zerodha_oi():
-    """
-    Fetch option chain OI data from Zerodha Kite API (server-side = no CORS).
-    App passes its API key and token. Server calls Kite and returns clean OI data.
-    """
+    """Fetch OI from Zerodha Kite - server-side to avoid CORS"""
     from flask import request as req
     sym = req.args.get("sym","NIFTY").upper()
     key = req.args.get("key","")
     token = req.args.get("token","")
     if not key or not token:
-        return jsonify({"ok":False,"error":"No Kite credentials"}),400
+        return jsonify({"ok":False,"error":"No credentials"}),400
     
     headers = {
-        "X-Kite-Version": "3",
-        "Authorization": f"token {key}:{token}",
-        "User-Agent": "Mozilla/5.0"
+        "X-Kite-Version":"3",
+        "Authorization":f"token {key}:{token}",
+        "User-Agent":"Mozilla/5.0"
     }
     
     try:
-        # Step 1: Get instruments list to find correct tokens for this symbol
-        # Use Kite's instruments dump to find option tokens
-        # Format: https://api.kite.trade/instruments/NFO
-        inst_url = "https://api.kite.trade/instruments/NFO"
-        r = requests.get(inst_url, headers=headers, timeout=20)
-        if r.status_code != 200:
-            return jsonify({"ok":False,"error":f"Kite instruments: {r.status_code}"}),503
-        
-        # Parse CSV
-        lines = r.text.strip().split("\n")
-        headers_row = lines[0].split(",")
-        
-        ce_oi = 0; pe_oi = 0; ce_chg = 0; pe_chg = 0
-        strikes_data = {}
+        # Get spot price first
+        idx_map = {
+            "NIFTY":"NSE:NIFTY 50",
+            "BANKNIFTY":"NSE:NIFTY BANK", 
+            "FINNIFTY":"NSE:NIFTY FIN SERVICE",
+            "SENSEX":"BSE:SENSEX"
+        }
         spot = 0
-        
-        # Get today's nearest expiry
-        from datetime import datetime, timedelta
-        today = datetime.now()
-        
-        for line in lines[1:]:
-            cols = line.split(",")
-            if len(cols) < 12: continue
-            try:
-                name = cols[2]  # tradingsymbol
-                inst_type = cols[9]  # instrument_type
-                strike = float(cols[6]) if cols[6] else 0
-                exp_date = cols[5]  # expiry
-                oi = int(cols[12]) if len(cols)>12 and cols[12] else 0
-                
-                if not name.startswith(sym): continue
-                if inst_type not in ["CE","PE"]: continue
-                
-                # Only count nearest expiry
-                try:
-                    exp = datetime.strptime(exp_date, "%Y-%m-%d")
-                    days_to_exp = (exp - today).days
-                    if days_to_exp < 0 or days_to_exp > 8: continue  # only weekly
-                except: continue
-                
-                if inst_type == "CE":
-                    ce_oi += oi
-                    if strike not in strikes_data: strikes_data[strike] = {"ce":0,"pe":0}
-                    strikes_data[strike]["ce"] = oi
-                else:
-                    pe_oi += oi
-                    if strike not in strikes_data: strikes_data[strike] = {"ce":0,"pe":0}
-                    strikes_data[strike]["pe"] = oi
-            except: continue
-        
-        if not ce_oi and not pe_oi:
-            return jsonify({"ok":False,"error":"No F&O data found for "+sym}),503
-        
-        pcr = round(pe_oi/ce_oi, 2) if ce_oi else 0
-        
-        # Max Pain
-        mp = 0; mpv = float('inf')
-        for s_strike in sorted(strikes_data.keys()):
-            pain = sum(
-                max(0, x-s_strike)*strikes_data[x]["ce"] + 
-                max(0, s_strike-x)*strikes_data[x]["pe"]
-                for x in strikes_data
-            )
-            if pain < mpv: mpv=pain; mp=s_strike
-        
-        # CE/PE walls (max OI strikes)
-        ce_wall = max(strikes_data, key=lambda x: strikes_data[x]["ce"], default=0)
-        pe_wall = max(strikes_data, key=lambda x: strikes_data[x]["pe"], default=0)
-        
-        # Get spot price
-        try:
-            spot_map = {"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK","FINNIFTY":"NSE:NIFTY FIN SERVICE"}
-            quote_url = f"https://api.kite.trade/quote?i={spot_map.get(sym,'NSE:NIFTY 50')}"
-            rq = requests.get(quote_url, headers=headers, timeout=10).json()
-            for k,v in (rq.get("data") or {}).items():
+        idx_sym = idx_map.get(sym)
+        if idx_sym:
+            qr = requests.get(
+                f"https://api.kite.trade/quote?i={requests.utils.quote(idx_sym)}",
+                headers=headers, timeout=10
+            ).json()
+            for k2,v in (qr.get("data") or {}).items():
                 spot = v.get("last_price",0)
                 break
-        except: pass
         
-        # PCR interpretation
-        if pcr > 1.4: pcr_interp = "EXTREME_BULL (reversal likely)"
-        elif pcr > 1.1: pcr_interp = "BULLISH — put writers active"
-        elif pcr > 0.9: pcr_interp = "NEUTRAL"
-        elif pcr > 0.7: pcr_interp = "BEARISH — call writers active"
-        else: pcr_interp = "EXTREME_BEAR (bounce likely)"
+        if not spot:
+            # fallback: get from our market data
+            ticker = YAHOO.get(sym)
+            if ticker:
+                d = yahoo(ticker)
+                spot = d.get("px",0) if d else 0
         
-        # Buildup (simple: based on PCR direction vs price)
-        buildup = "LONG_BUILDUP" if pcr > 1.1 else "SHORT_BUILDUP" if pcr < 0.9 else "NEUTRAL"
+        if not spot:
+            return jsonify({"ok":False,"error":"Could not get spot price"}),503
+        
+        # Get nearest expiry instruments
+        # Fetch NFO instruments dump (cached - only update if stale)
+        now_ts = time.time()
+        if not hasattr(zerodha_oi,'_inst_cache') or (now_ts - getattr(zerodha_oi,'_inst_ts',0)) > 3600:
+            r = requests.get("https://api.kite.trade/instruments/NFO",
+                headers=headers, timeout=30)
+            if r.status_code != 200:
+                return jsonify({"ok":False,"error":f"Kite instruments: {r.status_code}"}),503
+            zerodha_oi._inst_cache = r.text
+            zerodha_oi._inst_ts = now_ts
+        
+        inst_csv = zerodha_oi._inst_cache
+        lines = inst_csv.strip().split("\n")
+        
+        # Find ATM ± 10 strikes for nearest expiry
+        step = 50 if sym=="NIFTY" or sym=="FINNIFTY" else 100
+        atm = round(spot/step)*step
+        target_strikes = set(range(int(atm-step*10), int(atm+step*11), step))
+        
+        # Parse instruments - find nearest expiry options
+        from datetime import datetime
+        today = datetime.now()
+        best_exp = None
+        exp_days = 999
+        
+        # First pass: find nearest expiry
+        for line in lines[1:1000]:
+            cols = line.split(",")
+            if len(cols)<10: continue
+            if not cols[2].startswith(sym): continue
+            if cols[9] not in ["CE","PE"]: continue
+            try:
+                exp = datetime.strptime(cols[5],"%Y-%m-%d")
+                d2 = (exp-today).days
+                if 0 <= d2 < exp_days:
+                    exp_days = d2
+                    best_exp = cols[5]
+            except: continue
+        
+        if not best_exp:
+            return jsonify({"ok":False,"error":"No expiry found"}),503
+        
+        # Second pass: get instrument tokens for this expiry
+        inst_tokens = []
+        for line in lines[1:]:
+            cols = line.split(",")
+            if len(cols)<10: continue
+            if not cols[2].startswith(sym): continue
+            if cols[9] not in ["CE","PE"]: continue
+            if cols[5] != best_exp: continue
+            try:
+                strike = float(cols[6])
+                if strike not in target_strikes: continue
+                inst_tokens.append({
+                    "token": cols[0],
+                    "tradingsymbol": cols[2],
+                    "strike": strike,
+                    "type": cols[9]
+                })
+            except: continue
+        
+        if not inst_tokens:
+            return jsonify({"ok":False,"error":"No instruments found"}),503
+        
+        # Fetch live quotes for all these instruments (in batches of 50)
+        ce_oi = 0; pe_oi = 0; ce_chg = 0; pe_chg = 0
+        strikes_data = {}
+        iv_atm = 0
+        
+        batch_size = 50
+        for batch_start in range(0, len(inst_tokens), batch_size):
+            batch = inst_tokens[batch_start:batch_start+batch_size]
+            qs = "&".join(f"i=NFO:{t['tradingsymbol']}" for t in batch)
+            qr = requests.get(
+                f"https://api.kite.trade/quote?{qs}",
+                headers=headers, timeout=15
+            ).json()
+            
+            data = qr.get("data",{})
+            for t in batch:
+                key2 = f"NFO:{t['tradingsymbol']}"
+                q = data.get(key2,{})
+                if not q: continue
+                oi = q.get("oi",0) or 0
+                oi_day = q.get("oi_day_high",0) or 0
+                prev_oi = q.get("oi_day_low",0) or 0  # approximate
+                chg = oi - prev_oi if prev_oi else 0
+                
+                s = t["strike"]
+                if s not in strikes_data:
+                    strikes_data[s] = {"ce":0,"pe":0,"ce_chg":0,"pe_chg":0}
+                
+                if t["type"]=="CE":
+                    ce_oi += oi
+                    ce_chg += chg
+                    strikes_data[s]["ce"] = oi
+                    strikes_data[s]["ce_chg"] = chg
+                    # Get IV for ATM
+                    if abs(s-atm) < step*2:
+                        depth = q.get("depth",{})
+                        iv_atm = 0  # IV not in quote directly
+                else:
+                    pe_oi += oi
+                    pe_chg += chg
+                    strikes_data[s]["pe"] = oi
+                    strikes_data[s]["pe_chg"] = chg
+        
+        if not ce_oi and not pe_oi:
+            # If quote gives 0, fall back to instruments CSV OI (previous day)
+            for line in lines[1:]:
+                cols = line.split(",")
+                if len(cols)<13: continue
+                if not cols[2].startswith(sym): continue
+                if cols[9] not in ["CE","PE"]: continue
+                if cols[5] != best_exp: continue
+                try:
+                    strike = float(cols[6])
+                    oi = int(cols[12]) if cols[12] else 0
+                    if cols[9]=="CE": ce_oi += oi
+                    else: pe_oi += oi
+                    if strike not in strikes_data:
+                        strikes_data[strike]={"ce":0,"pe":0}
+                    strikes_data[strike][cols[9].lower()] = oi
+                except: continue
+        
+        pcr = round(pe_oi/ce_oi,2) if ce_oi else 0
+        
+        # Max Pain
+        mp = 0; mpv = float("inf")
+        for s in strikes_data:
+            pain = sum(
+                max(0,x-s)*strikes_data[x]["ce"]+max(0,s-x)*strikes_data[x]["pe"]
+                for x in strikes_data
+            )
+            if pain<mpv: mpv=pain; mp=s
+        
+        ce_wall = max(strikes_data, key=lambda x:strikes_data[x]["ce"], default=0)
+        pe_wall = max(strikes_data, key=lambda x:strikes_data[x]["pe"], default=0)
+        
+        # Buildup
+        if ce_chg>0 and pe_chg>0:
+            buildup = "LONG_BUILDUP" if pe_chg>ce_chg else "SHORT_BUILDUP"
+        elif ce_chg<0 and pe_chg<0:
+            buildup = "SHORT_COVERING" if ce_chg<pe_chg else "LONG_UNWINDING"
+        elif ce_chg>0: buildup="SHORT_BUILDUP"
+        elif pe_chg>0: buildup="LONG_BUILDUP"
+        else: buildup="UNKNOWN"
+        
+        pcr_interp = ("EXTREME_BULL" if pcr>1.4 else "BULLISH" if pcr>1.1 
+                      else "NEUTRAL" if pcr>0.9 else "BEARISH" if pcr>0.7 else "EXTREME_BEAR")
         
         return jsonify({
-            "ok": True,
-            "sym": sym,
-            "data": {
-                "ce_oi": ce_oi, "pe_oi": pe_oi,
-                "ce_chg": 0, "pe_chg": 0,
-                "pcr": pcr, "max_pain": mp,
-                "ce_wall": ce_wall, "pe_wall": pe_wall,
-                "iv": 0, "spot": spot,
-                "buildup": buildup,
-                "pcr_interp": pcr_interp,
-                "mp_dist": round(spot-mp, 0) if spot else 0,
-                "source": "zerodha_kite"
+            "ok":True, "sym":sym,
+            "data":{
+                "ce_oi":ce_oi,"pe_oi":pe_oi,
+                "ce_chg":ce_chg,"pe_chg":pe_chg,
+                "pcr":pcr,"max_pain":int(mp),"iv":iv_atm,
+                "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
+                "spot":spot,"buildup":buildup,"pcr_interp":pcr_interp,
+                "mp_dist":round(spot-mp,0) if mp else 0,
+                "source":"zerodha_kite","expiry":best_exp,
+                "instruments_count":len(inst_tokens)
             },
-            "time": now_ist().strftime("%H:%M:%S IST")
+            "time":now_ist().strftime("%H:%M:%S IST")
         })
     except Exception as e:
-        return jsonify({"ok":False,"error":str(e)}),503
+        import traceback
+        return jsonify({"ok":False,"error":str(e),"trace":traceback.format_exc()[-500:]}),503
 
 @app.route("/ping")
 def ping():
