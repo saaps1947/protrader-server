@@ -604,6 +604,135 @@ def kite_proxy():
     except Exception as e:
         return jsonify({"ok":False,"error":str(e)}),503
 
+
+@app.route("/zerodha_oi")
+def zerodha_oi():
+    """
+    Fetch option chain OI data from Zerodha Kite API (server-side = no CORS).
+    App passes its API key and token. Server calls Kite and returns clean OI data.
+    """
+    from flask import request as req
+    sym = req.args.get("sym","NIFTY").upper()
+    key = req.args.get("key","")
+    token = req.args.get("token","")
+    if not key or not token:
+        return jsonify({"ok":False,"error":"No Kite credentials"}),400
+    
+    headers = {
+        "X-Kite-Version": "3",
+        "Authorization": f"token {key}:{token}",
+        "User-Agent": "Mozilla/5.0"
+    }
+    
+    try:
+        # Step 1: Get instruments list to find correct tokens for this symbol
+        # Use Kite's instruments dump to find option tokens
+        # Format: https://api.kite.trade/instruments/NFO
+        inst_url = "https://api.kite.trade/instruments/NFO"
+        r = requests.get(inst_url, headers=headers, timeout=20)
+        if r.status_code != 200:
+            return jsonify({"ok":False,"error":f"Kite instruments: {r.status_code}"}),503
+        
+        # Parse CSV
+        lines = r.text.strip().split("\n")
+        headers_row = lines[0].split(",")
+        
+        ce_oi = 0; pe_oi = 0; ce_chg = 0; pe_chg = 0
+        strikes_data = {}
+        spot = 0
+        
+        # Get today's nearest expiry
+        from datetime import datetime, timedelta
+        today = datetime.now()
+        
+        for line in lines[1:]:
+            cols = line.split(",")
+            if len(cols) < 12: continue
+            try:
+                name = cols[2]  # tradingsymbol
+                inst_type = cols[9]  # instrument_type
+                strike = float(cols[6]) if cols[6] else 0
+                exp_date = cols[5]  # expiry
+                oi = int(cols[12]) if len(cols)>12 and cols[12] else 0
+                
+                if not name.startswith(sym): continue
+                if inst_type not in ["CE","PE"]: continue
+                
+                # Only count nearest expiry
+                try:
+                    exp = datetime.strptime(exp_date, "%Y-%m-%d")
+                    days_to_exp = (exp - today).days
+                    if days_to_exp < 0 or days_to_exp > 8: continue  # only weekly
+                except: continue
+                
+                if inst_type == "CE":
+                    ce_oi += oi
+                    if strike not in strikes_data: strikes_data[strike] = {"ce":0,"pe":0}
+                    strikes_data[strike]["ce"] = oi
+                else:
+                    pe_oi += oi
+                    if strike not in strikes_data: strikes_data[strike] = {"ce":0,"pe":0}
+                    strikes_data[strike]["pe"] = oi
+            except: continue
+        
+        if not ce_oi and not pe_oi:
+            return jsonify({"ok":False,"error":"No F&O data found for "+sym}),503
+        
+        pcr = round(pe_oi/ce_oi, 2) if ce_oi else 0
+        
+        # Max Pain
+        mp = 0; mpv = float('inf')
+        for s_strike in sorted(strikes_data.keys()):
+            pain = sum(
+                max(0, x-s_strike)*strikes_data[x]["ce"] + 
+                max(0, s_strike-x)*strikes_data[x]["pe"]
+                for x in strikes_data
+            )
+            if pain < mpv: mpv=pain; mp=s_strike
+        
+        # CE/PE walls (max OI strikes)
+        ce_wall = max(strikes_data, key=lambda x: strikes_data[x]["ce"], default=0)
+        pe_wall = max(strikes_data, key=lambda x: strikes_data[x]["pe"], default=0)
+        
+        # Get spot price
+        try:
+            spot_map = {"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK","FINNIFTY":"NSE:NIFTY FIN SERVICE"}
+            quote_url = f"https://api.kite.trade/quote?i={spot_map.get(sym,'NSE:NIFTY 50')}"
+            rq = requests.get(quote_url, headers=headers, timeout=10).json()
+            for k,v in (rq.get("data") or {}).items():
+                spot = v.get("last_price",0)
+                break
+        except: pass
+        
+        # PCR interpretation
+        if pcr > 1.4: pcr_interp = "EXTREME_BULL (reversal likely)"
+        elif pcr > 1.1: pcr_interp = "BULLISH — put writers active"
+        elif pcr > 0.9: pcr_interp = "NEUTRAL"
+        elif pcr > 0.7: pcr_interp = "BEARISH — call writers active"
+        else: pcr_interp = "EXTREME_BEAR (bounce likely)"
+        
+        # Buildup (simple: based on PCR direction vs price)
+        buildup = "LONG_BUILDUP" if pcr > 1.1 else "SHORT_BUILDUP" if pcr < 0.9 else "NEUTRAL"
+        
+        return jsonify({
+            "ok": True,
+            "sym": sym,
+            "data": {
+                "ce_oi": ce_oi, "pe_oi": pe_oi,
+                "ce_chg": 0, "pe_chg": 0,
+                "pcr": pcr, "max_pain": mp,
+                "ce_wall": ce_wall, "pe_wall": pe_wall,
+                "iv": 0, "spot": spot,
+                "buildup": buildup,
+                "pcr_interp": pcr_interp,
+                "mp_dist": round(spot-mp, 0) if spot else 0,
+                "source": "zerodha_kite"
+            },
+            "time": now_ist().strftime("%H:%M:%S IST")
+        })
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}),503
+
 @app.route("/ping")
 def ping():
     return jsonify({"ok": True, "time": now_ist().strftime("%H:%M:%S IST")})
