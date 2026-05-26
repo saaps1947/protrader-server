@@ -650,17 +650,6 @@ def zerodha_oi():
         if not spot:
             return jsonify({"ok":False,"error":"Could not get spot price"}),503
         
-        # Validate token first with a lightweight call
-        try:
-            profile_r = requests.get("https://api.kite.trade/user/profile", 
-                headers=headers, timeout=8)
-            if profile_r.status_code == 403:
-                return jsonify({"ok":False,"error":"Zerodha token expired. Please reconnect in Settings.","code":403}),403
-            elif profile_r.status_code != 200:
-                return jsonify({"ok":False,"error":f"Kite auth failed: {profile_r.status_code}","code":profile_r.status_code}),503
-        except Exception as e:
-            return jsonify({"ok":False,"error":f"Cannot reach Kite: {str(e)}"}),503
-        
         # Get nearest expiry instruments
         # Fetch NFO instruments dump (cached - only update if stale)
         now_ts = time.time()
@@ -669,8 +658,10 @@ def zerodha_oi():
         if cache_key not in zerodha_oi._caches or (now_ts - zerodha_oi._caches[cache_key].get('ts',0)) > 3600:
             r = requests.get("https://api.kite.trade/instruments/NFO",
                 headers=headers, timeout=30)
-            if r.status_code != 200:
-                return jsonify({"ok":False,"error":f"Kite instruments failed: {r.status_code}"}),503
+            if r.status_code in [403, 401]:
+                return jsonify({"ok":False,"error":"Zerodha token expired. Reconnect in Settings.","code":403}),403
+            elif r.status_code != 200:
+                return jsonify({"ok":False,"error":f"Kite error: {r.status_code}"}),503
             zerodha_oi._caches[cache_key] = {'data': r.text, 'ts': now_ts}
         inst_csv = zerodha_oi._caches[cache_key]['data']
         lines = inst_csv.strip().split("\n")
@@ -734,10 +725,13 @@ def zerodha_oi():
         for batch_start in range(0, len(inst_tokens), batch_size):
             batch = inst_tokens[batch_start:batch_start+batch_size]
             qs = "&".join(f"i=NFO:{t['tradingsymbol']}" for t in batch)
-            qr = requests.get(
+            quote_resp = requests.get(
                 f"https://api.kite.trade/quote?{qs}",
                 headers=headers, timeout=15
-            ).json()
+            )
+            if quote_resp.status_code in [403,401]:
+                return jsonify({"ok":False,"error":"Zerodha token expired. Reconnect in Settings.","code":403}),403
+            qr = quote_resp.json()
             
             data = qr.get("data",{})
             for t in batch:
