@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests, json, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 IST = timezone(timedelta(hours=5, minutes=30))
 def now_ist(): return datetime.now(IST)
@@ -313,7 +314,6 @@ def stocks():
 
 @app.route("/market")
 def market():
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     result = {}
     usd_inr = get_usd_inr()
 
@@ -342,11 +342,13 @@ def market():
                 if d: result[sym] = d
             except: pass
 
-    # VIX from Yahoo (no NSE dependency)
+    # VIX - use hardcoded fallback (reliable)
     vix_val = 17.5
     try:
-        vd = yahoo("^INDIAVIX")
-        if vd and vd.get("px"): vix_val = vd["px"]
+        vd = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX?interval=1d&range=1d",
+            headers={"User-Agent":"Mozilla/5.0"}, timeout=5).json()
+        px = vd["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        if px: vix_val = round(px, 2)
     except: pass
 
     return jsonify({"ok":True,"data":result,"vix":vix_val,"time":now_ist().strftime("%H:%M:%S")})
