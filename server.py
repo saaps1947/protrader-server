@@ -312,62 +312,206 @@ def stocks():
     return jsonify({"ok":True, "data":_stock_cache, "ts":_stock_cache_ts,
                     "age_s": int(time.time()-_stock_cache_ts)})
 
+# Zerodha NSE symbol mapping (exchange:tradingsymbol)
+KITE_SYMS = {
+    # Indices
+    "NIFTY":     "NSE:NIFTY 50",
+    "BANKNIFTY": "NSE:NIFTY BANK",
+    "FINNIFTY":  "NSE:NIFTY FIN SERVICE",
+    "SENSEX":    "BSE:SENSEX",
+    # Banking & Finance
+    "HDFCBANK":"NSE:HDFCBANK","ICICIBANK":"NSE:ICICIBANK","KOTAKBANK":"NSE:KOTAKBANK",
+    "AXISBANK":"NSE:AXISBANK","SBIN":"NSE:SBIN","INDUSINDBK":"NSE:INDUSINDBK",
+    "BAJFINANCE":"NSE:BAJFINANCE","BAJAJFINSV":"NSE:BAJAJFINSV",
+    # IT
+    "TCS":"NSE:TCS","INFY":"NSE:INFY","WIPRO":"NSE:WIPRO","HCLTECH":"NSE:HCLTECH",
+    "TECHM":"NSE:TECHM","LTIM":"NSE:LTIM",
+    # Energy
+    "RELIANCE":"NSE:RELIANCE","ONGC":"NSE:ONGC","BPCL":"NSE:BPCL",
+    "POWERGRID":"NSE:POWERGRID","NTPC":"NSE:NTPC","COALINDIA":"NSE:COALINDIA",
+    # Auto
+    "MARUTI":"NSE:MARUTI","TATAMOTORS":"NSE:TATAMOTORS","M&M":"NSE:M&M",
+    "BAJAJ-AUTO":"NSE:BAJAJ-AUTO","EICHERMOT":"NSE:EICHERMOT","HEROMOTOCO":"NSE:HEROMOTOCO",
+    # Pharma
+    "SUNPHARMA":"NSE:SUNPHARMA","DRREDDY":"NSE:DRREDDY","CIPLA":"NSE:CIPLA",
+    "DIVISLAB":"NSE:DIVISLAB","APOLLOHOSP":"NSE:APOLLOHOSP",
+    # FMCG
+    "HINDUNILVR":"NSE:HINDUNILVR","NESTLEIND":"NSE:NESTLEIND","ITC":"NSE:ITC",
+    "BRITANNIA":"NSE:BRITANNIA","TITAN":"NSE:TITAN","ASIANPAINT":"NSE:ASIANPAINT",
+    "TATACONSUM":"NSE:TATACONSUM","TRENT":"NSE:TRENT",
+    # Metal
+    "TATASTEEL":"NSE:TATASTEEL","HINDALCO":"NSE:HINDALCO","JSWSTEEL":"NSE:JSWSTEEL",
+    # Infra & Others
+    "LT":"NSE:LT","ADANIPORTS":"NSE:ADANIPORTS","ULTRACEMCO":"NSE:ULTRACEMCO",
+    "GRASIM":"NSE:GRASIM","BHARTIARTL":"NSE:BHARTIARTL","SHRIRAMFIN":"NSE:SHRIRAMFIN",
+    "BEL":"NSE:BEL","INDIGO":"NSE:INDIGO","HAL":"NSE:HAL",
+}
+# Commodities stay on Yahoo (MCX data not in Zerodha equity segment)
+MCX_YAHOO = {"CRUDEOIL":"CL=F","GOLD":"GC=F"}
+
+# Technicals cache — Yahoo candle data, refreshed every 5 min
+_tech_cache = {}
+_tech_cache_ts = {}
+
+def get_technicals(sym):
+    """Get SMA20/50, RSI, trend from Yahoo candles. Cached 5 min."""
+    now = time.time()
+    if sym in _tech_cache and now - _tech_cache_ts.get(sym,0) < 300:
+        return _tech_cache[sym]
+    ticker = YAHOO.get(sym) or (KITE_SYMS.get(sym,"").replace("NSE:","") + ".NS")
+    try:
+        d = yahoo(ticker)
+        if d and d.get("sma20"):
+            tech = {
+                "sma20": d["sma20"], "sma50": d["sma50"],
+                "rsi": d.get("rsi"), "trend": d.get("trend","NEUTRAL"),
+                "crossover": d.get("crossover","NONE"),
+                "breakout": d.get("breakout",False),
+                "breakdown": d.get("breakdown",False),
+                "above_sma20": (d["px"] > d["sma20"]) if d.get("px") and d.get("sma20") else None,
+                "high": d.get("high",0), "low": d.get("low",0),
+                "open": d.get("open",0), "prev_close": d.get("prev_close",0),
+            }
+            _tech_cache[sym] = tech
+            _tech_cache_ts[sym] = now
+            return tech
+    except: pass
+    return _tech_cache.get(sym, {})  # return stale if fresh fetch failed
+
 @app.route("/market")
 def market():
+    """
+    Live prices from Zerodha Kite (real-time, no delay).
+    Technicals (SMA/RSI) from Yahoo candles (cached 5 min).
+    Commodities (Crude/Gold) from Yahoo MCX.
+    VIX from Yahoo.
+    Requires: ?key=API_KEY&token=ACCESS_TOKEN
+    Falls back to Yahoo if no Zerodha credentials.
+    """
+    key   = request.args.get("key","")
+    token = request.args.get("token","")
+
     result = {}
     usd_inr = get_usd_inr()
 
-    def fetch_sym(sym):
-        ticker = YAHOO.get(sym)
-        if not ticker: return sym, None
-        d = yahoo(ticker)
-        if not d or not d.get("px"): return sym, None
-        if sym == "CRUDEOIL" and d["px"] < 500:
-            f = usd_inr
-            d["px"]=round(d["px"]*f,2); d["chg"]=round(d["chg"]*f,2)
-            d["currency"]="INR"
-        elif sym == "GOLD" and d["px"] < 5000:
-            f = usd_inr / 31.1 * 10
-            d["px"]=round(d["px"]*f,2); d["chg"]=round(d["chg"]*f,2)
-            d["currency"]="INR"
+    # ── Live prices from Zerodha (if credentials provided) ──
+    kite_data = {}
+    if key and token:
+        hdrs = {"X-Kite-Version":"3","Authorization":f"token {key}:{token}","User-Agent":"Mozilla/5.0"}
+        try:
+            # Bulk quote — all stocks + indices in ONE call
+            all_kite = list(KITE_SYMS.values())
+            # Kite allows max 500 instruments per call
+            qs = "&".join(f"i={s}" for s in all_kite)
+            r = requests.get(f"https://api.kite.trade/quote?{qs}", headers=hdrs, timeout=20)
+            if r.status_code == 200:
+                kdata = r.json().get("data",{})
+                for sym, kite_sym in KITE_SYMS.items():
+                    q = kdata.get(kite_sym,{})
+                    if not q or not q.get("last_price"): continue
+                    px  = q["last_price"]
+                    pc  = q.get("ohlc",{}).get("close", px)  # prev close
+                    chg = round(px - pc, 2)
+                    pct = round(chg/pc*100, 2) if pc else 0
+                    kite_data[sym] = {
+                        "px": px, "chg": chg, "pct": pct,
+                        "high": q.get("ohlc",{}).get("high",0),
+                        "low":  q.get("ohlc",{}).get("low",0),
+                        "open": q.get("ohlc",{}).get("open",0),
+                        "prev_close": pc,
+                        "volume": q.get("volume",0),
+                        "source": "zerodha"
+                    }
+                print(f"[Kite] Got prices for {len(kite_data)} symbols")
+            elif r.status_code in [401,403]:
+                print(f"[Kite] Token expired: {r.status_code}")
+        except Exception as e:
+            print(f"[Kite] Quote error: {e}")
+
+    use_kite = len(kite_data) > 10  # only use Kite if we got meaningful data
+
+    # ── Build result for each symbol ──
+    def build_sym(sym):
+        # Live price
+        if use_kite and sym in kite_data:
+            d = dict(kite_data[sym])
+        elif sym in MCX_YAHOO:
+            # Commodities — Yahoo only
+            yd = yahoo(MCX_YAHOO[sym])
+            if not yd or not yd.get("px"): return sym, None
+            d = {"px":yd["px"],"chg":yd["chg"],"pct":yd.get("pct",0),
+                 "high":yd.get("high",0),"low":yd.get("low",0),
+                 "open":yd.get("open",0),"prev_close":yd.get("prev_close",0),"source":"yahoo_mcx"}
+            # Convert USD to INR
+            if sym == "CRUDEOIL" and d["px"] < 500:
+                d["px"]=round(d["px"]*usd_inr,2); d["chg"]=round(d["chg"]*usd_inr,2)
+            elif sym == "GOLD" and d["px"] < 5000:
+                f=usd_inr/31.1*10
+                d["px"]=round(d["px"]*f,2); d["chg"]=round(d["chg"]*f,2)
+        else:
+            # Fallback to Yahoo if no Kite
+            ticker = YAHOO.get(sym)
+            if not ticker: return sym, None
+            yd = yahoo(ticker)
+            if not yd or not yd.get("px"): return sym, None
+            d = {"px":yd["px"],"chg":yd["chg"],"pct":yd.get("pct",0),
+                 "high":yd.get("high",0),"low":yd.get("low",0),
+                 "open":yd.get("open",0),"prev_close":yd.get("prev_close",0),"source":"yahoo"}
+
+        if not d.get("px"): return sym, None
+
+        # Add technicals (SMA/RSI) — from Yahoo candles cache
+        if sym not in MCX_YAHOO:
+            tech = get_technicals(sym)
+            if tech:
+                d["sma20"]     = tech.get("sma20")
+                d["sma50"]     = tech.get("sma50")
+                d["technicals"] = {
+                    "rsi14":    tech.get("rsi"),
+                    "trend":    tech.get("trend","NEUTRAL"),
+                    "crossover":tech.get("crossover","NONE"),
+                    "breakout": tech.get("breakout",False),
+                    "breakdown":tech.get("breakdown",False),
+                    "above_sma20": tech.get("above_sma20"),
+                }
         return sym, d
 
-    # Fetch all symbols in parallel — 60s timeout to handle cold starts
-    all_syms = list(YAHOO.keys())
-    try:
-        with ThreadPoolExecutor(max_workers=30) as ex:
-            futures = {ex.submit(fetch_sym, sym): sym for sym in all_syms}
-            try:
-                for fut in as_completed(futures, timeout=55):
+    # All symbols = KITE stocks + commodities
+    all_syms = list(KITE_SYMS.keys()) + list(MCX_YAHOO.keys())
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = {ex.submit(build_sym, sym): sym for sym in all_syms}
+        try:
+            for fut in as_completed(futures, timeout=40):
+                try:
+                    sym, d = fut.result()
+                    if d: result[sym] = d
+                except: pass
+        except:
+            for fut in futures:
+                if fut.done():
                     try:
                         sym, d = fut.result()
                         if d: result[sym] = d
-                    except Exception: pass
-            except Exception:
-                # Timeout — collect whatever completed so far
-                for fut, sym in futures.items():
-                    if fut.done():
-                        try:
-                            sym2, d = fut.result()
-                            if d: result[sym2] = d
-                        except Exception: pass
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 503
+                    except: pass
 
-    # Must have at least some data to return
     if not result:
-        return jsonify({"ok": False, "error": "No market data available"}), 503
+        return jsonify({"ok":False,"error":"No market data"}),503
 
-    # VIX
+    # VIX — Yahoo only (NSE VIX not in Zerodha)
     vix_val = 17.5
     try:
         vd = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX?interval=1d&range=1d",
             headers={"User-Agent":"Mozilla/5.0"}, timeout=5).json()
         px = vd["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        if px: vix_val = round(px, 2)
+        if px: vix_val = round(px,2)
     except: pass
 
-    return jsonify({"ok":True,"data":result,"vix":vix_val,"time":now_ist().strftime("%H:%M:%S")})
+    return jsonify({
+        "ok":True,"data":result,"vix":vix_val,
+        "source": "zerodha" if use_kite else "yahoo",
+        "time":now_ist().strftime("%H:%M:%S")
+    })
 
 # OI data cache - serves last known data when NSE is unavailable
 _oi_cache = {}
@@ -662,201 +806,154 @@ def kite_proxy():
 
 @app.route("/zerodha_oi")
 def zerodha_oi():
-    """Fetch live OI from Zerodha Kite API - server side (no CORS issues)"""
+    """
+    Fetch live OI from Zerodha Kite API.
+    Two-step: try constructed symbols first (fast), 
+    fall back to instruments CSV if needed.
+    """
     from flask import request as req
-    sym = req.args.get("sym","NIFTY").upper()
-    key = req.args.get("key","")
+    sym   = req.args.get("sym","NIFTY").upper()
+    key   = req.args.get("key","")
     token = req.args.get("token","")
-    if not key or not token:
-        return jsonify({"ok":False,"error":"No credentials"}),400
 
-    headers = {
-        "X-Kite-Version":"3",
-        "Authorization":f"token {key}:{token}",
-        "User-Agent":"Mozilla/5.0"
-    }
+    if not key or not token:
+        return jsonify({"ok":False,"error":"No Zerodha credentials — add in Settings"}),400
+
+    hdrs = {"X-Kite-Version":"3","Authorization":f"token {key}:{token}","User-Agent":"Mozilla/5.0"}
+
+    if not hasattr(zerodha_oi,'_cache'): zerodha_oi._cache={}
+    cache = zerodha_oi._cache
+
+    def get_cache():
+        if sym in cache:
+            c=cache[sym]; age=int((time.time()-c['ts'])/60)
+            d=dict(c['data']); d['note']=f"Cached {age}min"
+            return jsonify({"ok":True,"sym":sym,"data":d,"source":"cache","age_min":age})
+        return None
 
     try:
-        # ── Step 1: Get spot price ──
-        idx_map = {
-            "NIFTY":"NSE:NIFTY 50",
-            "BANKNIFTY":"NSE:NIFTY BANK",
-            "FINNIFTY":"NSE:NIFTY FIN SERVICE",
-            "SENSEX":"BSE:SENSEX"
-        }
-        spot = 0
-        idx_sym = idx_map.get(sym)
-        if idx_sym:
-            r = requests.get(
-                f"https://api.kite.trade/quote?i={requests.utils.quote(idx_sym)}",
-                headers=headers, timeout=10
-            )
-            if r.status_code in [401,403]:
-                return jsonify({"ok":False,"error":"Zerodha token expired. Reconnect in Settings.","code":403}),403
-            qr = r.json()
-            for v in (qr.get("data") or {}).values():
-                spot = v.get("last_price",0)
-                break
+        # Step 1: spot price from Kite
+        idx_map={"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK",
+                 "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
+        if sym not in idx_map:
+            return jsonify({"ok":False,"error":f"{sym} not supported"}),400
 
+        r=requests.get("https://api.kite.trade/quote",params={"i":idx_map[sym]},headers=hdrs,timeout=10)
+        if r.status_code in [401,403]:
+            return jsonify({"ok":False,"error":"Zerodha token expired — reconnect in Settings","code":403}),403
+        spot=0
+        for v in (r.json().get("data") or {}).values():
+            spot=v.get("last_price",0); break
         if not spot:
-            d = yahoo(YAHOO.get(sym,""))
-            spot = d.get("px",0) if d else 0
+            yd=yahoo(YAHOO.get(sym,"")); spot=yd.get("px",0) if yd else 0
         if not spot:
-            return jsonify({"ok":False,"error":"Could not get spot price"}),503
+            return get_cache() or jsonify({"ok":False,"error":"Cannot get spot price"}),503
 
-        # ── Step 2: Get instruments CSV (cached 1 hour) ──
-        now_ts = time.time()
-        if not hasattr(zerodha_oi,'_cache'): zerodha_oi._cache={}
-        cache_key = f"inst_{sym}"
-        if cache_key not in zerodha_oi._cache or (now_ts - zerodha_oi._cache[cache_key]['ts']) > 3600:
-            r = requests.get("https://api.kite.trade/instruments/NFO",
-                headers=headers, timeout=30)
-            if r.status_code in [401,403]:
-                return jsonify({"ok":False,"error":"Zerodha token expired. Reconnect in Settings.","code":403}),403
-            if r.status_code != 200:
-                return jsonify({"ok":False,"error":f"Instruments fetch failed: {r.status_code}"}),503
-            zerodha_oi._cache[cache_key] = {'data': r.text, 'ts': now_ts}
+        step=50 if sym in ["NIFTY","FINNIFTY"] else 100
+        atm=int(round(spot/step)*step)
+        strikes=[atm+step*i for i in range(-10,11)]
 
-        lines = zerodha_oi._cache[cache_key]['data'].strip().split("\n")
+        # Step 2: Get instruments CSV (cached 4h) to get correct trading symbols
+        csv_key=f"csv_{sym}"
+        if csv_key not in cache or (time.time()-cache[csv_key]['ts'])>14400:
+            rc=requests.get("https://api.kite.trade/instruments/NFO",headers=hdrs,timeout=30)
+            if rc.status_code in [401,403]:
+                return jsonify({"ok":False,"error":"Zerodha token expired","code":403}),403
+            if rc.status_code!=200:
+                return get_cache() or jsonify({"ok":False,"error":f"Instruments error {rc.status_code}"}),503
+            cache[csv_key]={'data':rc.text,'ts':time.time()}
+            print(f"[Kite] Instruments CSV cached for {sym}")
 
-        # ── Step 3: Find nearest weekly expiry ──
-        step = 50 if sym in ["NIFTY","FINNIFTY"] else 100
-        atm = round(spot/step)*step
-        # ATM ±15 strikes
-        target_strikes = set(range(int(atm-step*15), int(atm+step*16), step))
+        lines=cache[csv_key]['data'].strip().split("\n")
 
-        today = datetime.now(IST).replace(tzinfo=None)
-        best_exp = None; exp_days = 999
-        for line in lines[1:2000]:
-            cols = line.split(",")
-            if len(cols)<10: continue
-            if not cols[2].startswith(sym): continue
+        # Find nearest expiry
+        today_n=datetime.now(IST).replace(tzinfo=None)
+        best_exp=None; best_days=999
+        for line in lines[1:3000]:
+            cols=line.split(",")
+            if len(cols)<10 or not cols[2].startswith(sym): continue
             if cols[9] not in ["CE","PE"]: continue
             try:
-                exp = datetime.strptime(cols[5],"%Y-%m-%d")
-                d2 = (exp - today).days
-                if 0 <= d2 < exp_days:
-                    exp_days = d2; best_exp = cols[5]
+                exp=datetime.strptime(cols[5],"%Y-%m-%d")
+                d2=(exp-today_n).days
+                if 0<=d2<best_days: best_days=d2; best_exp=cols[5]
             except: continue
-
         if not best_exp:
-            return jsonify({"ok":False,"error":"No expiry found in instruments"}),503
+            return get_cache() or jsonify({"ok":False,"error":"No expiry found"}),503
 
-        # ── Step 4: Collect tradingsymbols for ATM strikes ──
-        instruments = []
+        # Collect ATM±10 trading symbols
+        target=set(strikes)
+        instruments=[]
         for line in lines[1:]:
-            cols = line.split(",")
-            if len(cols)<10: continue
-            if not cols[2].startswith(sym): continue
-            if cols[9] not in ["CE","PE"]: continue
-            if cols[5] != best_exp: continue
+            cols=line.split(",")
+            if len(cols)<10 or not cols[2].startswith(sym): continue
+            if cols[9] not in ["CE","PE"] or cols[5]!=best_exp: continue
             try:
-                strike = float(cols[6])
-                if strike not in target_strikes: continue
-                instruments.append({
-                    "tradingsymbol": cols[2],
-                    "strike": strike,
-                    "type": cols[9]
-                })
+                sk=float(cols[6])
+                if sk in target:
+                    instruments.append({"sym":f"NFO:{cols[2]}","strike":int(sk),"type":cols[9]})
             except: continue
-
         if not instruments:
-            return jsonify({"ok":False,"error":f"No instruments for {sym} expiry {best_exp}"}),503
+            return get_cache() or jsonify({"ok":False,"error":"No instruments found"}),503
 
-        # ── Step 5: Fetch live OI quotes in parallel batches ──
-        ce_oi=0; pe_oi=0; ce_chg=0; pe_chg=0
+        # Step 3: ONE bulk quote call for all instruments
+        qs="&".join(f"i={i['sym']}" for i in instruments)
+        r2=requests.get(f"https://api.kite.trade/quote?{qs}",headers=hdrs,timeout=20)
+        if r2.status_code in [401,403]:
+            return jsonify({"ok":False,"error":"Zerodha token expired","code":403}),403
+        qdata=r2.json().get("data",{})
+
+        # Step 4: Aggregate OI
+        ce_oi=0;pe_oi=0;ce_chg=0;pe_chg=0
         strikes_data={}
-
-        def fetch_batch(batch):
-            qs = "&".join(f"i=NFO:{t['tradingsymbol']}" for t in batch)
-            try:
-                r2 = requests.get(f"https://api.kite.trade/quote?{qs}",
-                    headers=headers, timeout=15)
-                if r2.status_code in [401,403]:
-                    return None, 403
-                return r2.json().get("data",{}), 200
-            except:
-                return {}, 0
-
-        batch_size = 50
-        batches = [instruments[i:i+batch_size] for i in range(0, len(instruments), batch_size)]
-
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            futures2 = [ex.submit(fetch_batch, b) for b in batches]
-            for fut2, batch in zip(futures2, batches):
-                try:
-                    data, status = fut2.result(timeout=20)
-                    if status == 403:
-                        return jsonify({"ok":False,"error":"Zerodha token expired. Reconnect in Settings.","code":403}),403
-                    if not data: continue
-                    for t in batch:
-                        key2 = f"NFO:{t['tradingsymbol']}"
-                        q = data.get(key2,{})
-                        if not q: continue
-                        oi = q.get("oi",0) or 0
-                        # OI change = current OI minus day's open OI
-                        oi_open = q.get("oi_day_low",0) or oi  # oi_day_low = approx open OI
-                        chg = oi - oi_open
-                        s = t["strike"]
-                        if s not in strikes_data:
-                            strikes_data[s] = {"ce":0,"pe":0,"ce_chg":0,"pe_chg":0}
-                        if t["type"]=="CE":
-                            ce_oi+=oi; ce_chg+=chg
-                            strikes_data[s]["ce"]=oi; strikes_data[s]["ce_chg"]=chg
-                        else:
-                            pe_oi+=oi; pe_chg+=chg
-                            strikes_data[s]["pe"]=oi; strikes_data[s]["pe_chg"]=chg
-                except Exception: continue
+        for inst in instruments:
+            q=qdata.get(inst['sym'],{})
+            if not q: continue
+            oi=q.get("oi",0) or 0
+            oi_low=q.get("oi_day_low",0) or 0
+            chg=oi-oi_low if oi_low else 0
+            s=inst['strike']
+            if s not in strikes_data: strikes_data[s]={"ce":0,"pe":0,"ce_chg":0,"pe_chg":0}
+            if inst['type']=="CE":
+                ce_oi+=oi;ce_chg+=chg
+                strikes_data[s]["ce"]=oi;strikes_data[s]["ce_chg"]=chg
+            else:
+                pe_oi+=oi;pe_chg+=chg
+                strikes_data[s]["pe"]=oi;strikes_data[s]["pe_chg"]=chg
 
         if not ce_oi and not pe_oi:
-            return jsonify({"ok":False,"error":"OI data is zero — market may be closed or token invalid"}),503
+            return get_cache() or jsonify({"ok":False,"error":"OI is zero — market closed?"}),503
 
-        # ── Step 6: Calculate PCR, Max Pain, Walls ──
-        pcr = round(pe_oi/ce_oi,2) if ce_oi else 0
-
-        mp=0; mpv=float("inf")
+        # Step 5: PCR, Max Pain, Walls
+        pcr=round(pe_oi/ce_oi,2) if ce_oi else 0
+        mp=0;mpv=float("inf")
         for s in strikes_data:
-            pain=sum(max(0,x-s)*strikes_data[x].get("ce",0)+max(0,s-x)*strikes_data[x].get("pe",0) for x in strikes_data)
-            if pain<mpv: mpv=pain; mp=s
-
-        ce_wall = max(strikes_data, key=lambda x:strikes_data[x].get("ce",0), default=0)
-        pe_wall = max(strikes_data, key=lambda x:strikes_data[x].get("pe",0), default=0)
-
+            pain=sum(max(0,x-s)*strikes_data[x]["ce"]+max(0,s-x)*strikes_data[x]["pe"] for x in strikes_data)
+            if pain<mpv: mpv=pain;mp=s
+        ce_wall=max(strikes_data,key=lambda x:strikes_data[x]["ce"],default=0)
+        pe_wall=max(strikes_data,key=lambda x:strikes_data[x]["pe"],default=0)
         buildup="UNKNOWN"
         if ce_chg>0 and pe_chg>0: buildup="LONG_BUILDUP" if pe_chg>ce_chg else "SHORT_BUILDUP"
         elif ce_chg<0 and pe_chg<0: buildup="SHORT_COVERING" if ce_chg<pe_chg else "LONG_UNWINDING"
-        elif ce_chg>0 and pe_chg<0: buildup="SHORT_BUILDUP"
-        elif ce_chg<0 and pe_chg>0: buildup="LONG_BUILDUP"
-
+        elif ce_chg>0: buildup="SHORT_BUILDUP"
+        elif pe_chg>0: buildup="LONG_BUILDUP"
         pcr_interp=("EXTREME_BULL" if pcr>1.4 else "BULLISH" if pcr>1.1
                     else "NEUTRAL" if pcr>0.9 else "BEARISH" if pcr>0.7 else "EXTREME_BEAR")
 
-        result = {
-            "ce_oi":ce_oi,"pe_oi":pe_oi,
-            "ce_chg":ce_chg,"pe_chg":pe_chg,
-            "pcr":pcr,"max_pain":int(mp),"iv":0,
-            "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
-            "spot":spot,"buildup":buildup,"pcr_interp":pcr_interp,
-            "mp_dist":round(spot-mp,0) if mp else 0,
-            "source":"zerodha_kite","expiry":best_exp,
-            "instruments_count":len(instruments)
-        }
-        # Cache successful result
-        if not hasattr(zerodha_oi,'_oi_cache'): zerodha_oi._oi_cache={}
-        zerodha_oi._oi_cache[sym] = {"data":result,"ts":now_ts}
-
+        result={"ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,
+                "pcr":pcr,"max_pain":int(mp),"iv":0,
+                "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
+                "spot":round(spot,1),"buildup":buildup,"pcr_interp":pcr_interp,
+                "mp_dist":round(spot-mp,0) if mp else 0,
+                "source":"zerodha_kite","expiry":best_exp,"instruments_count":len(instruments)}
+        cache[sym]={"data":result,"ts":time.time()}
+        print(f"[Kite OI] {sym} PCR:{pcr} MP:{mp} CE_OI:{ce_oi} PE_OI:{pe_oi}")
         return jsonify({"ok":True,"sym":sym,"data":result,"time":now_ist().strftime("%H:%M:%S IST")})
 
     except Exception as e:
         import traceback
-        tb = traceback.format_exc()[-800:]
-        # Return cached data if available
-        if hasattr(zerodha_oi,'_oi_cache') and sym in zerodha_oi._oi_cache:
-            cached = zerodha_oi._oi_cache[sym]
-            age = int((time.time()-cached['ts'])/60)
-            d2 = dict(cached['data']); d2['note']=f"Cached {age}min ago"
-            return jsonify({"ok":True,"sym":sym,"data":d2,"source":"cache","error_detail":str(e)})
-        return jsonify({"ok":False,"error":str(e),"trace":tb}),503
+        print(f"[Kite OI ERROR] {sym}: {e}\n{traceback.format_exc()[-400:]}")
+        return get_cache() or jsonify({"ok":False,"error":str(e),"trace":traceback.format_exc()[-400:]}),503
 
 @app.route("/debug_oi")
 def debug_oi():
