@@ -662,95 +662,88 @@ def kite_proxy():
 
 @app.route("/zerodha_oi")
 def zerodha_oi():
-    """Fetch OI from Zerodha Kite - server-side to avoid CORS"""
+    """Fetch live OI from Zerodha Kite API - server side (no CORS issues)"""
     from flask import request as req
     sym = req.args.get("sym","NIFTY").upper()
     key = req.args.get("key","")
     token = req.args.get("token","")
     if not key or not token:
         return jsonify({"ok":False,"error":"No credentials"}),400
-    
+
     headers = {
         "X-Kite-Version":"3",
         "Authorization":f"token {key}:{token}",
         "User-Agent":"Mozilla/5.0"
     }
-    
+
     try:
-        # Get spot price first
+        # ── Step 1: Get spot price ──
         idx_map = {
             "NIFTY":"NSE:NIFTY 50",
-            "BANKNIFTY":"NSE:NIFTY BANK", 
+            "BANKNIFTY":"NSE:NIFTY BANK",
             "FINNIFTY":"NSE:NIFTY FIN SERVICE",
             "SENSEX":"BSE:SENSEX"
         }
         spot = 0
         idx_sym = idx_map.get(sym)
         if idx_sym:
-            qr = requests.get(
+            r = requests.get(
                 f"https://api.kite.trade/quote?i={requests.utils.quote(idx_sym)}",
                 headers=headers, timeout=10
-            ).json()
-            for k2,v in (qr.get("data") or {}).items():
+            )
+            if r.status_code in [401,403]:
+                return jsonify({"ok":False,"error":"Zerodha token expired. Reconnect in Settings.","code":403}),403
+            qr = r.json()
+            for v in (qr.get("data") or {}).values():
                 spot = v.get("last_price",0)
                 break
-        
+
         if not spot:
-            # fallback: get from our market data
-            ticker = YAHOO.get(sym)
-            if ticker:
-                d = yahoo(ticker)
-                spot = d.get("px",0) if d else 0
-        
+            d = yahoo(YAHOO.get(sym,""))
+            spot = d.get("px",0) if d else 0
         if not spot:
             return jsonify({"ok":False,"error":"Could not get spot price"}),503
-        
-        # Get nearest expiry instruments
-        # Fetch NFO instruments dump (cached - only update if stale)
+
+        # ── Step 2: Get instruments CSV (cached 1 hour) ──
         now_ts = time.time()
+        if not hasattr(zerodha_oi,'_cache'): zerodha_oi._cache={}
         cache_key = f"inst_{sym}"
-        if not hasattr(zerodha_oi,'_caches'): zerodha_oi._caches={}
-        if cache_key not in zerodha_oi._caches or (now_ts - zerodha_oi._caches[cache_key].get('ts',0)) > 3600:
+        if cache_key not in zerodha_oi._cache or (now_ts - zerodha_oi._cache[cache_key]['ts']) > 3600:
             r = requests.get("https://api.kite.trade/instruments/NFO",
                 headers=headers, timeout=30)
-            if r.status_code in [403, 401]:
+            if r.status_code in [401,403]:
                 return jsonify({"ok":False,"error":"Zerodha token expired. Reconnect in Settings.","code":403}),403
-            elif r.status_code != 200:
-                return jsonify({"ok":False,"error":f"Kite error: {r.status_code}"}),503
-            zerodha_oi._caches[cache_key] = {'data': r.text, 'ts': now_ts}
-        inst_csv = zerodha_oi._caches[cache_key]['data']
-        lines = inst_csv.strip().split("\n")
-        
-        # Find ATM ± 10 strikes for nearest expiry
-        step = 50 if sym=="NIFTY" or sym=="FINNIFTY" else 100
+            if r.status_code != 200:
+                return jsonify({"ok":False,"error":f"Instruments fetch failed: {r.status_code}"}),503
+            zerodha_oi._cache[cache_key] = {'data': r.text, 'ts': now_ts}
+
+        lines = zerodha_oi._cache[cache_key]['data'].strip().split("\n")
+
+        # ── Step 3: Find nearest weekly expiry ──
+        step = 50 if sym in ["NIFTY","FINNIFTY"] else 100
         atm = round(spot/step)*step
-        target_strikes = set(range(int(atm-step*10), int(atm+step*11), step))
-        
-        # Parse instruments - find nearest expiry options
-        from datetime import datetime
-        today = datetime.now()
-        best_exp = None
-        exp_days = 999
-        
-        # First pass: find nearest expiry
-        for line in lines[1:1000]:
+        # ATM ±15 strikes
+        target_strikes = set(range(int(atm-step*15), int(atm+step*16), step))
+
+        today = datetime.now(IST).replace(tzinfo=None)
+        best_exp = None; exp_days = 999
+        for line in lines[1:2000]:
             cols = line.split(",")
             if len(cols)<10: continue
             if not cols[2].startswith(sym): continue
             if cols[9] not in ["CE","PE"]: continue
             try:
                 exp = datetime.strptime(cols[5],"%Y-%m-%d")
-                d2 = (exp-today).days
+                d2 = (exp - today).days
                 if 0 <= d2 < exp_days:
-                    exp_days = d2
-                    best_exp = cols[5]
+                    exp_days = d2; best_exp = cols[5]
             except: continue
-        
+
         if not best_exp:
-            return jsonify({"ok":False,"error":"No expiry found"}),503
-        
-        # Second pass: get instrument tokens for this expiry
-        inst_tokens = []
+            return jsonify({"ok":False,"error":"No expiry found in instruments"}),503
+
+        # ── Step 4: Collect tradingsymbols for ATM strikes ──
+        instruments = []
         for line in lines[1:]:
             cols = line.split(",")
             if len(cols)<10: continue
@@ -760,124 +753,110 @@ def zerodha_oi():
             try:
                 strike = float(cols[6])
                 if strike not in target_strikes: continue
-                inst_tokens.append({
-                    "token": cols[0],
+                instruments.append({
                     "tradingsymbol": cols[2],
                     "strike": strike,
                     "type": cols[9]
                 })
             except: continue
-        
-        if not inst_tokens:
-            return jsonify({"ok":False,"error":"No instruments found"}),503
-        
-        # Fetch live quotes for all these instruments (in batches of 50)
-        ce_oi = 0; pe_oi = 0; ce_chg = 0; pe_chg = 0
-        strikes_data = {}
-        iv_atm = 0
-        
-        batch_size = 50
-        for batch_start in range(0, len(inst_tokens), batch_size):
-            batch = inst_tokens[batch_start:batch_start+batch_size]
+
+        if not instruments:
+            return jsonify({"ok":False,"error":f"No instruments for {sym} expiry {best_exp}"}),503
+
+        # ── Step 5: Fetch live OI quotes in parallel batches ──
+        ce_oi=0; pe_oi=0; ce_chg=0; pe_chg=0
+        strikes_data={}
+
+        def fetch_batch(batch):
             qs = "&".join(f"i=NFO:{t['tradingsymbol']}" for t in batch)
-            quote_resp = requests.get(
-                f"https://api.kite.trade/quote?{qs}",
-                headers=headers, timeout=15
-            )
-            if quote_resp.status_code in [403,401]:
-                return jsonify({"ok":False,"error":"Zerodha token expired. Reconnect in Settings.","code":403}),403
-            qr = quote_resp.json()
-            
-            data = qr.get("data",{})
-            for t in batch:
-                key2 = f"NFO:{t['tradingsymbol']}"
-                q = data.get(key2,{})
-                if not q: continue
-                oi = q.get("oi",0) or 0
-                oi_day = q.get("oi_day_high",0) or 0
-                prev_oi = q.get("oi_day_low",0) or 0  # approximate
-                chg = oi - prev_oi if prev_oi else 0
-                
-                s = t["strike"]
-                if s not in strikes_data:
-                    strikes_data[s] = {"ce":0,"pe":0,"ce_chg":0,"pe_chg":0}
-                
-                if t["type"]=="CE":
-                    ce_oi += oi
-                    ce_chg += chg
-                    strikes_data[s]["ce"] = oi
-                    strikes_data[s]["ce_chg"] = chg
-                    # Get IV for ATM
-                    if abs(s-atm) < step*2:
-                        depth = q.get("depth",{})
-                        iv_atm = 0  # IV not in quote directly
-                else:
-                    pe_oi += oi
-                    pe_chg += chg
-                    strikes_data[s]["pe"] = oi
-                    strikes_data[s]["pe_chg"] = chg
-        
-        if not ce_oi and not pe_oi:
-            # If quote gives 0, fall back to instruments CSV OI (previous day)
-            for line in lines[1:]:
-                cols = line.split(",")
-                if len(cols)<13: continue
-                if not cols[2].startswith(sym): continue
-                if cols[9] not in ["CE","PE"]: continue
-                if cols[5] != best_exp: continue
+            try:
+                r2 = requests.get(f"https://api.kite.trade/quote?{qs}",
+                    headers=headers, timeout=15)
+                if r2.status_code in [401,403]:
+                    return None, 403
+                return r2.json().get("data",{}), 200
+            except:
+                return {}, 0
+
+        batch_size = 50
+        batches = [instruments[i:i+batch_size] for i in range(0, len(instruments), batch_size)]
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futures2 = [ex.submit(fetch_batch, b) for b in batches]
+            for fut2, batch in zip(futures2, batches):
                 try:
-                    strike = float(cols[6])
-                    oi = int(cols[12]) if cols[12] else 0
-                    if cols[9]=="CE": ce_oi += oi
-                    else: pe_oi += oi
-                    if strike not in strikes_data:
-                        strikes_data[strike]={"ce":0,"pe":0}
-                    strikes_data[strike][cols[9].lower()] = oi
-                except: continue
-        
+                    data, status = fut2.result(timeout=20)
+                    if status == 403:
+                        return jsonify({"ok":False,"error":"Zerodha token expired. Reconnect in Settings.","code":403}),403
+                    if not data: continue
+                    for t in batch:
+                        key2 = f"NFO:{t['tradingsymbol']}"
+                        q = data.get(key2,{})
+                        if not q: continue
+                        oi = q.get("oi",0) or 0
+                        # OI change = current OI minus day's open OI
+                        oi_open = q.get("oi_day_low",0) or oi  # oi_day_low = approx open OI
+                        chg = oi - oi_open
+                        s = t["strike"]
+                        if s not in strikes_data:
+                            strikes_data[s] = {"ce":0,"pe":0,"ce_chg":0,"pe_chg":0}
+                        if t["type"]=="CE":
+                            ce_oi+=oi; ce_chg+=chg
+                            strikes_data[s]["ce"]=oi; strikes_data[s]["ce_chg"]=chg
+                        else:
+                            pe_oi+=oi; pe_chg+=chg
+                            strikes_data[s]["pe"]=oi; strikes_data[s]["pe_chg"]=chg
+                except Exception: continue
+
+        if not ce_oi and not pe_oi:
+            return jsonify({"ok":False,"error":"OI data is zero — market may be closed or token invalid"}),503
+
+        # ── Step 6: Calculate PCR, Max Pain, Walls ──
         pcr = round(pe_oi/ce_oi,2) if ce_oi else 0
-        
-        # Max Pain
-        mp = 0; mpv = float("inf")
+
+        mp=0; mpv=float("inf")
         for s in strikes_data:
-            pain = sum(
-                max(0,x-s)*strikes_data[x]["ce"]+max(0,s-x)*strikes_data[x]["pe"]
-                for x in strikes_data
-            )
+            pain=sum(max(0,x-s)*strikes_data[x].get("ce",0)+max(0,s-x)*strikes_data[x].get("pe",0) for x in strikes_data)
             if pain<mpv: mpv=pain; mp=s
-        
-        ce_wall = max(strikes_data, key=lambda x:strikes_data[x]["ce"], default=0)
-        pe_wall = max(strikes_data, key=lambda x:strikes_data[x]["pe"], default=0)
-        
-        # Buildup
-        if ce_chg>0 and pe_chg>0:
-            buildup = "LONG_BUILDUP" if pe_chg>ce_chg else "SHORT_BUILDUP"
-        elif ce_chg<0 and pe_chg<0:
-            buildup = "SHORT_COVERING" if ce_chg<pe_chg else "LONG_UNWINDING"
-        elif ce_chg>0: buildup="SHORT_BUILDUP"
-        elif pe_chg>0: buildup="LONG_BUILDUP"
-        else: buildup="UNKNOWN"
-        
-        pcr_interp = ("EXTREME_BULL" if pcr>1.4 else "BULLISH" if pcr>1.1 
-                      else "NEUTRAL" if pcr>0.9 else "BEARISH" if pcr>0.7 else "EXTREME_BEAR")
-        
-        return jsonify({
-            "ok":True, "sym":sym,
-            "data":{
-                "ce_oi":ce_oi,"pe_oi":pe_oi,
-                "ce_chg":ce_chg,"pe_chg":pe_chg,
-                "pcr":pcr,"max_pain":int(mp),"iv":iv_atm,
-                "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
-                "spot":spot,"buildup":buildup,"pcr_interp":pcr_interp,
-                "mp_dist":round(spot-mp,0) if mp else 0,
-                "source":"zerodha_kite","expiry":best_exp,
-                "instruments_count":len(inst_tokens)
-            },
-            "time":now_ist().strftime("%H:%M:%S IST")
-        })
+
+        ce_wall = max(strikes_data, key=lambda x:strikes_data[x].get("ce",0), default=0)
+        pe_wall = max(strikes_data, key=lambda x:strikes_data[x].get("pe",0), default=0)
+
+        buildup="UNKNOWN"
+        if ce_chg>0 and pe_chg>0: buildup="LONG_BUILDUP" if pe_chg>ce_chg else "SHORT_BUILDUP"
+        elif ce_chg<0 and pe_chg<0: buildup="SHORT_COVERING" if ce_chg<pe_chg else "LONG_UNWINDING"
+        elif ce_chg>0 and pe_chg<0: buildup="SHORT_BUILDUP"
+        elif ce_chg<0 and pe_chg>0: buildup="LONG_BUILDUP"
+
+        pcr_interp=("EXTREME_BULL" if pcr>1.4 else "BULLISH" if pcr>1.1
+                    else "NEUTRAL" if pcr>0.9 else "BEARISH" if pcr>0.7 else "EXTREME_BEAR")
+
+        result = {
+            "ce_oi":ce_oi,"pe_oi":pe_oi,
+            "ce_chg":ce_chg,"pe_chg":pe_chg,
+            "pcr":pcr,"max_pain":int(mp),"iv":0,
+            "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
+            "spot":spot,"buildup":buildup,"pcr_interp":pcr_interp,
+            "mp_dist":round(spot-mp,0) if mp else 0,
+            "source":"zerodha_kite","expiry":best_exp,
+            "instruments_count":len(instruments)
+        }
+        # Cache successful result
+        if not hasattr(zerodha_oi,'_oi_cache'): zerodha_oi._oi_cache={}
+        zerodha_oi._oi_cache[sym] = {"data":result,"ts":now_ts}
+
+        return jsonify({"ok":True,"sym":sym,"data":result,"time":now_ist().strftime("%H:%M:%S IST")})
+
     except Exception as e:
         import traceback
-        return jsonify({"ok":False,"error":str(e),"trace":traceback.format_exc()[-500:]}),503
+        tb = traceback.format_exc()[-800:]
+        # Return cached data if available
+        if hasattr(zerodha_oi,'_oi_cache') and sym in zerodha_oi._oi_cache:
+            cached = zerodha_oi._oi_cache[sym]
+            age = int((time.time()-cached['ts'])/60)
+            d2 = dict(cached['data']); d2['note']=f"Cached {age}min ago"
+            return jsonify({"ok":True,"sym":sym,"data":d2,"source":"cache","error_detail":str(e)})
+        return jsonify({"ok":False,"error":str(e),"trace":tb}),503
 
 @app.route("/debug_oi")
 def debug_oi():
@@ -907,6 +886,24 @@ def debug_oi():
     except Exception as e:
         result["nse_test"] = {"error":str(e)}
     return jsonify(result)
+
+@app.route("/test_oi")
+def test_oi():
+    """Quick diagnostic - test if Zerodha token works"""
+    from flask import request as req
+    key = req.args.get("key","")
+    token = req.args.get("token","")
+    if not key or not token:
+        return jsonify({"error":"pass ?key=...&token=..."})
+    headers={"X-Kite-Version":"3","Authorization":f"token {key}:{token}","User-Agent":"Mozilla/5.0"}
+    try:
+        r = requests.get("https://api.kite.trade/user/profile",headers=headers,timeout=10)
+        profile = r.json() if r.status_code==200 else {"status_code":r.status_code,"text":r.text[:200]}
+        r2 = requests.get("https://api.kite.trade/quote?i=NSE%3ANIFTY+50",headers=headers,timeout=10)
+        quote = r2.json() if r2.status_code==200 else {"status_code":r2.status_code}
+        return jsonify({"profile_ok":r.status_code==200,"profile":profile,"quote_ok":r2.status_code==200,"quote":quote,"time":now_ist().strftime("%H:%M:%S IST")})
+    except Exception as e:
+        return jsonify({"error":str(e)})
 
 @app.route("/ping")
 def ping():
