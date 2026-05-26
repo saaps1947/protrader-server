@@ -332,17 +332,33 @@ def market():
             d["currency"]="INR"
         return sym, d
 
-    # Fetch all symbols in parallel (max 20 threads, 12s timeout)
+    # Fetch all symbols in parallel — 60s timeout to handle cold starts
     all_syms = list(YAHOO.keys())
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        futures = {ex.submit(fetch_sym, sym): sym for sym in all_syms}
-        for fut in as_completed(futures, timeout=12):
+    try:
+        with ThreadPoolExecutor(max_workers=30) as ex:
+            futures = {ex.submit(fetch_sym, sym): sym for sym in all_syms}
             try:
-                sym, d = fut.result()
-                if d: result[sym] = d
-            except: pass
+                for fut in as_completed(futures, timeout=55):
+                    try:
+                        sym, d = fut.result()
+                        if d: result[sym] = d
+                    except Exception: pass
+            except Exception:
+                # Timeout — collect whatever completed so far
+                for fut, sym in futures.items():
+                    if fut.done():
+                        try:
+                            sym2, d = fut.result()
+                            if d: result[sym2] = d
+                        except Exception: pass
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 503
 
-    # VIX - use hardcoded fallback (reliable)
+    # Must have at least some data to return
+    if not result:
+        return jsonify({"ok": False, "error": "No market data available"}), 503
+
+    # VIX
     vix_val = 17.5
     try:
         vd = requests.get("https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX?interval=1d&range=1d",
