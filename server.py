@@ -313,48 +313,42 @@ def stocks():
 
 @app.route("/market")
 def market():
-    result={}
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    result = {}
     usd_inr = get_usd_inr()
-    # Only fetch 6 CORE instruments (fast - <5s total)
-    core_syms = ["NIFTY","BANKNIFTY","SENSEX","FINNIFTY","CRUDEOIL","GOLD"]
-    for sym in core_syms:
-        ticker=YAHOO.get(sym)
-        if ticker:
-            d=yahoo(ticker)
-            if d and d.get("px"):
-                # Convert MCX commodity prices from USD to INR
-                if sym == "CRUDEOIL" and d["px"] < 500:
-                    # WTI price in USD -> MCX price in INR (per barrel)
-                    factor = usd_inr
-                    d["px"] = round(d["px"] * factor, 2)
-                    d["chg"] = round(d["chg"] * factor, 2)
-                    d["high"] = round(d["high"] * factor, 2) if d.get("high") else 0
-                    d["low"] = round(d["low"] * factor, 2) if d.get("low") else 0
-                    d["currency"] = "INR"
-                    d["note"] = f"MCX approx (WTI x {usd_inr:.1f})"
-                elif sym == "GOLD" and d["px"] < 5000:
-                    # Gold USD/oz -> MCX INR per 10g
-                    # 1 oz = 31.1g, MCX lot = 1kg = 1000g = per 10g unit
-                    factor = usd_inr / 31.1 * 10
-                    d["px"] = round(d["px"] * factor, 2)
-                    d["chg"] = round(d["chg"] * factor, 2)
-                    d["high"] = round(d["high"] * factor, 2) if d.get("high") else 0
-                    d["low"] = round(d["low"] * factor, 2) if d.get("low") else 0
-                    d["currency"] = "INR"
-                    d["note"] = f"MCX approx (COMEX x {factor:.1f})"
-                result[sym]=d
-    # Also include cached stock data
-    result.update(_stock_cache)
-    vix_val=17.5
-    vd=nse_get("https://www.nseindia.com/api/allIndices")
-    if vd:
-        for item in vd.get("data",[]):
-            if "VIX" in (item.get("indexSymbol","") or ""):
-                vix_val=item.get("last",17.5); break
-    for sym in ["NIFTY","BANKNIFTY"]:
-        if sym in result:
-            oi=calc_oi(sym)
-            if oi: result[sym]["oi"]=oi
+
+    def fetch_sym(sym):
+        ticker = YAHOO.get(sym)
+        if not ticker: return sym, None
+        d = yahoo(ticker)
+        if not d or not d.get("px"): return sym, None
+        if sym == "CRUDEOIL" and d["px"] < 500:
+            f = usd_inr
+            d["px"]=round(d["px"]*f,2); d["chg"]=round(d["chg"]*f,2)
+            d["currency"]="INR"
+        elif sym == "GOLD" and d["px"] < 5000:
+            f = usd_inr / 31.1 * 10
+            d["px"]=round(d["px"]*f,2); d["chg"]=round(d["chg"]*f,2)
+            d["currency"]="INR"
+        return sym, d
+
+    # Fetch all symbols in parallel (max 20 threads, 12s timeout)
+    all_syms = list(YAHOO.keys())
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        futures = {ex.submit(fetch_sym, sym): sym for sym in all_syms}
+        for fut in as_completed(futures, timeout=12):
+            try:
+                sym, d = fut.result()
+                if d: result[sym] = d
+            except: pass
+
+    # VIX from Yahoo (no NSE dependency)
+    vix_val = 17.5
+    try:
+        vd = yahoo("^INDIAVIX")
+        if vd and vd.get("px"): vix_val = vd["px"]
+    except: pass
+
     return jsonify({"ok":True,"data":result,"vix":vix_val,"time":now_ist().strftime("%H:%M:%S")})
 
 # OI data cache - serves last known data when NSE is unavailable
