@@ -808,31 +808,47 @@ def kite_proxy():
 def zerodha_oi():
     """
     Fetch live OI from Zerodha Kite API.
-    Two-step: try constructed symbols first (fast), 
-    fall back to instruments CSV if needed.
+    Persists last good OI to disk so it survives server restarts.
     """
+    import os, json as _json
     from flask import request as req
     sym   = req.args.get("sym","NIFTY").upper()
     key   = req.args.get("key","")
     token = req.args.get("token","")
 
+    # ── Persistent disk cache (survives Render sleep/restart) ──
+    CACHE_DIR = "/tmp/oi_cache"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = f"{CACHE_DIR}/{sym}.json"
+
+    def save_cache(data):
+        try:
+            with open(cache_file,"w") as f:
+                _json.dump({"data":data,"ts":time.time()},f)
+        except: pass
+
+    def load_cache():
+        try:
+            with open(cache_file) as f:
+                c = _json.load(f)
+                age = int((time.time()-c['ts'])/60)
+                d = dict(c['data'])
+                d['note'] = f"Last known OI — {age}min ago (market closed or token expired)"
+                d['cached'] = True
+                return jsonify({"ok":True,"sym":sym,"data":d,"source":"cache","age_min":age})
+        except: return None
+
     if not key or not token:
-        return jsonify({"ok":False,"error":"No Zerodha credentials — add in Settings"}),400
+        return load_cache() or jsonify({"ok":False,"error":"No Zerodha credentials"}),400
 
     hdrs = {"X-Kite-Version":"3","Authorization":f"token {key}:{token}","User-Agent":"Mozilla/5.0"}
 
-    if not hasattr(zerodha_oi,'_cache'): zerodha_oi._cache={}
-    cache = zerodha_oi._cache
-
-    def get_cache():
-        if sym in cache:
-            c=cache[sym]; age=int((time.time()-c['ts'])/60)
-            d=dict(c['data']); d['note']=f"Cached {age}min"
-            return jsonify({"ok":True,"sym":sym,"data":d,"source":"cache","age_min":age})
-        return None
+    # In-memory instruments CSV cache (reset on restart — that's fine, re-downloads once)
+    if not hasattr(zerodha_oi,'_csv'): zerodha_oi._csv={}
+    csv_cache = zerodha_oi._csv
 
     try:
-        # Step 1: spot price from Kite
+        # Step 1: spot price
         idx_map={"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK",
                  "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
         if sym not in idx_map:
@@ -840,31 +856,31 @@ def zerodha_oi():
 
         r=requests.get("https://api.kite.trade/quote",params={"i":idx_map[sym]},headers=hdrs,timeout=10)
         if r.status_code in [401,403]:
-            return jsonify({"ok":False,"error":"Zerodha token expired — reconnect in Settings","code":403}),403
+            # Token expired — return last cached OI so app still shows data
+            return load_cache() or jsonify({"ok":False,"error":"Zerodha token expired — reconnect in Settings","code":403}),403
+
         spot=0
         for v in (r.json().get("data") or {}).values():
             spot=v.get("last_price",0); break
         if not spot:
-            yd=yahoo(YAHOO.get(sym,"")); spot=yd.get("px",0) if yd else 0
-        if not spot:
-            return get_cache() or jsonify({"ok":False,"error":"Cannot get spot price"}),503
+            return load_cache() or jsonify({"ok":False,"error":"Cannot get spot price"}),503
 
         step=50 if sym in ["NIFTY","FINNIFTY"] else 100
         atm=int(round(spot/step)*step)
         strikes=[atm+step*i for i in range(-10,11)]
 
-        # Step 2: Get instruments CSV (cached 4h) to get correct trading symbols
+        # Step 2: instruments CSV (in-memory cache 4h)
         csv_key=f"csv_{sym}"
-        if csv_key not in cache or (time.time()-cache[csv_key]['ts'])>14400:
+        if csv_key not in csv_cache or (time.time()-csv_cache[csv_key]['ts'])>14400:
             rc=requests.get("https://api.kite.trade/instruments/NFO",headers=hdrs,timeout=30)
             if rc.status_code in [401,403]:
-                return jsonify({"ok":False,"error":"Zerodha token expired","code":403}),403
+                return load_cache() or jsonify({"ok":False,"error":"Token expired","code":403}),403
             if rc.status_code!=200:
-                return get_cache() or jsonify({"ok":False,"error":f"Instruments error {rc.status_code}"}),503
-            cache[csv_key]={'data':rc.text,'ts':time.time()}
+                return load_cache() or jsonify({"ok":False,"error":f"Instruments error {rc.status_code}"}),503
+            csv_cache[csv_key]={'data':rc.text,'ts':time.time()}
             print(f"[Kite] Instruments CSV cached for {sym}")
 
-        lines=cache[csv_key]['data'].strip().split("\n")
+        lines=csv_cache[csv_key]['data'].strip().split("\n")
 
         # Find nearest expiry
         today_n=datetime.now(IST).replace(tzinfo=None)
@@ -879,9 +895,9 @@ def zerodha_oi():
                 if 0<=d2<best_days: best_days=d2; best_exp=cols[5]
             except: continue
         if not best_exp:
-            return get_cache() or jsonify({"ok":False,"error":"No expiry found"}),503
+            return load_cache() or jsonify({"ok":False,"error":"No expiry found"}),503
 
-        # Collect ATM±10 trading symbols
+        # Collect ATM±10 instruments
         target=set(strikes)
         instruments=[]
         for line in lines[1:]:
@@ -894,16 +910,16 @@ def zerodha_oi():
                     instruments.append({"sym":f"NFO:{cols[2]}","strike":int(sk),"type":cols[9]})
             except: continue
         if not instruments:
-            return get_cache() or jsonify({"ok":False,"error":"No instruments found"}),503
+            return load_cache() or jsonify({"ok":False,"error":"No instruments found"}),503
 
-        # Step 3: ONE bulk quote call for all instruments
+        # Step 3: Bulk OI quote
         qs="&".join(f"i={i['sym']}" for i in instruments)
         r2=requests.get(f"https://api.kite.trade/quote?{qs}",headers=hdrs,timeout=20)
         if r2.status_code in [401,403]:
-            return jsonify({"ok":False,"error":"Zerodha token expired","code":403}),403
+            return load_cache() or jsonify({"ok":False,"error":"Token expired","code":403}),403
         qdata=r2.json().get("data",{})
 
-        # Step 4: Aggregate OI
+        # Step 4: Aggregate
         ce_oi=0;pe_oi=0;ce_chg=0;pe_chg=0
         strikes_data={}
         for inst in instruments:
@@ -921,10 +937,11 @@ def zerodha_oi():
                 pe_oi+=oi;pe_chg+=chg
                 strikes_data[s]["pe"]=oi;strikes_data[s]["pe_chg"]=chg
 
+        # If OI is zero (market closed), return last cached data
         if not ce_oi and not pe_oi:
-            return get_cache() or jsonify({"ok":False,"error":"OI is zero — market closed?"}),503
+            return load_cache() or jsonify({"ok":False,"error":"OI is zero — market closed, no cache yet"}),503
 
-        # Step 5: PCR, Max Pain, Walls
+        # Step 5: Calculate metrics
         pcr=round(pe_oi/ce_oi,2) if ce_oi else 0
         mp=0;mpv=float("inf")
         for s in strikes_data:
@@ -945,15 +962,18 @@ def zerodha_oi():
                 "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
                 "spot":round(spot,1),"buildup":buildup,"pcr_interp":pcr_interp,
                 "mp_dist":round(spot-mp,0) if mp else 0,
-                "source":"zerodha_kite","expiry":best_exp,"instruments_count":len(instruments)}
-        cache[sym]={"data":result,"ts":time.time()}
-        print(f"[Kite OI] {sym} PCR:{pcr} MP:{mp} CE_OI:{ce_oi} PE_OI:{pe_oi}")
+                "source":"zerodha_kite","expiry":best_exp,
+                "instruments_count":len(instruments)}
+
+        # Save to disk — persists across restarts
+        save_cache(result)
+        print(f"[Kite OI ✅] {sym} PCR:{pcr} MP:{mp} CE:{ce_oi} PE:{pe_oi} Exp:{best_exp}")
         return jsonify({"ok":True,"sym":sym,"data":result,"time":now_ist().strftime("%H:%M:%S IST")})
 
     except Exception as e:
         import traceback
-        print(f"[Kite OI ERROR] {sym}: {e}\n{traceback.format_exc()[-400:]}")
-        return get_cache() or jsonify({"ok":False,"error":str(e),"trace":traceback.format_exc()[-400:]}),503
+        print(f"[Kite OI ERROR] {sym}: {e}\n{traceback.format_exc()[-300:]}")
+        return load_cache() or jsonify({"ok":False,"error":str(e)}),503
 
 @app.route("/debug_oi")
 def debug_oi():
