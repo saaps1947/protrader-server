@@ -282,13 +282,42 @@ def calc_oi(sym):
 def home():
     return jsonify({"status":"PRO Trader Server","time":now_ist().strftime("%d %b %Y %H:%M IST")})
 
+# Cache for stock data (updated every 5 min in background)
+_stock_cache = {}
+_stock_cache_ts = 0
+
+def update_stock_cache():
+    """Background update of all 50 stocks - called every 5 min"""
+    global _stock_cache, _stock_cache_ts
+    usd_inr = get_usd_inr()
+    stock_syms = [s for s in YAHOO.keys() if s not in ["NIFTY","BANKNIFTY","SENSEX","FINNIFTY","CRUDEOIL","GOLD"]]
+    result = {}
+    for sym in stock_syms:
+        ticker = YAHOO.get(sym)
+        if ticker:
+            d = yahoo(ticker)
+            if d and d.get("px"):
+                result[sym] = d
+    _stock_cache = result
+    _stock_cache_ts = time.time()
+    return result
+
+@app.route("/stocks")
+def stocks():
+    """Returns all Nifty 50 stock data - cached, updated every 5 min"""
+    global _stock_cache, _stock_cache_ts
+    if not _stock_cache or (time.time() - _stock_cache_ts) > 300:
+        update_stock_cache()
+    return jsonify({"ok":True, "data":_stock_cache, "ts":_stock_cache_ts,
+                    "age_s": int(time.time()-_stock_cache_ts)})
+
 @app.route("/market")
 def market():
     result={}
     usd_inr = get_usd_inr()
-    # Fetch all available instruments
-    all_syms = list(YAHOO.keys())
-    for sym in all_syms:
+    # Only fetch 6 CORE instruments (fast - <5s total)
+    core_syms = ["NIFTY","BANKNIFTY","SENSEX","FINNIFTY","CRUDEOIL","GOLD"]
+    for sym in core_syms:
         ticker=YAHOO.get(sym)
         if ticker:
             d=yahoo(ticker)
@@ -314,6 +343,8 @@ def market():
                     d["currency"] = "INR"
                     d["note"] = f"MCX approx (COMEX x {factor:.1f})"
                 result[sym]=d
+    # Also include cached stock data
+    result.update(_stock_cache)
     vix_val=17.5
     vd=nse_get("https://www.nseindia.com/api/allIndices")
     if vd:
@@ -351,8 +382,20 @@ def price(sym):
     if not t: return jsonify({"error":"Unknown"}),400
     return jsonify(yahoo(t,request.args.get("interval","5m"),request.args.get("range","1d")))
 
+# Background stock updater
+import threading
+def bg_stock_updater():
+    while True:
+        try:
+            update_stock_cache()
+        except: pass
+        time.sleep(300) # every 5 min
+
 if __name__=="__main__":
     nse_cookies()
+    # Start background stock updater
+    t = threading.Thread(target=bg_stock_updater, daemon=True)
+    t.start()
     app.run(host="0.0.0.0",port=10000,debug=False)
 
 # ══════════════════════════════════════════
