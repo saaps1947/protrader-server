@@ -756,14 +756,28 @@ def zerodha_oi():
     if sym not in OI_INDICES:
         return jsonify({"ok":False,"error":f"{sym} options not supported"}),400
 
-    # Get spot from prices cache to avoid extra API call
+    # Try to get spot from prices cache first (avoids extra API call)
+    # If cache is cold, get_oi() will fetch spot directly from Zerodha
     prices = CACHE.get_val("all_prices") or {}
     spot   = prices.get(sym,{}).get("px",0)
 
     data = get_oi(sym, key, token, spot)
     if data:
-        return jsonify({"ok":True,"sym":sym,"data":data,"time":ist_str()})
-    return jsonify({"ok":False,"error":"OI unavailable — check Zerodha token"}),503
+        age = data.get("cache_age_min",0)
+        note = f" (cached {age}min ago)" if data.get("cached") else ""
+        return jsonify({"ok":True,"sym":sym,"data":data,"time":ist_str(),"note":note})
+
+    # Return detailed error to help diagnose
+    return jsonify({
+        "ok":False,
+        "error":"OI unavailable",
+        "debug":{
+            "has_key": bool(key),
+            "has_token": bool(token),
+            "spot": spot,
+            "sym": sym
+        }
+    }),503
 
 @app.route("/smc/<sym>")
 def smc_route(sym):
@@ -818,24 +832,42 @@ def full_route(sym):
 
 @app.route("/test_kite")
 def test_kite():
-    """Diagnose Zerodha connection."""
+    """Diagnose Zerodha connection — open in browser to check."""
     key   = request.args.get("key","")
     token = request.args.get("token","")
     if not key or not token:
-        return jsonify({"error":"Pass ?key=...&token=..."})
+        return jsonify({"error":"Pass ?key=YOUR_API_KEY&token=YOUR_ACCESS_TOKEN"})
     hdrs = _kite_headers(key,token)
+    result = {"key_provided":bool(key),"token_provided":bool(token)}
     try:
-        profile = requests.get("https://api.kite.trade/user/profile",headers=hdrs,timeout=10)
-        quote   = requests.get("https://api.kite.trade/quote?i=NSE%3ANIFTY+50",headers=hdrs,timeout=10)
-        return jsonify({
-            "profile_ok": profile.status_code==200,
-            "profile": profile.json() if profile.status_code==200 else {"code":profile.status_code},
-            "quote_ok": quote.status_code==200,
-            "nifty_price": list(quote.json().get("data",{}).values())[0].get("last_price",0) if quote.status_code==200 else 0,
-            "time": ist_str()
-        })
+        # Test 1: Profile
+        r1 = requests.get("https://api.kite.trade/user/profile",headers=hdrs,timeout=10)
+        result["profile_status"] = r1.status_code
+        result["profile_ok"] = r1.status_code==200
+        if r1.status_code==200:
+            p=r1.json().get("data",{})
+            result["user"] = p.get("user_name","")
+
+        # Test 2: Spot price
+        r2 = requests.get("https://api.kite.trade/quote?i=NSE%3ANIFTY+50",headers=hdrs,timeout=10)
+        result["quote_status"] = r2.status_code
+        result["quote_ok"] = r2.status_code==200
+        if r2.status_code==200:
+            vals = list(r2.json().get("data",{}).values())
+            result["nifty_price"] = vals[0].get("last_price",0) if vals else 0
+
+        # Test 3: NFO instruments (just count lines)
+        r3 = requests.get("https://api.kite.trade/instruments/NFO",headers=hdrs,timeout=20)
+        result["instruments_status"] = r3.status_code
+        result["instruments_ok"] = r3.status_code==200
+        if r3.status_code==200:
+            result["nfo_instruments_count"] = len(r3.text.strip().split("\n"))
+
+        result["time"] = ist_str()
+        result["verdict"] = "✅ ALL OK — OI should work" if (result.get("profile_ok") and result.get("quote_ok") and result.get("instruments_ok")) else "❌ Some checks failed — see above"
     except Exception as e:
-        return jsonify({"error":str(e)})
+        result["error"] = str(e)
+    return jsonify(result)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -844,19 +876,20 @@ def test_kite():
 # ═══════════════════════════════════════════════════════════════
 
 def _warmup():
-    """Pre-fetch technicals for top 10 symbols on startup."""
-    time.sleep(3)
+    """Pre-warm cache on startup so first request is fast."""
+    time.sleep(5)
     print("[Warmup] Pre-fetching technicals for key symbols...")
     priority = ["NIFTY","BANKNIFTY","SENSEX","FINNIFTY","RELIANCE","HDFCBANK","TCS","INFY","ICICIBANK","SBIN"]
     for sym in priority:
         try:
             get_technicals(sym)
-            get_smc_cpr(sym)
-            time.sleep(0.5)
+            time.sleep(0.3)
         except: pass
     print("[Warmup] Done.")
 
+# Start warmup for both direct run AND gunicorn
+_warmup_thread = threading.Thread(target=_warmup, daemon=True)
+_warmup_thread.start()
+
 if __name__ == "__main__":
-    t = threading.Thread(target=_warmup, daemon=True)
-    t.start()
     app.run(host="0.0.0.0", port=10000, debug=False)
