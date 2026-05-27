@@ -1066,8 +1066,9 @@ def usdinr():
 @app.route("/market")
 def market():
     """
-    Full market snapshot: prices (Zerodha) + technicals (Yahoo cached).
-    Returns all instruments in one response.
+    Fast market snapshot: prices (Zerodha, one bulk call) + cached technicals.
+    Never blocks on Yahoo — uses cached technicals if available, skips if not.
+    Technicals are populated by background warmup and /smc calls.
     """
     key   = request.args.get("key","")
     token = request.args.get("token","")
@@ -1076,28 +1077,41 @@ def market():
     if not prices:
         return jsonify({"ok":False,"error":"No market data available"}),503
 
-    # Merge in technicals (cached, non-blocking)
+    # Merge technicals from cache ONLY — never fetch synchronously here
     result = {}
     for sym, p in prices.items():
         d = dict(p)
         inst = INSTRUMENTS.get(sym,{})
         if not inst.get("mcx"):
-            tech = get_technicals(sym)
+            # Only use cached technicals — don't block on Yahoo fetch
+            cache_key = f"tech_{sym}"
+            tech = CACHE.get_val(cache_key)
             if tech:
                 d["sma20"] = tech.get("sma20")
                 d["sma50"] = tech.get("sma50")
                 d["technicals"] = {
-                    "rsi14":    tech.get("rsi"),
-                    "trend":    tech.get("trend","NEUTRAL"),
-                    "crossover":tech.get("crossover","NONE"),
-                    "breakout": tech.get("breakout",False),
-                    "breakdown":tech.get("breakdown",False),
+                    "rsi14":      tech.get("rsi"),
+                    "trend":      tech.get("trend","NEUTRAL"),
+                    "crossover":  tech.get("crossover","NONE"),
+                    "breakout":   tech.get("breakout",False),
+                    "breakdown":  tech.get("breakdown",False),
                     "above_sma20":tech.get("above_sma20"),
                 }
         result[sym] = d
 
     vix = get_vix()
     sources = set(d.get("source","") for d in result.values())
+
+    # Trigger background technical refresh for uncached symbols
+    uncached = [sym for sym in result if not CACHE.fresh(f"tech_{sym}", TTL["technicals"])
+                and not INSTRUMENTS.get(sym,{}).get("mcx")]
+    if uncached:
+        def _bg_tech():
+            for sym in uncached[:10]:  # limit to 10 per cycle
+                try: get_technicals(sym)
+                except: pass
+        threading.Thread(target=_bg_tech, daemon=True).start()
+
     return jsonify({"ok":True,"data":result,"vix":vix,
                     "source":"zerodha" if "zerodha" in sources else "yahoo",
                     "time":now_ist().strftime("%H:%M:%S"),
@@ -1272,16 +1286,18 @@ def test_kite():
 # ═══════════════════════════════════════════════════════════════
 
 def _warmup():
-    """Pre-warm cache on startup so first request is fast."""
-    time.sleep(5)
-    print("[Warmup] Pre-fetching technicals for key symbols...")
-    priority = ["NIFTY","BANKNIFTY","SENSEX","FINNIFTY","RELIANCE","HDFCBANK","TCS","INFY","ICICIBANK","SBIN"]
-    for sym in priority:
-        try:
-            get_technicals(sym)
-            time.sleep(0.3)
+    """Pre-warm ALL technicals cache at startup using parallel threads."""
+    time.sleep(3)
+    print("[Warmup] Starting parallel technical fetch for all symbols...")
+    all_syms = [s for s,i in INSTRUMENTS.items() if not i.get("mcx")]
+
+    def fetch_one(sym):
+        try: get_technicals(sym)
         except: pass
-    print("[Warmup] Done.")
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        ex.map(fetch_one, all_syms)
+    print(f"[Warmup] Done — {len(all_syms)} symbols cached.")
 
 # Start warmup for both direct run AND gunicorn
 _warmup_thread = threading.Thread(target=_warmup, daemon=True)
