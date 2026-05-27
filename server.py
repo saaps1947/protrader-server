@@ -844,17 +844,13 @@ def test_kite():
         r1 = requests.get("https://api.kite.trade/user/profile",headers=hdrs,timeout=10)
         result["profile_status"] = r1.status_code
         result["profile_ok"] = r1.status_code==200
-        if r1.status_code==200:
-            p=r1.json().get("data",{})
-            result["user"] = p.get("user_name","")
+        result["profile_response"] = r1.json() if r1.status_code!=200 else {"name": r1.json().get("data",{}).get("user_name","")}
 
         # Test 2: Spot price
         r2 = requests.get("https://api.kite.trade/quote?i=NSE%3ANIFTY+50",headers=hdrs,timeout=10)
         result["quote_status"] = r2.status_code
         result["quote_ok"] = r2.status_code==200
-        if r2.status_code==200:
-            vals = list(r2.json().get("data",{}).values())
-            result["nifty_price"] = vals[0].get("last_price",0) if vals else 0
+        result["quote_response"] = r2.json() if r2.status_code!=200 else {"price": list(r2.json().get("data",{}).values())[0].get("last_price",0) if r2.json().get("data") else 0}
 
         # Test 3: NFO instruments (just count lines)
         r3 = requests.get("https://api.kite.trade/instruments/NFO",headers=hdrs,timeout=20)
