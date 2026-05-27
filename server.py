@@ -830,7 +830,48 @@ def full_route(sym):
         "vix": get_vix(),
         "time":ist_str()})
 
-@app.route("/test_kite")
+@app.route("/kite_token", methods=["POST"])
+def kite_token():
+    """
+    Exchange Zerodha request_token for access_token server-side.
+    Avoids CORS issues with direct browser calls to api.kite.trade.
+    POST body: api_key, request_token, api_secret
+    """
+    import hashlib
+    data      = request.get_json() or {}
+    api_key   = data.get("api_key","")
+    req_token = data.get("request_token","")
+    api_secret= data.get("api_secret","")
+
+    if not api_key or not req_token or not api_secret:
+        return jsonify({"ok":False,"error":"Need api_key, request_token, api_secret"}),400
+
+    # Generate checksum: SHA256(api_key + request_token + api_secret)
+    checksum = hashlib.sha256(f"{api_key}{req_token}{api_secret}".encode()).hexdigest()
+
+    try:
+        r = requests.post("https://api.kite.trade/session/token",
+            headers={"X-Kite-Version":"3","User-Agent":"Mozilla/5.0"},
+            data={"api_key":api_key,"request_token":req_token,"checksum":checksum},
+            timeout=15)
+        d = r.json()
+        if d.get("status")=="success" and d.get("data",{}).get("access_token"):
+            tok = d["data"]["access_token"]
+            print(f"[Kite] Token generated for {d['data'].get('user_name','')}")
+            return jsonify({
+                "ok":True,
+                "access_token": tok,
+                "user_name": d["data"].get("user_name",""),
+                "email": d["data"].get("email",""),
+                "time": ist_str()
+            })
+        else:
+            return jsonify({"ok":False,"error":d.get("message","Token exchange failed"),
+                           "response":d}),400
+    except Exception as e:
+        return jsonify({"ok":False,"error":str(e)}),503
+
+
 def test_kite():
     """Diagnose Zerodha connection — open in browser to check."""
     key   = request.args.get("key","")
