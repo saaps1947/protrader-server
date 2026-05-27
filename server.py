@@ -186,16 +186,20 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
         meta = res["meta"]
         ts   = res.get("timestamp",[])
         q    = res["indicators"]["quote"][0]
+        vol  = q.get("volume",[])
         candles = [
-            {"t":ts[i],"o":round(q["open"][i] or 0,2),
+            {"t":ts[i],
+             "o":round(q["open"][i] or 0,2),
              "h":round(q["high"][i] or 0,2),
              "l":round(q["low"][i] or 0,2),
-             "c":round(q["close"][i] or 0,2)}
+             "c":round(q["close"][i] or 0,2),
+             "v":int(vol[i] or 0) if i<len(vol) else 0}
             for i in range(len(ts)) if q["close"][i]
         ]
-        closes = [c["c"] for c in candles]
-        highs  = [c["h"] for c in candles]
-        lows   = [c["l"] for c in candles]
+        closes  = [c["c"] for c in candles]
+        highs   = [c["h"] for c in candles]
+        lows    = [c["l"] for c in candles]
+        volumes = [c["v"] for c in candles]
 
         def sma(n):
             return round(sum(closes[-n:])/n,2) if len(closes)>=n else None
@@ -216,6 +220,11 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
             if ps20<s50 and s20>s50: cross="GOLDEN_CROSS"
             elif ps20>s50 and s20<s50: cross="DEATH_CROSS"
 
+        # Volume analysis
+        avg_vol = int(sum(volumes[-20:])/20) if len(volumes)>=20 else 0
+        cur_vol = volumes[-1] if volumes else 0
+        vol_ratio = round(cur_vol/avg_vol,2) if avg_vol else 0
+
         return {
             "px":px, "chg":round(px-pc,2),
             "pct":round((px-pc)/pc*100,2) if pc else 0,
@@ -229,7 +238,8 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
             "trend":"BULLISH" if (s20 and s50 and s20>s50) else "BEARISH" if (s20 and s50 and s20<s50) else "NEUTRAL",
             "breakout":  bool(highs and px >= max(highs)*0.998),
             "breakdown": bool(lows  and px <= min(lows)*1.002),
-            "candles": candles[-50:],
+            "volume": cur_vol, "avg_volume": avg_vol, "vol_ratio": vol_ratio,
+            "candles": candles[-78:],  # ~6.5 hrs of 5min candles
         }
     except Exception as e:
         return None
@@ -257,7 +267,320 @@ def fetch_kite_instruments_nfo(key, token):
 # LAYER 3 — MARKET DATA ENGINE
 # ═══════════════════════════════════════════════════════════════
 
-def get_vix():
+
+# ═══════════════════════════════════════════════════════════════
+# LAYER 3B — MARKET INTELLIGENCE ENGINE
+# VWAP, ORB, Volume, Regime, OI Writer Behavior
+# ═══════════════════════════════════════════════════════════════
+
+def calc_vwap(candles):
+    """
+    Calculate VWAP from intraday candles.
+    VWAP = Σ(typical_price × volume) / Σ(volume)
+    Only uses today's candles (reset at market open 9:15 IST).
+    """
+    if not candles: return None
+    # Filter to today's candles only (after 9:15 IST = 3:45 UTC)
+    today = datetime.now(IST).date()
+    today_ts = int(datetime(today.year, today.month, today.day, 3, 45, tzinfo=timezone.utc).timestamp())
+    today_c = [c for c in candles if c.get("t",0) >= today_ts]
+    if not today_c: today_c = candles[-30:]  # fallback to last 30
+
+    cum_pv = sum((c["h"]+c["l"]+c["c"])/3 * c.get("v",0) for c in today_c)
+    cum_v  = sum(c.get("v",0) for c in today_c)
+    if not cum_v: return None
+    return round(cum_pv / cum_v, 2)
+
+def calc_orb(candles):
+    """
+    Opening Range Breakout — first 15 minutes (3 × 5min candles after 9:15).
+    Returns ORB high, ORB low, and whether price has broken out.
+    """
+    if not candles: return None
+    today = datetime.now(IST).date()
+    # 9:15 IST = 3:45 UTC, 9:30 IST = 4:00 UTC
+    orb_start = int(datetime(today.year, today.month, today.day, 3, 45, tzinfo=timezone.utc).timestamp())
+    orb_end   = int(datetime(today.year, today.month, today.day, 4,  0, tzinfo=timezone.utc).timestamp())
+    orb_c = [c for c in candles if orb_start <= c.get("t",0) < orb_end]
+    if not orb_c: return None
+    orb_h = max(c["h"] for c in orb_c)
+    orb_l = min(c["l"] for c in orb_c)
+    cur   = candles[-1]["c"]
+    return {
+        "high": round(orb_h, 2),
+        "low":  round(orb_l, 2),
+        "range_pct": round((orb_h-orb_l)/orb_l*100, 2),
+        "breakout":  cur > orb_h * 1.001,
+        "breakdown": cur < orb_l * 0.999,
+        "inside":    orb_l * 0.999 <= cur <= orb_h * 1.001,
+    }
+
+def calc_volume_analysis(candles):
+    """
+    Detect volume expansion/contraction vs 20-candle average.
+    Also detects volume climax and drying up.
+    """
+    if not candles or len(candles) < 5: return {}
+    vols = [c.get("v",0) for c in candles]
+    avg20 = sum(vols[-20:])/20 if len(vols)>=20 else sum(vols)/len(vols)
+    cur   = vols[-1]
+    prev5_avg = sum(vols[-6:-1])/5 if len(vols)>=6 else avg20
+    ratio = round(cur/avg20, 2) if avg20 else 0
+
+    # Detect volume trend in last 5 candles
+    recent = vols[-5:]
+    vol_rising = all(recent[i] <= recent[i+1] for i in range(len(recent)-1))
+    vol_falling = all(recent[i] >= recent[i+1] for i in range(len(recent)-1))
+
+    return {
+        "current": cur,
+        "avg_20":  int(avg20),
+        "ratio":   ratio,
+        "expanding": ratio > 1.5,
+        "contracting": ratio < 0.5,
+        "climax": ratio > 3.0,   # volume spike — often reversal
+        "drying_up": ratio < 0.3, # very low volume — no conviction
+        "rising": vol_rising,
+        "falling": vol_falling,
+        "label": ("🚀 CLIMAX" if ratio>3 else
+                  "📈 EXPANDING" if ratio>1.5 else
+                  "📉 CONTRACTING" if ratio<0.5 else
+                  "💧 DRYING UP" if ratio<0.3 else "NORMAL"),
+    }
+
+def calc_oi_writer_behavior(oi_data):
+    """
+    Interpret OI data to detect writer behavior:
+    - CE wall shifting up/down (writers rolling)
+    - Trapped writers (shorts/longs caught)
+    - Aggressive writing vs unwinding
+    - Gamma squeeze zones
+    """
+    if not oi_data: return {}
+    ce_oi  = oi_data.get("ce_oi", 0)
+    pe_oi  = oi_data.get("pe_oi", 0)
+    ce_chg = oi_data.get("ce_chg", 0)
+    pe_chg = oi_data.get("pe_chg", 0)
+    pcr    = oi_data.get("pcr", 0)
+    mp     = oi_data.get("max_pain", 0)
+    spot   = oi_data.get("spot", 0)
+    ce_wall= oi_data.get("ce_wall", 0)
+    pe_wall= oi_data.get("pe_wall", 0)
+
+    signals = []
+    writer_bias = "NEUTRAL"
+
+    # CE writer behavior
+    if ce_chg > 0:
+        if ce_chg > ce_oi * 0.05:  # >5% fresh CE writing
+            signals.append(f"Aggressive CE writing at ₹{ce_wall} — strong resistance")
+            writer_bias = "BEARISH"
+        else:
+            signals.append(f"Fresh CE writing building at ₹{ce_wall}")
+    elif ce_chg < 0:
+        signals.append(f"CE writers exiting (short covering) — bullish pressure")
+        writer_bias = "BULLISH"
+
+    # PE writer behavior
+    if pe_chg > 0:
+        if pe_chg > pe_oi * 0.05:
+            signals.append(f"Aggressive PE writing at ₹{pe_wall} — strong support")
+            writer_bias = "BULLISH" if writer_bias == "NEUTRAL" else writer_bias
+        else:
+            signals.append(f"Fresh PE writing building at ₹{pe_wall}")
+    elif pe_chg < 0:
+        signals.append(f"PE writers exiting (long unwinding) — bearish pressure")
+
+    # Max pain dynamics
+    if spot and mp:
+        dist = spot - mp
+        dist_pct = round(dist/mp*100, 2)
+        if abs(dist_pct) < 0.3:
+            signals.append(f"Price pinned near Max Pain ₹{mp} — expiry magnet active")
+        elif dist_pct > 1.0:
+            signals.append(f"Price ₹{abs(dist):.0f} above Max Pain — gravitational pull down")
+        elif dist_pct < -1.0:
+            signals.append(f"Price ₹{abs(dist):.0f} below Max Pain — gravitational pull up")
+
+    # Gamma squeeze detection
+    if ce_wall and pe_wall and spot:
+        range_width = (ce_wall - pe_wall) / spot * 100
+        if range_width < 1.5:
+            signals.append(f"Tight OI band ₹{pe_wall}–₹{ce_wall} ({range_width:.1f}%) — gamma squeeze risk")
+
+    # Trapped writers detection
+    if spot and ce_wall and spot > ce_wall * 1.005:
+        signals.append(f"CE writers at ₹{ce_wall} trapped — price above wall, forced to cover")
+        writer_bias = "BULLISH"
+    if spot and pe_wall and spot < pe_wall * 0.995:
+        signals.append(f"PE writers at ₹{pe_wall} trapped — price below wall, forced to cover")
+        writer_bias = "BEARISH"
+
+    return {
+        "writer_bias": writer_bias,
+        "signals": signals[:3],
+        "ce_writing": ce_chg > 0,
+        "pe_writing": pe_chg > 0,
+        "ce_unwinding": ce_chg < 0,
+        "pe_unwinding": pe_chg < 0,
+        "pinned": bool(spot and mp and abs((spot-mp)/mp) < 0.003),
+        "trapped_ce_writers": bool(spot and ce_wall and spot > ce_wall*1.005),
+        "trapped_pe_writers": bool(spot and pe_wall and spot < pe_wall*0.995),
+    }
+
+def detect_market_regime(candles, oi_data, vwap, orb, vol_analysis):
+    """
+    Detect the current market regime:
+    TRENDING_UP, TRENDING_DOWN, MEAN_REVERT, RANGE_BOUND,
+    EXPIRY_CHAOS, BREAKOUT_DAY, CHOPPY
+    """
+    if not candles or len(candles) < 10:
+        return {"regime": "UNKNOWN", "label": "Insufficient data", "confidence": 0}
+
+    closes = [c["c"] for c in candles[-20:]]
+    highs  = [c["h"] for c in candles[-20:]]
+    lows   = [c["l"] for c in candles[-20:]]
+    px     = closes[-1]
+
+    scores = {}
+
+    # Trending signals
+    if vwap:
+        above_vwap = px > vwap
+        vwap_dist  = abs(px - vwap) / vwap * 100
+    else:
+        above_vwap = None; vwap_dist = 0
+
+    # ATR (Average True Range) for volatility
+    trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+           for i in range(1, len(closes))]
+    atr = sum(trs[-10:])/10 if len(trs)>=10 else sum(trs)/len(trs) if trs else 0
+    atr_pct = round(atr/px*100, 2) if px else 0
+
+    # Day range
+    day_h = max(highs); day_l = min(lows)
+    day_range_pct = (day_h - day_l) / day_l * 100 if day_l else 0
+
+    # OI context
+    pcr = oi_data.get("pcr", 0) if oi_data else 0
+    mp  = oi_data.get("max_pain", 0) if oi_data else 0
+    pinned = bool(mp and px and abs((px-mp)/mp) < 0.003)
+
+    # Regime scoring
+    trending_up   = (above_vwap and
+                     closes[-1] > closes[-5] and
+                     vol_analysis.get("expanding") and
+                     orb and orb.get("breakout"))
+    trending_down = (not above_vwap and
+                     closes[-1] < closes[-5] and
+                     vol_analysis.get("expanding") and
+                     orb and orb.get("breakdown"))
+    expiry_chaos  = (pinned and pcr and 0.8 < pcr < 1.2)
+    breakout_day  = (orb and orb.get("range_pct",0) < 0.3 and
+                     (orb.get("breakout") or orb.get("breakdown")) and
+                     vol_analysis.get("expanding"))
+    choppy        = (vol_analysis.get("contracting") and
+                     orb and orb.get("inside") and
+                     day_range_pct < 0.5)
+    mean_revert   = (vol_analysis.get("climax") or
+                     (vwap and vwap_dist > 0.8 and not vol_analysis.get("expanding")))
+
+    if trending_up:    regime, label, conf = "TRENDING_UP",    "Trending Up — ride the trend",       82
+    elif trending_down:regime, label, conf = "TRENDING_DOWN",  "Trending Down — ride the trend",     82
+    elif breakout_day: regime, label, conf = "BREAKOUT_DAY",   "Breakout Day — ORB triggered",       85
+    elif expiry_chaos: regime, label, conf = "EXPIRY_CHAOS",   "Expiry Pinning — near Max Pain",     75
+    elif mean_revert:  regime, label, conf = "MEAN_REVERT",    "Mean Reversion — extremes to VWAP",  72
+    elif choppy:       regime, label, conf = "CHOPPY",         "Choppy — low conviction, wait",      65
+    else:              regime, label, conf = "RANGE_BOUND",    "Range Bound — trade extremes",       60
+
+    return {
+        "regime": regime, "label": label, "confidence": conf,
+        "atr_pct": atr_pct, "day_range_pct": round(day_range_pct,2),
+        "above_vwap": above_vwap, "pinned_to_mp": pinned,
+    }
+
+def generate_narrative(sym, px, regime, vwap, orb, vol, oi_data, writer, smc, tech):
+    """
+    Generate a trader-readable intelligence narrative.
+    Interprets market behavior — NOT a prediction, an interpretation.
+    """
+    parts = []
+    bias_signals = []
+    bear_signals = []
+
+    # 1. Market structure context
+    r = regime.get("regime","")
+    if r == "TRENDING_UP":
+        parts.append(f"{sym} is in a confirmed uptrend — price holding above VWAP ₹{vwap} with expanding volume.")
+    elif r == "TRENDING_DOWN":
+        parts.append(f"{sym} is in a confirmed downtrend — price below VWAP ₹{vwap} with sellers in control.")
+    elif r == "BREAKOUT_DAY":
+        orb_d = "above" if orb and orb.get("breakout") else "below"
+        parts.append(f"{sym} has broken {orb_d} the Opening Range (₹{orb.get('low',0) if orb else 0}–₹{orb.get('high',0) if orb else 0}) — breakout day setup active.")
+    elif r == "EXPIRY_CHAOS":
+        parts.append(f"{sym} is pinned near Max Pain ₹{oi_data.get('max_pain',0)} — expiry gravity dominant, expect range-bound action.")
+    elif r == "MEAN_REVERT":
+        parts.append(f"{sym} showing mean reversion setup — price extended from VWAP, likely to retrace.")
+    elif r == "CHOPPY":
+        parts.append(f"{sym} is in low-conviction chop — volume contracting, no clear directional edge. Avoid new positions.")
+
+    # 2. OI/Options intelligence
+    if writer and writer.get("signals"):
+        parts.append(writer["signals"][0])
+
+    # 3. VWAP context
+    if vwap and px:
+        dist = round((px - vwap)/vwap*100, 2)
+        if abs(dist) < 0.1:
+            parts.append(f"Price at VWAP ₹{vwap} — key decision zone. Direction of break matters.")
+        elif dist > 0.3:
+            bias_signals.append(f"Holding above VWAP ₹{vwap} (+{dist}%) — bulls in control")
+        elif dist < -0.3:
+            bear_signals.append(f"Below VWAP ₹{vwap} ({dist}%) — bears defending")
+
+    # 4. Liquidity sweep context
+    sweeps = smc.get("sweep",[]) if smc else []
+    if sweeps:
+        parts.append(sweeps[0].get("signal",""))
+
+    # 5. Volume confirmation
+    vol_lbl = vol.get("label","") if vol else ""
+    if vol_lbl in ["🚀 CLIMAX","📈 EXPANDING"]:
+        parts.append(f"Volume {vol_lbl.lower()} ({vol.get('ratio',0)}x avg) — move has conviction.")
+    elif vol_lbl in ["💧 DRYING UP","📉 CONTRACTING"]:
+        parts.append(f"Volume {vol_lbl.lower()} ({vol.get('ratio',0)}x avg) — caution, low participation.")
+
+    # 6. Build bias conclusion
+    writer_bias = writer.get("writer_bias","NEUTRAL") if writer else "NEUTRAL"
+    struct = smc.get("structure","") if smc else ""
+    crossover = tech.get("crossover","NONE") if tech else "NONE"
+
+    if crossover == "GOLDEN_CROSS":
+        bias_signals.append("Golden Cross — major bullish trend change")
+    elif crossover == "DEATH_CROSS":
+        bear_signals.append("Death Cross — major bearish trend change")
+
+    if struct in ["HH_HL","BULLISH"]:
+        bias_signals.append(f"Market structure {struct} — uptrend intact")
+    elif struct in ["LH_LL","BEARISH"]:
+        bear_signals.append(f"Market structure {struct} — downtrend intact")
+
+    if writer_bias == "BULLISH":
+        bias_signals.append("Option writers supporting upside")
+    elif writer_bias == "BEARISH":
+        bear_signals.append("Option writers capping upside")
+
+    # Conclusion
+    if len(bias_signals) > len(bear_signals):
+        conclusion = f"Bias: BULLISH above ₹{vwap or px}. " + " | ".join(bias_signals[:2])
+    elif len(bear_signals) > len(bias_signals):
+        conclusion = f"Bias: BEARISH below ₹{vwap or px}. " + " | ".join(bear_signals[:2])
+    else:
+        conclusion = f"Bias: NEUTRAL — wait for VWAP reclaim or break with volume."
+
+    parts.append(conclusion)
+    return " ".join(p for p in parts if p)[:500]  # max 500 chars
+
     """India VIX from Yahoo. Cached 1 min."""
     if CACHE.fresh("vix", TTL["vix"]):
         return CACHE.get_val("vix")
@@ -648,8 +971,8 @@ def calc_smc(candles):
 
     return result
 
-def get_smc_cpr(sym):
-    """Get SMC + CPR for a symbol. Cached 5 min."""
+def get_smc_cpr(sym, oi_data=None):
+    """Get full market intelligence for a symbol. Cached 5 min."""
     cache_key = f"smc_{sym}"
     if CACHE.fresh(cache_key, TTL["smc"]):
         return CACHE.get_val(cache_key)
@@ -659,21 +982,37 @@ def get_smc_cpr(sym):
     if not ticker: return {}
 
     result = {}
-    # SMC from 5min candles
-    d5 = fetch_yahoo_candles(ticker,"5m","2d")
-    if d5 and d5.get("candles"):
-        result["smc"] = calc_smc(d5["candles"])
 
-    # CPR from daily candles
+    # ── 5min candles (intraday intelligence) ──
+    d5 = fetch_yahoo_candles(ticker,"5m","2d")
+    candles5 = d5.get("candles",[]) if d5 else []
+
+    # SMC from 5min
+    if candles5:
+        result["smc"] = calc_smc(candles5)
+
+    # VWAP
+    vwap = calc_vwap(candles5)
+    if vwap: result["vwap"] = vwap
+
+    # ORB
+    orb = calc_orb(candles5)
+    if orb: result["orb"] = orb
+
+    # Volume analysis
+    vol = calc_volume_analysis(candles5)
+    if vol: result["volume"] = vol
+
+    # ── Daily candles (CPR + MTF) ──
     d1d = fetch_yahoo_candles(ticker,"1d","1mo")
     if d1d and d1d.get("candles"):
         cpr = calc_cpr(d1d["candles"])
         if cpr: result["cpr"] = cpr
 
-    # MTF alignment
-    tf5  = d5.get("trend","") if d5 else ""
-    d15  = fetch_yahoo_candles(ticker,"15m","5d")
-    d1h  = fetch_yahoo_candles(ticker,"1h","1mo")
+    # ── MTF alignment ──
+    d15 = fetch_yahoo_candles(ticker,"15m","5d")
+    d1h = fetch_yahoo_candles(ticker,"1h","1mo")
+    tf5  = d5.get("trend","")  if d5  else ""
     tf15 = d15.get("trend","") if d15 else ""
     tf1h = d1h.get("trend","") if d1h else ""
     trends=[tf5,tf15,tf1h]
@@ -683,6 +1022,24 @@ def get_smc_cpr(sym):
         "alignment": ("STRONG_BULL" if bulls==3 else "BULL" if bulls==2
                       else "STRONG_BEAR" if bears==3 else "BEAR" if bears==2 else "MIXED")
     }
+
+    # ── OI writer behavior ──
+    writer = calc_oi_writer_behavior(oi_data)
+    if writer: result["writer"] = writer
+
+    # ── Market regime ──
+    tech = get_technicals(sym)
+    regime = detect_market_regime(candles5, oi_data, vwap, orb, vol)
+    result["regime"] = regime
+
+    # ── AI narrative ──
+    px = d5.get("px",0) if d5 else 0
+    narrative = generate_narrative(
+        sym, px, regime, vwap, orb, vol, oi_data, writer,
+        result.get("smc",{}), tech
+    )
+    result["narrative"] = narrative
+
     CACHE.set(cache_key, result)
     return result
 
@@ -781,11 +1138,13 @@ def zerodha_oi():
 
 @app.route("/smc/<sym>")
 def smc_route(sym):
-    """SMC + CPR + MTF for a symbol."""
+    """Full market intelligence: SMC + CPR + MTF + VWAP + ORB + Volume + Regime + Narrative."""
     sym = sym.upper()
     if sym not in INSTRUMENTS:
         return jsonify({"ok":False,"error":"Unknown symbol"}),400
-    data = get_smc_cpr(sym)
+    # Pass OI data if available for writer behavior analysis
+    oi_data = CACHE.get_val(f"oi_{sym}")
+    data = get_smc_cpr(sym, oi_data)
     return jsonify({"ok":True,"sym":sym,**data,"time":ist_str()})
 
 @app.route("/price/<sym>")
