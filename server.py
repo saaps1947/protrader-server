@@ -634,76 +634,91 @@ def get_technicals(sym):
             "above_sma20": d["px"] > d["sma20"] if d.get("px") and d.get("sma20") else None,
             "high":d.get("high",0),"low":d.get("low",0),
             "open":d.get("open",0),"prev_close":d.get("prev_close",0),
-            "candles":d.get("candles",[]),
+            "volume":d.get("volume",0),"vol_ratio":d.get("vol_ratio",0),
         }
         CACHE.set(cache_key, tech)
+        # Store candles separately — used by SMC/VWAP but NOT sent in /market
+        if d.get("candles"):
+            CACHE.set(f"candles5_{sym}", d["candles"])
         return tech
-    # Return stale data rather than nothing
     return CACHE.get_val(cache_key) or {}
 
 def get_all_prices(key, token):
     """
-    Get live prices for all instruments.
-    Zerodha (real-time) for equities/indices, Yahoo for commodities.
-    Cached 30s. Returns dict of sym → price data.
+    Live prices from Zerodha ONLY (one bulk call).
+    Yahoo only for Crude Oil and Gold (MCX — not on Zerodha equity).
+    On token expiry: return stale cache so app still works.
     """
     cache_key = "all_prices"
+
+    # Return fresh cache if available
     if CACHE.fresh(cache_key, TTL["prices"]):
         return CACHE.get_val(cache_key)
 
     result = {}
     usd_inr = get_usdinr()
 
-    # ── Zerodha bulk quote (one API call for all 50 stocks) ──
+    # ── Zerodha bulk quote — ONE call for all 50 stocks ──
     kite_syms = [inst["kite"] for sym,inst in INSTRUMENTS.items() if inst.get("kite")]
-    kite_data  = fetch_kite_quotes(key, token, kite_syms) if key and token else {}
-    token_ok   = not kite_data.get("_token_expired", False)
-    use_kite   = token_ok and len(kite_data) > 10
+    kite_data = fetch_kite_quotes(key, token, kite_syms) if key and token else {}
+    token_expired = kite_data.get("_token_expired", False)
 
-    for sym, inst in INSTRUMENTS.items():
-        if inst.get("mcx"):
-            # MCX commodities — Yahoo only
-            d = fetch_yahoo_candles(inst["yahoo"])
-            if not d or not d.get("px"): continue
-            px = d["px"]
-            if sym == "CRUDEOIL" and px < 500:
-                px = round(px * usd_inr, 2)
-                chg = round(d["chg"] * usd_inr, 2)
-            elif sym == "GOLD" and px < 5000:
-                f = usd_inr / 31.1 * 10
-                px = round(d["px"] * f, 2)
-                chg = round(d["chg"] * f, 2)
-            else:
-                chg = d["chg"]
-            result[sym] = {"px":px,"chg":chg,"pct":d.get("pct",0),
-                           "high":d.get("high",0),"low":d.get("low",0),
-                           "open":d.get("open",0),"source":"yahoo_mcx"}
-        elif use_kite and inst.get("kite") and inst["kite"] in kite_data:
-            q  = kite_data[inst["kite"]]
-            px = q.get("last_price",0)
-            if not px: continue
+    if token_expired:
+        # Token expired — return stale cache so app still shows last prices
+        stale = CACHE.get_val(cache_key)
+        if stale:
+            print("[Prices] Token expired — serving stale cache")
+            return stale
+        # No cache — return empty, app will show dashes
+        print("[Prices] Token expired and no cache — reconnect Zerodha")
+        return {}
+
+    use_kite = len(kite_data) > 10
+
+    if use_kite:
+        for sym, inst in INSTRUMENTS.items():
+            if inst.get("mcx"): continue  # Skip MCX — handled below
+            q = kite_data.get(inst.get("kite",""), {})
+            if not q or not q.get("last_price"): continue
+            px = q["last_price"]
             pc = q.get("ohlc",{}).get("close", px)
             result[sym] = {
-                "px":px,
-                "chg":round(px-pc,2),
-                "pct":round((px-pc)/pc*100,2) if pc else 0,
-                "high":q.get("ohlc",{}).get("high",0),
-                "low": q.get("ohlc",{}).get("low",0),
-                "open":q.get("ohlc",{}).get("open",0),
-                "prev_close":pc,
-                "volume":q.get("volume",0),
-                "source":"zerodha"
+                "px": px,
+                "chg": round(px-pc, 2),
+                "pct": round((px-pc)/pc*100, 2) if pc else 0,
+                "high":   q.get("ohlc",{}).get("high", 0),
+                "low":    q.get("ohlc",{}).get("low", 0),
+                "open":   q.get("ohlc",{}).get("open", 0),
+                "prev_close": pc,
+                "volume": q.get("volume", 0),
+                "source": "zerodha"
             }
+        print(f"[Prices] Zerodha: {len(result)} symbols")
+    else:
+        # No Zerodha data (no credentials) — use stale cache
+        stale = CACHE.get_val(cache_key)
+        if stale:
+            print("[Prices] No Zerodha creds — serving stale cache")
+            return stale
+
+    # ── MCX Commodities — Yahoo only (not on Zerodha equity segment) ──
+    for sym in ["CRUDEOIL", "GOLD"]:
+        inst = INSTRUMENTS[sym]
+        d = fetch_yahoo_candles(inst["yahoo"])
+        if not d or not d.get("px"): continue
+        px = d["px"]
+        if sym == "CRUDEOIL" and px < 500:
+            px = round(px * usd_inr, 2)
+            chg = round(d["chg"] * usd_inr, 2)
+        elif sym == "GOLD" and px < 5000:
+            f = usd_inr / 31.1 * 10
+            px = round(d["px"] * f, 2)
+            chg = round(d["chg"] * f, 2)
         else:
-            # Fallback to Yahoo
-            ticker = inst.get("yahoo","")
-            if not ticker: continue
-            d = fetch_yahoo_candles(ticker)
-            if not d or not d.get("px"): continue
-            result[sym] = {"px":d["px"],"chg":d["chg"],"pct":d.get("pct",0),
-                           "high":d.get("high",0),"low":d.get("low",0),
-                           "open":d.get("open",0),"prev_close":d.get("prev_close",0),
-                           "source":"yahoo"}
+            chg = d["chg"]
+        result[sym] = {"px":px,"chg":chg,"pct":d.get("pct",0),
+                       "high":d.get("high",0),"low":d.get("low",0),
+                       "open":d.get("open",0),"source":"yahoo_mcx"}
 
     if result:
         CACHE.set(cache_key, result)
@@ -985,7 +1000,8 @@ def get_smc_cpr(sym, oi_data=None):
 
     # ── 5min candles (intraday intelligence) ──
     d5 = fetch_yahoo_candles(ticker,"5m","2d")
-    candles5 = d5.get("candles",[]) if d5 else []
+    # Use cached candles if available (avoids duplicate Yahoo fetch)
+    candles5 = CACHE.get_val(f"candles5_{sym}") or (d5.get("candles",[]) if d5 else [])
 
     # SMC from 5min
     if candles5:
@@ -1062,6 +1078,17 @@ def ping():
 @app.route("/usdinr")
 def usdinr():
     return jsonify({"ok":True,"rate":get_usdinr(),"time":ist_str()})
+
+@app.route("/prices")
+def prices_only():
+    """Ultra-fast prices-only endpoint. No technicals. ~2s response."""
+    key   = request.args.get("key","")
+    token = request.args.get("token","")
+    prices = get_all_prices(key, token)
+    if not prices:
+        return jsonify({"ok":False,"error":"No price data"}),503
+    vix = get_vix()
+    return jsonify({"ok":True,"data":prices,"vix":vix,"time":now_ist().strftime("%H:%M:%S")})
 
 @app.route("/market")
 def market():
