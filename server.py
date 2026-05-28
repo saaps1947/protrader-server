@@ -645,81 +645,73 @@ def get_technicals(sym):
 
 def get_all_prices(key, token):
     """
-    Live prices from Zerodha ONLY (one bulk call).
-    Yahoo only for Crude Oil and Gold (MCX — not on Zerodha equity).
-    On token expiry: return stale cache so app still works.
+    Live prices from Zerodha ONLY — one bulk call, <3s target.
+    Yahoo only for Crude Oil and Gold (MCX).
     """
     cache_key = "all_prices"
+    t0 = time.time()
 
-    # Return fresh cache if available
+    # Return fresh cache immediately
     if CACHE.fresh(cache_key, TTL["prices"]):
         return CACHE.get_val(cache_key)
 
     result = {}
     usd_inr = get_usdinr()
 
-    # ── Zerodha bulk quote — ONE call for all 50 stocks ──
+    # ── Zerodha bulk quote ──
     kite_syms = [inst["kite"] for sym,inst in INSTRUMENTS.items() if inst.get("kite")]
     kite_data = fetch_kite_quotes(key, token, kite_syms) if key and token else {}
-    token_expired = kite_data.get("_token_expired", False)
+    t1 = time.time()
+    print(f"[Prices] Zerodha quote: {t1-t0:.2f}s, {len(kite_data)} symbols")
 
+    token_expired = kite_data.get("_token_expired", False)
     if token_expired:
-        # Token expired — return stale cache so app still shows last prices
         stale = CACHE.get_val(cache_key)
         if stale:
-            print("[Prices] Token expired — serving stale cache")
+            print(f"[Prices] Token expired — stale cache ({len(stale)} syms)")
             return stale
-        # No cache — return empty, app will show dashes
-        print("[Prices] Token expired and no cache — reconnect Zerodha")
         return {}
 
-    use_kite = len(kite_data) > 10
-
+    use_kite = len(kite_data) >= 1
     if use_kite:
         for sym, inst in INSTRUMENTS.items():
-            if inst.get("mcx"): continue  # Skip MCX — handled below
-            q = kite_data.get(inst.get("kite",""), {})
+            if inst.get("mcx"): continue
+            kite_sym = inst.get("kite","")
+            if not kite_sym: continue
+            q = kite_data.get(kite_sym, {})
             if not q or not q.get("last_price"): continue
             px = q["last_price"]
             pc = q.get("ohlc",{}).get("close", px)
             result[sym] = {
-                "px": px,
-                "chg": round(px-pc, 2),
-                "pct": round((px-pc)/pc*100, 2) if pc else 0,
-                "high":   q.get("ohlc",{}).get("high", 0),
-                "low":    q.get("ohlc",{}).get("low", 0),
-                "open":   q.get("ohlc",{}).get("open", 0),
-                "prev_close": pc,
-                "volume": q.get("volume", 0),
-                "source": "zerodha"
+                "px":px, "chg":round(px-pc,2),
+                "pct":round((px-pc)/pc*100,2) if pc else 0,
+                "high":q.get("ohlc",{}).get("high",0),
+                "low": q.get("ohlc",{}).get("low",0),
+                "open":q.get("ohlc",{}).get("open",0),
+                "prev_close":pc, "volume":q.get("volume",0),
+                "source":"zerodha"
             }
-        print(f"[Prices] Zerodha: {len(result)} symbols")
+        print(f"[Prices] Zerodha mapped: {len(result)} symbols in {time.time()-t0:.2f}s")
     else:
-        # No Zerodha data (no credentials) — use stale cache
         stale = CACHE.get_val(cache_key)
         if stale:
-            print("[Prices] No Zerodha creds — serving stale cache")
+            print(f"[Prices] No Kite data — stale cache")
             return stale
 
-    # ── MCX Commodities — Yahoo only (not on Zerodha equity segment) ──
-    for sym in ["CRUDEOIL", "GOLD"]:
+    # MCX only — 2 calls
+    for sym in ["CRUDEOIL","GOLD"]:
         inst = INSTRUMENTS[sym]
         d = fetch_yahoo_candles(inst["yahoo"])
         if not d or not d.get("px"): continue
         px = d["px"]
-        if sym == "CRUDEOIL" and px < 500:
-            px = round(px * usd_inr, 2)
-            chg = round(d["chg"] * usd_inr, 2)
-        elif sym == "GOLD" and px < 5000:
-            f = usd_inr / 31.1 * 10
-            px = round(d["px"] * f, 2)
-            chg = round(d["chg"] * f, 2)
-        else:
-            chg = d["chg"]
-        result[sym] = {"px":px,"chg":chg,"pct":d.get("pct",0),
-                       "high":d.get("high",0),"low":d.get("low",0),
-                       "open":d.get("open",0),"source":"yahoo_mcx"}
+        if sym=="CRUDEOIL" and px<500: px=round(px*usd_inr,2); chg=round(d["chg"]*usd_inr,2)
+        elif sym=="GOLD" and px<5000: f=usd_inr/31.1*10; px=round(d["px"]*f,2); chg=round(d["chg"]*f,2)
+        else: chg=d["chg"]
+        result[sym]={"px":px,"chg":chg,"pct":d.get("pct",0),
+                     "high":d.get("high",0),"low":d.get("low",0),
+                     "open":d.get("open",0),"source":"yahoo_mcx"}
 
+    print(f"[Prices] TOTAL: {len(result)} symbols in {time.time()-t0:.2f}s")
     if result:
         CACHE.set(cache_key, result)
     return result
@@ -1078,6 +1070,77 @@ def ping():
 @app.route("/usdinr")
 def usdinr():
     return jsonify({"ok":True,"rate":get_usdinr(),"time":ist_str()})
+
+@app.route("/hero")
+def hero():
+    """
+    Ultra-fast hero data — NIFTY + BANKNIFTY only.
+    Target: <1 second. Called first, independently of /market.
+    """
+    key   = request.args.get("key","")
+    token = request.args.get("token","")
+    t0    = time.time()
+
+    # Check cache first
+    cached_prices = CACHE.get_val("all_prices")
+    if cached_prices:
+        result = {sym: cached_prices[sym] for sym in ["NIFTY","BANKNIFTY","FINNIFTY","SENSEX"] if sym in cached_prices}
+        if result:
+            return jsonify({"ok":True,"data":result,"source":"cache","time":now_ist().strftime("%H:%M:%S")})
+
+    # Fetch only 4 index quotes — very fast
+    if key and token:
+        hdrs = _kite_headers(key, token)
+        indices = {"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK",
+                   "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
+        qs = "&".join(f"i={v}" for v in indices.values())
+        try:
+            r = requests.get(f"https://api.kite.trade/quote?{qs}", headers=hdrs, timeout=8)
+            if r.status_code == 200:
+                data = r.json().get("data",{})
+                result = {}
+                for sym, kite_sym in indices.items():
+                    q = data.get(kite_sym,{})
+                    if not q: continue
+                    px = q.get("last_price",0)
+                    pc = q.get("ohlc",{}).get("close",px)
+                    result[sym] = {"px":px,"chg":round(px-pc,2),"pct":round((px-pc)/pc*100,2) if pc else 0,"source":"zerodha"}
+                print(f"[Hero] {len(result)} indices in {time.time()-t0:.2f}s")
+                return jsonify({"ok":True,"data":result,"vix":get_vix(),"time":now_ist().strftime("%H:%M:%S")})
+        except Exception as e:
+            print(f"[Hero] Error: {e}")
+
+    return jsonify({"ok":False,"error":"No data"}),503
+
+@app.route("/debug_market")
+def debug_market():
+    """Shows exactly what /market sees — use to diagnose issues."""
+    key   = request.args.get("key","")
+    token = request.args.get("token","")
+    
+    result = {"time": ist_str(), "key_provided": bool(key), "token_provided": bool(token)}
+    
+    # Test Zerodha
+    if key and token:
+        kite_syms = ["NSE:NIFTY 50","NSE:HDFCBANK","NSE:RELIANCE","NSE:TCS"]
+        kite_data = fetch_kite_quotes(key, token, kite_syms)
+        result["zerodha_token_expired"] = kite_data.get("_token_expired", False)
+        result["zerodha_symbols_returned"] = len(kite_data)
+        result["zerodha_sample"] = {k: {"px": v.get("last_price"), "source": "kite"} 
+                                     for k,v in list(kite_data.items())[:3] 
+                                     if not k.startswith("_")}
+    
+    # Test cache
+    cached = CACHE.get_val("all_prices")
+    result["cache_has_prices"] = bool(cached)
+    result["cache_symbol_count"] = len(cached) if cached else 0
+    result["cache_age_s"] = int(CACHE.age("all_prices") or 0)
+    if cached:
+        nifty = cached.get("NIFTY", {})
+        result["cached_nifty_px"] = nifty.get("px")
+        result["cached_nifty_source"] = nifty.get("source")
+    
+    return jsonify(result)
 
 @app.route("/prices")
 def prices_only():
