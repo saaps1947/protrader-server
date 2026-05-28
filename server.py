@@ -1071,8 +1071,63 @@ def ping():
 def usdinr():
     return jsonify({"ok":True,"rate":get_usdinr(),"time":ist_str()})
 
-@app.route("/hero")
-def hero():
+@app.route("/lot_sizes")
+def lot_sizes():
+    """Get current lot sizes from Zerodha NFO instruments CSV."""
+    key   = request.args.get("key","")
+    token = request.args.get("token","")
+
+    # Fallback lot sizes (updated periodically by SEBI)
+    fallback = {"NIFTY":75,"BANKNIFTY":30,"FINNIFTY":40,"SENSEX":20,
+                "MIDCPNIFTY":120,"CRUDEOIL":100,"GOLD":100}
+
+    if not key or not token:
+        return jsonify({"ok":True,"data":fallback,"source":"fallback"})
+
+    try:
+        csv = fetch_kite_instruments_nfo(key, token)
+        if not csv:
+            return jsonify({"ok":True,"data":fallback,"source":"fallback"})
+
+        lines = csv.strip().split("\n")
+        result = {}
+        seen = set()
+        for line in lines[1:]:
+            cols = line.split(",")
+            if len(cols) < 10: continue
+            sym = cols[2]  # tradingsymbol
+            opt_type = cols[9]  # CE/PE
+            if opt_type not in ["CE","PE"]: continue
+            # Extract underlying from symbol name
+            # e.g. NIFTY25JUN24500CE -> NIFTY
+            underlying = None
+            for idx in ["NIFTY","BANKNIFTY","FINNIFTY","SENSEX","MIDCPNIFTY"]:
+                if sym.startswith(idx):
+                    underlying = idx
+                    break
+            if not underlying or underlying in seen: continue
+            try:
+                lot = int(cols[11]) if cols[11] else 0  # lot_size column
+                if lot > 0:
+                    result[underlying] = lot
+                    seen.add(underlying)
+            except: continue
+            if len(seen) >= 8: break
+
+        # Merge with fallback for any missing
+        for k,v in fallback.items():
+            if k not in result:
+                result[k] = v
+
+        # Cache it
+        CACHE.set("lot_sizes", result)
+        print(f"[LotSizes] {result}")
+        return jsonify({"ok":True,"data":result,"source":"zerodha"})
+
+    except Exception as e:
+        return jsonify({"ok":True,"data":fallback,"source":"fallback","error":str(e)})
+
+
     """
     Ultra-fast hero data — NIFTY + BANKNIFTY only.
     Target: <1 second. Called first, independently of /market.
