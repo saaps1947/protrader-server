@@ -430,73 +430,176 @@ def calc_oi_writer_behavior(oi_data):
 
 def detect_market_regime(candles, oi_data, vwap, orb, vol_analysis):
     """
-    Detect the current market regime:
-    TRENDING_UP, TRENDING_DOWN, MEAN_REVERT, RANGE_BOUND,
-    EXPIRY_CHAOS, BREAKOUT_DAY, CHOPPY
+    Detect current market regime with confidence score.
+    Regimes: TRENDING_UP, TRENDING_DOWN, BREAKOUT_DAY,
+             EXPIRY_PINNING, RANGE_BOUND, MEAN_REVERT, CHOPPY
+    Each regime has different valid strategies.
     """
     if not candles or len(candles) < 10:
-        return {"regime": "UNKNOWN", "label": "Insufficient data", "confidence": 0}
+        return {"regime": "UNKNOWN", "label": "Insufficient data", "confidence": 0,
+                "valid_strategies": [], "no_trade": True}
 
     closes = [c["c"] for c in candles[-20:]]
     highs  = [c["h"] for c in candles[-20:]]
     lows   = [c["l"] for c in candles[-20:]]
+    vols   = [c.get("v",0) for c in candles[-20:]]
     px     = closes[-1]
 
-    scores = {}
+    # VWAP context
+    above_vwap = px > vwap if vwap else None
+    vwap_dist  = abs(px - vwap) / vwap * 100 if vwap else 0
 
-    # Trending signals
-    if vwap:
-        above_vwap = px > vwap
-        vwap_dist  = abs(px - vwap) / vwap * 100
-    else:
-        above_vwap = None; vwap_dist = 0
-
-    # ATR (Average True Range) for volatility
+    # ATR — volatility measure
     trs = [max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
            for i in range(1, len(closes))]
-    atr = sum(trs[-10:])/10 if len(trs)>=10 else sum(trs)/len(trs) if trs else 0
+    atr     = sum(trs[-10:])/10 if len(trs)>=10 else (sum(trs)/len(trs) if trs else 0)
     atr_pct = round(atr/px*100, 2) if px else 0
 
     # Day range
     day_h = max(highs); day_l = min(lows)
-    day_range_pct = (day_h - day_l) / day_l * 100 if day_l else 0
+    day_range_pct = round((day_h-day_l)/day_l*100, 2) if day_l else 0
+
+    # Price momentum — last 5 vs previous 5
+    recent_avg  = sum(closes[-5:])/5
+    prev_avg    = sum(closes[-10:-5])/5
+    momentum    = (recent_avg - prev_avg) / prev_avg * 100 if prev_avg else 0
+
+    # Volume trend
+    vol_avg     = sum(vols[-20:])/20 if len(vols)>=20 else sum(vols)/len(vols) if vols else 1
+    vol_cur     = vols[-1] if vols else 0
+    vol_ratio   = vol_cur/vol_avg if vol_avg else 1
+    vol_expand  = vol_analysis.get("expanding", False) if vol_analysis else vol_ratio > 1.5
+    vol_dry     = vol_analysis.get("drying_up", False) if vol_analysis else vol_ratio < 0.3
 
     # OI context
-    pcr = oi_data.get("pcr", 0) if oi_data else 0
-    mp  = oi_data.get("max_pain", 0) if oi_data else 0
-    pinned = bool(mp and px and abs((px-mp)/mp) < 0.003)
+    pcr    = oi_data.get("pcr", 0) if oi_data else 0
+    mp     = oi_data.get("max_pain", 0) if oi_data else 0
+    ce_wall= oi_data.get("ce_wall", 0) if oi_data else 0
+    pe_wall= oi_data.get("pe_wall", 0) if oi_data else 0
+    # OI wall tightness — how much room between pe_wall and ce_wall
+    wall_width_pct = abs(ce_wall-pe_wall)/px*100 if (ce_wall and pe_wall and px) else 5
+    mp_dist_pct    = abs((px-mp)/mp*100) if mp else 5
+    pinned         = mp_dist_pct < 0.3
 
-    # Regime scoring
-    trending_up   = (above_vwap and
-                     closes[-1] > closes[-5] and
-                     vol_analysis.get("expanding") and
-                     orb and orb.get("breakout"))
-    trending_down = (not above_vwap and
-                     closes[-1] < closes[-5] and
-                     vol_analysis.get("expanding") and
-                     orb and orb.get("breakdown"))
-    expiry_chaos  = (pinned and pcr and 0.8 < pcr < 1.2)
-    breakout_day  = (orb and orb.get("range_pct",0) < 0.3 and
-                     (orb.get("breakout") or orb.get("breakdown")) and
-                     vol_analysis.get("expanding"))
-    choppy        = (vol_analysis.get("contracting") and
-                     orb and orb.get("inside") and
-                     day_range_pct < 0.5)
-    mean_revert   = (vol_analysis.get("climax") or
-                     (vwap and vwap_dist > 0.8 and not vol_analysis.get("expanding")))
+    # Expiry check — is today expiry?
+    from datetime import datetime, timezone, timedelta
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(ist)
+    is_thursday = now.weekday() == 3
+    is_expiry_time = now.hour >= 13  # afternoon on expiry
 
-    if trending_up:    regime, label, conf = "TRENDING_UP",    "Trending Up — ride the trend",       82
-    elif trending_down:regime, label, conf = "TRENDING_DOWN",  "Trending Down — ride the trend",     82
-    elif breakout_day: regime, label, conf = "BREAKOUT_DAY",   "Breakout Day — ORB triggered",       85
-    elif expiry_chaos: regime, label, conf = "EXPIRY_CHAOS",   "Expiry Pinning — near Max Pain",     75
-    elif mean_revert:  regime, label, conf = "MEAN_REVERT",    "Mean Reversion — extremes to VWAP",  72
-    elif choppy:       regime, label, conf = "CHOPPY",         "Choppy — low conviction, wait",      65
-    else:              regime, label, conf = "RANGE_BOUND",    "Range Bound — trade extremes",       60
+    # ── REGIME CLASSIFICATION ──
+    # Priority order matters — more specific wins
 
+    # 1. EXPIRY PINNING — expiry day + price near max pain + tight walls
+    if is_thursday and pinned and wall_width_pct < 2.0:
+        return {
+            "regime": "EXPIRY_PINNING",
+            "label": "Expiry Pinning — Max Pain ₹{} dominant".format(int(mp)),
+            "confidence": 85,
+            "atr_pct": atr_pct, "day_range_pct": day_range_pct,
+            "above_vwap": above_vwap, "pinned_to_mp": pinned,
+            "wall_width_pct": wall_width_pct, "mp_dist_pct": round(mp_dist_pct,2),
+            # What strategies work in expiry pinning
+            "valid_strategies": ["IRON_CONDOR", "SHORT_STRADDLE", "MAX_PAIN_FADE"],
+            "no_trade_for": ["DIRECTIONAL_CE", "DIRECTIONAL_PE"],
+            "note": "Sell premium near walls. Avoid buying options — theta destroys value."
+        }
+
+    # 2. TRENDING UP — price above VWAP + momentum + volume
+    if (above_vwap and momentum > 0.2 and vol_expand and
+        closes[-1] > closes[-3] > closes[-6]):
+        return {
+            "regime": "TRENDING_UP",
+            "label": "Trending Up — buy dips to VWAP",
+            "confidence": 80,
+            "atr_pct": atr_pct, "day_range_pct": day_range_pct,
+            "above_vwap": True, "pinned_to_mp": pinned,
+            "valid_strategies": ["BUY_CE_ON_PULLBACK", "ORB_BREAKOUT", "VWAP_RECLAIM"],
+            "no_trade_for": ["BUY_PE", "SHORT_CE"],
+            "note": "Only buy CE. Enter on VWAP pullbacks, not at highs."
+        }
+
+    # 3. TRENDING DOWN — price below VWAP + momentum + volume
+    if (not above_vwap and momentum < -0.2 and vol_expand and
+        closes[-1] < closes[-3] < closes[-6]):
+        return {
+            "regime": "TRENDING_DOWN",
+            "label": "Trending Down — sell bounces to VWAP",
+            "confidence": 80,
+            "atr_pct": atr_pct, "day_range_pct": day_range_pct,
+            "above_vwap": False, "pinned_to_mp": pinned,
+            "valid_strategies": ["BUY_PE_ON_BOUNCE", "ORB_BREAKDOWN", "VWAP_REJECT"],
+            "no_trade_for": ["BUY_CE", "SHORT_PE"],
+            "note": "Only buy PE. Enter on VWAP bounce-rejections, not at lows."
+        }
+
+    # 4. BREAKOUT DAY — narrow ORB + expansion with volume
+    if (orb and orb.get("range_pct", 5) < 0.3 and
+        (orb.get("breakout") or orb.get("breakdown")) and vol_expand):
+        direction = "UP" if orb.get("breakout") else "DOWN"
+        return {
+            "regime": "BREAKOUT_DAY",
+            "label": "Breakout Day — ORB {} with volume".format(direction),
+            "confidence": 82,
+            "atr_pct": atr_pct, "day_range_pct": day_range_pct,
+            "above_vwap": above_vwap, "pinned_to_mp": pinned,
+            "valid_strategies": ["ORB_BREAKOUT" if direction=="UP" else "ORB_BREAKDOWN"],
+            "no_trade_for": ["COUNTER_TREND"],
+            "note": "Trade ORB direction only. Do not fade the breakout."
+        }
+
+    # 5. MEAN REVERSION — price extended from VWAP + volume climax
+    if vwap_dist > 1.0 and (vol_analysis.get("climax") if vol_analysis else vol_ratio > 3):
+        side = "ABOVE" if above_vwap else "BELOW"
+        return {
+            "regime": "MEAN_REVERT",
+            "label": "Mean Reversion — price extended {} VWAP".format(side),
+            "confidence": 72,
+            "atr_pct": atr_pct, "day_range_pct": day_range_pct,
+            "above_vwap": above_vwap, "pinned_to_mp": pinned,
+            "valid_strategies": ["VWAP_FADE", "LIQUIDITY_SWEEP_REVERSAL"],
+            "no_trade_for": ["MOMENTUM_CONTINUATION"],
+            "note": "Fade the extension. Target: VWAP retest. Tight SL."
+        }
+
+    # 6. RANGE BOUND — price between walls, low volatility, no clear momentum
+    if wall_width_pct > 0 and day_range_pct < atr_pct * 1.5 and abs(momentum) < 0.15:
+        return {
+            "regime": "RANGE_BOUND",
+            "label": "Range Bound — ₹{} to ₹{} zone".format(int(pe_wall), int(ce_wall)),
+            "confidence": 65,
+            "atr_pct": atr_pct, "day_range_pct": day_range_pct,
+            "above_vwap": above_vwap, "pinned_to_mp": pinned,
+            "valid_strategies": ["BUY_AT_PE_WALL", "SELL_AT_CE_WALL", "IRON_CONDOR"],
+            "no_trade_for": ["BREAKOUT_CHASE"],
+            "note": "Trade only at extremes. Avoid mid-range entries."
+        }
+
+    # 7. CHOPPY — inside ORB, drying volume, no momentum
+    if (orb and orb.get("inside") and vol_dry and abs(momentum) < 0.1):
+        return {
+            "regime": "CHOPPY",
+            "label": "Choppy — no directional edge",
+            "confidence": 60,
+            "atr_pct": atr_pct, "day_range_pct": day_range_pct,
+            "above_vwap": above_vwap, "pinned_to_mp": pinned,
+            "valid_strategies": [],
+            "no_trade_for": ["ALL_DIRECTIONAL"],
+            "no_trade": True,
+            "note": "Stay out. No clear edge. Wait for breakout or session change."
+        }
+
+    # Default — insufficient data for clear regime
     return {
-        "regime": regime, "label": label, "confidence": conf,
-        "atr_pct": atr_pct, "day_range_pct": round(day_range_pct,2),
+        "regime": "DEVELOPING",
+        "label": "Developing — wait for confirmation",
+        "confidence": 55,
+        "atr_pct": atr_pct, "day_range_pct": day_range_pct,
         "above_vwap": above_vwap, "pinned_to_mp": pinned,
+        "valid_strategies": ["WAIT"],
+        "no_trade_for": [],
+        "note": "No clear regime yet. Wait for VWAP direction + volume confirmation."
     }
 
 def generate_narrative(sym, px, regime, vwap, orb, vol, oi_data, writer, smc, tech):
