@@ -1327,6 +1327,14 @@ def market():
 
     prices = get_all_prices(key, token)
     if not prices:
+        # Before giving up — return stale cache if available (after-hours, weekend)
+        stale = CACHE.get_val("all_prices")
+        if stale:
+            vix = get_vix()
+            return jsonify({"ok":True,"data":stale,"vix":vix,
+                            "source":"cache_stale","stale":True,
+                            "time":now_ist().strftime("%H:%M:%S"),
+                            "cached_age_s": int(CACHE.age("all_prices") or 0)})
         return jsonify({"ok":False,"error":"No market data available"}),503
 
     # Merge technicals from cache ONLY — never fetch synchronously here
