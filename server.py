@@ -806,18 +806,61 @@ def get_all_prices(key, token):
             print(f"[Prices] No Kite data — stale cache")
             return stale
 
-    # MCX only — 2 calls
+    # MCX commodities — fetch from Zerodha using front-month futures
     for sym in ["CRUDEOIL","GOLD"]:
-        inst = INSTRUMENTS[sym]
-        d = fetch_yahoo_candles(inst["yahoo"])
-        if not d or not d.get("px"): continue
-        px = d["px"]
-        if sym=="CRUDEOIL" and px<500: px=round(px*usd_inr,2); chg=round(d["chg"]*usd_inr,2)
-        elif sym=="GOLD" and px<5000: f=usd_inr/31.1*10; px=round(d["px"]*f,2); chg=round(d["chg"]*f,2)
-        else: chg=d["chg"]
-        result[sym]={"px":px,"chg":chg,"pct":d.get("pct",0),
-                     "high":d.get("high",0),"low":d.get("low",0),
-                     "open":d.get("open",0),"source":"yahoo_mcx"}
+        try:
+            # Fetch MCX instruments to find front-month contract
+            mcx_cache_key = f"mcx_sym_{sym}"
+            mcx_kite_sym = CACHE.get_val(mcx_cache_key)
+            if not mcx_kite_sym:
+                r_inst = requests.get("https://api.kite.trade/instruments/MCX",
+                    headers=_kite_headers(key, token), timeout=10)
+                if r_inst.status_code == 200:
+                    from io import StringIO
+                    import csv as _csv
+                    reader = _csv.DictReader(StringIO(r_inst.text))
+                    contracts = []
+                    for row in reader:
+                        if row.get("name","").upper() == sym and row.get("instrument_type","") == "FUT":
+                            contracts.append((row.get("expiry",""), f"MCX:{row.get('tradingsymbol','')}"))
+                    if contracts:
+                        contracts.sort()  # earliest expiry first
+                        mcx_kite_sym = contracts[0][1]
+                        CACHE.set(mcx_cache_key, mcx_kite_sym)
+                        print(f"[MCX] {sym} front-month: {mcx_kite_sym}")
+
+            if mcx_kite_sym:
+                r_q = requests.get("https://api.kite.trade/quote",
+                    params={"i": mcx_kite_sym},
+                    headers=_kite_headers(key, token), timeout=8)
+                if r_q.status_code == 200:
+                    qdata = r_q.json().get("data", {})
+                    for v in qdata.values():
+                        px  = v.get("last_price", 0)
+                        pc  = v.get("ohlc", {}).get("close", px)
+                        chg = round(px - pc, 2)
+                        pct = round((px - pc) / pc * 100, 2) if pc else 0
+                        result[sym] = {
+                            "px": px, "chg": chg, "pct": pct,
+                            "h": v.get("ohlc", {}).get("high", px),
+                            "l": v.get("ohlc", {}).get("low", px),
+                            "source": "zerodha_mcx", "contract": mcx_kite_sym
+                        }
+                        break
+        except Exception as ex:
+            print(f"[MCX] {sym} Zerodha fetch failed: {ex}")
+        # Fallback to Yahoo if Zerodha MCX fetch failed
+        if sym not in result:
+            inst = INSTRUMENTS[sym]
+            d = fetch_yahoo_candles(inst["yahoo"])
+            if d and d.get("px"):
+                px = d["px"]
+                if sym=="CRUDEOIL" and px<500: px=round(px*usd_inr,2); chg=round(d["chg"]*usd_inr,2)
+                elif sym=="GOLD" and px<5000: f=usd_inr/31.1*10; px=round(d["px"]*f,2); chg=round(d["chg"]*f,2)
+                else: chg=d["chg"]
+                result[sym]={"px":px,"chg":chg,"pct":d.get("pct",0),
+                             "h":d.get("high",0),"l":d.get("low",0),
+                             "source":"yahoo_mcx_fallback"}
 
     print(f"[Prices] TOTAL: {len(result)} symbols in {time.time()-t0:.2f}s")
     if result:
