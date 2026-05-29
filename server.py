@@ -688,6 +688,7 @@ def generate_narrative(sym, px, regime, vwap, orb, vol, oi_data, writer, smc, te
     parts.append(conclusion)
     return " ".join(p for p in parts if p)[:500]  # max 500 chars
 
+def get_vix():
     """India VIX from Yahoo. Cached 1 min."""
     if CACHE.fresh("vix", TTL["vix"]):
         return CACHE.get_val("vix")
@@ -1235,6 +1236,8 @@ def lot_sizes():
         return jsonify({"ok":True,"data":fallback,"source":"fallback","error":str(e)})
 
 
+@app.route("/hero")
+def hero():
     """
     Ultra-fast hero data — NIFTY + BANKNIFTY only.
     Target: <1 second. Called first, independently of /market.
