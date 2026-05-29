@@ -162,17 +162,21 @@ def _kite_headers(key, token):
     return {"X-Kite-Version":"3","Authorization":f"token {key}:{token}","User-Agent":"Mozilla/5.0"}
 
 def fetch_kite_quotes(key, token, kite_syms):
-    """Fetch bulk quotes from Zerodha for list of kite symbols. Returns dict or {}."""
+    """Fetch bulk quotes from Zerodha. Uses params= for proper URL encoding."""
     if not key or not token or not kite_syms: return {}
     try:
-        qs = "&".join(f"i={s}" for s in kite_syms)
-        r = requests.get(f"https://api.kite.trade/quote?{qs}",
+        # Use params= so requests handles URL encoding correctly
+        # e.g. "NSE:NIFTY 50" → "NSE%3ANIFTY+50"
+        params = [("i", s) for s in kite_syms]
+        r = requests.get("https://api.kite.trade/quote",
+            params=params,
             headers=_kite_headers(key,token), timeout=20)
         if r.status_code in [401,403]:
             print(f"[Kite] Token expired ({r.status_code})")
             return {"_token_expired": True}
         if r.status_code == 200:
             return r.json().get("data", {})
+        print(f"[Kite] Quote error status: {r.status_code} — {r.text[:200]}")
     except Exception as e:
         print(f"[Kite] Quote error: {e}")
     return {}
@@ -930,9 +934,9 @@ def get_oi(sym, key, token, spot=0):
 
         if not instruments: return load_disk()
 
-        # Step 3 — ONE bulk quote call for all ATM ±10 strikes
-        qs = "&".join(f"i={i['sym']}" for i in instruments)
-        r2 = requests.get(f"https://api.kite.trade/quote?{qs}", headers=hdrs, timeout=20)
+        # Step 3 — ONE bulk quote call for all ATM ±10 strikes (use params= for encoding)
+        params2 = [("i", i["sym"]) for i in instruments]
+        r2 = requests.get("https://api.kite.trade/quote", params=params2, headers=hdrs, timeout=20)
         if r2.status_code in [401,403]: return load_disk()
         qdata = r2.json().get("data",{})
 
@@ -1251,9 +1255,9 @@ def lot_sizes():
         hdrs = _kite_headers(key, token)
         indices = {"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK",
                    "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
-        qs = "&".join(f"i={v}" for v in indices.values())
+        params_h = [("i", v) for v in indices.values()]
         try:
-            r = requests.get(f"https://api.kite.trade/quote?{qs}", headers=hdrs, timeout=8)
+            r = requests.get("https://api.kite.trade/quote", params=params_h, headers=hdrs, timeout=8)
             if r.status_code == 200:
                 data = r.json().get("data",{})
                 result = {}
