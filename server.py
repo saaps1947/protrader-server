@@ -1030,11 +1030,12 @@ def get_oi(sym, key, token, spot=0):
         if not best_exp: return load_disk()
 
         # Collect instruments for ATM ±10
+        # SENSEX uses BFO exchange prefix, all others use NFO
+        exchange_prefix = "BFO" if sym == "SENSEX" else "NFO"
         instruments=[]
         for line in lines[1:]:
             cols=line.split(",")
             if len(cols)<10: continue
-            # Match by name column first, fallback to tradingsymbol prefix
             name = cols[13].strip() if len(cols)>13 else ""
             sym_match = (name==sym) or cols[2].startswith(sym)
             if not sym_match: continue
@@ -1042,7 +1043,7 @@ def get_oi(sym, key, token, spot=0):
             try:
                 sk=float(cols[6])
                 if sk in target_strikes:
-                    instruments.append({"sym":f"NFO:{cols[2]}","strike":int(sk),"type":cols[9]})
+                    instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":int(sk),"type":cols[9]})
             except: continue
 
         if not instruments: return load_disk()
