@@ -1124,11 +1124,13 @@ def calc_smc(candles):
         c,cn,cn2 = candles[i],candles[i+1],(candles[i+2] if i+2<n else candles[i+1])
         body=abs(c["c"]-c["o"]); nm=abs(cn["c"]-cn["o"])
         if c["c"]<c["o"] and cn["c"]>cn["o"] and nm>body*1.5 and cn["h"]>c["h"]*1.002:
-            result["ob"].append({"type":"BULLISH","high":round(max(c["o"],c["c"]),2),
-                "low":round(min(c["o"],c["c"]),2),"strength":round(nm/body,1)if body else 0})
+            hi=round(max(c["o"],c["c"]),2); lo=round(min(c["o"],c["c"]),2)
+            result["ob"].append({"type":"BULLISH","high":hi,"low":lo,
+                "mid":round((hi+lo)/2,2),"strength":round(nm/body,1)if body else 0})
         if c["c"]>c["o"] and cn["c"]<cn["o"] and nm>body*1.5 and cn["l"]<c["l"]*0.998:
-            result["ob"].append({"type":"BEARISH","high":round(max(c["o"],c["c"]),2),
-                "low":round(min(c["o"],c["c"]),2),"strength":round(nm/body,1)if body else 0})
+            hi=round(max(c["o"],c["c"]),2); lo=round(min(c["o"],c["c"]),2)
+            result["ob"].append({"type":"BEARISH","high":hi,"low":lo,
+                "mid":round((hi+lo)/2,2),"strength":round(nm/body,1)if body else 0})
     bull_obs=[o for o in result["ob"] if o["type"]=="BULLISH"][-2:]
     bear_obs=[o for o in result["ob"] if o["type"]=="BEARISH"][-2:]
     result["ob"] = bull_obs + bear_obs
