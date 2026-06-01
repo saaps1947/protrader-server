@@ -100,7 +100,28 @@ INSTRUMENTS = {
     "HAL":        {"kite":"NSE:HAL",       "yahoo":"HAL.NS",       "step":100,"sector":"DEFENCE"},
 }
 
-OI_INDICES = {"NIFTY","BANKNIFTY","FINNIFTY","SENSEX"}  # These have F&O option chains
+OI_INDICES = {"NIFTY","BANKNIFTY","FINNIFTY","SENSEX"}  # Index option chains
+
+# 18 most liquid F&O stocks — meaningful OI, real CE/PE walls
+# Verified by ADV (average daily volume) in NSE F&O segment
+OI_STOCKS = {
+    # Banking (highest F&O liquidity in Nifty50)
+    "HDFCBANK","ICICIBANK","KOTAKBANK","AXISBANK","SBIN","INDUSINDBK",
+    # NBFC
+    "BAJFINANCE","BAJAJFINSV",
+    # IT
+    "TCS","INFY","WIPRO","HCLTECH",
+    # Energy / Conglomerate
+    "RELIANCE",
+    # Auto
+    "TATAMOTORS","MARUTI",
+    # Infra
+    "LT","ADANIPORTS",
+    # Telecom
+    "BHARTIARTL",
+}
+
+OI_ALL = OI_INDICES | OI_STOCKS  # Everything with OI support
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -930,14 +951,22 @@ def get_oi(sym, key, token, spot=0):
 
         # Step 1 — spot price
         if not spot:
-            idx_map = {"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK",
-                       "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
-            r = requests.get("https://api.kite.trade/quote",
-                params={"i":idx_map[sym]}, headers=hdrs, timeout=10)
-            if r.status_code in [401,403]:
-                return load_disk()
-            for v in (r.json().get("data") or {}).values():
-                spot = v.get("last_price",0); break
+            if sym in OI_INDICES:
+                # Indices use special Kite symbols
+                idx_map = {"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK",
+                           "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
+                kite_sym = idx_map.get(sym)
+            else:
+                # Stocks — use NSE:SYMBOL directly
+                kite_sym = INSTRUMENTS.get(sym,{}).get("kite","")
+
+            if kite_sym:
+                r = requests.get("https://api.kite.trade/quote",
+                    params={"i": kite_sym}, headers=hdrs, timeout=10)
+                if r.status_code in [401,403]:
+                    return load_disk()
+                for v in (r.json().get("data") or {}).values():
+                    spot = v.get("last_price",0); break
 
         if not spot: return load_disk()
 
@@ -951,24 +980,35 @@ def get_oi(sym, key, token, spot=0):
         # Smart ATM ±10 strikes only
         target_strikes = set(range(atm - step*10, atm + step*11, step))
 
-        # Find nearest expiry
+        # Find nearest expiry — scan ALL lines but filter by symbol first
+        # NFO CSV is 150k+ rows sorted alphabetically — NIFTY is at row ~70k-90k
+        # 5000 line limit was silently missing most symbols
         today_n = datetime.now(IST).replace(tzinfo=None)
         best_exp=None; best_days=999
-        for line in lines[1:3000]:
+        for line in lines[1:]:
             cols=line.split(",")
-            if len(cols)<10 or not cols[2].startswith(sym) or cols[9] not in ["CE","PE"]: continue
+            if len(cols)<10: continue
+            # Fast pre-filter before expensive operations
+            ts = cols[2] if len(cols)>2 else ""
+            if not ts.startswith(sym): continue
+            if cols[9] not in ["CE","PE"]: continue
             try:
                 exp=datetime.strptime(cols[5],"%Y-%m-%d")
                 d2=(exp-today_n).days
                 if 0<=d2<best_days: best_days=d2; best_exp=cols[5]
             except: continue
+
         if not best_exp: return load_disk()
 
         # Collect instruments for ATM ±10
         instruments=[]
         for line in lines[1:]:
             cols=line.split(",")
-            if len(cols)<10 or not cols[2].startswith(sym): continue
+            if len(cols)<10: continue
+            # Match by name column first, fallback to tradingsymbol prefix
+            name = cols[13].strip() if len(cols)>13 else ""
+            sym_match = (name==sym) or cols[2].startswith(sym)
+            if not sym_match: continue
             if cols[9] not in ["CE","PE"] or cols[5]!=best_exp: continue
             try:
                 sk=float(cols[6])
@@ -1371,6 +1411,11 @@ def market():
     key   = request.args.get("key","")
     token = request.args.get("token","")
 
+    # Cache credentials for background stock OI thread
+    if key and token:
+        CACHE.set("_kite_key", key)
+        CACHE.set("_kite_token", token)
+
     prices = get_all_prices(key, token)
     if not prices:
         # Before giving up — return stale cache if available (after-hours, weekend)
@@ -1383,13 +1428,12 @@ def market():
                             "cached_age_s": int(CACHE.age("all_prices") or 0)})
         return jsonify({"ok":False,"error":"No market data available"}),503
 
-    # Merge technicals from cache ONLY — never fetch synchronously here
+    # Merge technicals + stock OI from cache
     result = {}
     for sym, p in prices.items():
         d = dict(p)
         inst = INSTRUMENTS.get(sym,{})
         if not inst.get("mcx"):
-            # Only use cached technicals — don't block on Yahoo fetch
             cache_key = f"tech_{sym}"
             tech = CACHE.get_val(cache_key)
             if tech:
@@ -1403,6 +1447,23 @@ def market():
                     "breakdown":  tech.get("breakdown",False),
                     "above_sma20":tech.get("above_sma20"),
                 }
+            # Merge cached stock OI — if available, include in response
+            if sym in OI_STOCKS:
+                oi_data = CACHE.get_val(f"oi_{sym}")
+                if oi_data:
+                    d["oi"] = {
+                        "pcr":       oi_data.get("pcr",0),
+                        "max_pain":  oi_data.get("max_pain",0),
+                        "ce_wall":   oi_data.get("ce_wall",0),
+                        "pe_wall":   oi_data.get("pe_wall",0),
+                        "ce_oi":     oi_data.get("ce_oi",0),
+                        "pe_oi":     oi_data.get("pe_oi",0),
+                        "buildup":   oi_data.get("buildup","UNKNOWN"),
+                        "pcr_interp":oi_data.get("pcr_interp","NEUTRAL"),
+                        "expiry":    oi_data.get("expiry",""),
+                        "atm":       oi_data.get("atm",0),
+                        "cached":    True,
+                    }
         result[sym] = d
 
     vix = get_vix()
@@ -1425,13 +1486,18 @@ def market():
 
 @app.route("/zerodha_oi")
 def zerodha_oi():
-    """Live OI from Zerodha — ATM ±10 strikes only."""
+    """Live OI from Zerodha — ATM ±10 strikes. Works for indices AND stocks."""
     sym   = request.args.get("sym","NIFTY").upper()
     key   = request.args.get("key","")
     token = request.args.get("token","")
 
-    if sym not in OI_INDICES:
-        return jsonify({"ok":False,"error":f"{sym} options not supported"}),400
+    if sym not in OI_ALL:
+        return jsonify({"ok":False,"error":f"{sym} not in F&O list"}),400
+
+    # Cache credentials for background stock OI thread
+    if key and token:
+        CACHE.set("_kite_key", key)
+        CACHE.set("_kite_token", token)
 
     # Try to get spot from prices cache first (avoids extra API call)
     # If cache is cold, get_oi() will fetch spot directly from Zerodha
@@ -1605,9 +1671,58 @@ def _warmup():
         ex.map(fetch_one, all_syms)
     print(f"[Warmup] Done — {len(all_syms)} symbols cached.")
 
+
+def _bg_stock_oi():
+    """
+    Background thread: refresh OI for all 18 liquid F&O stocks every 5 min.
+    Runs independently of /market — results cached, served instantly.
+    Staggered 3s apart to avoid Zerodha rate limits (3 req/sec).
+    """
+    import os as _os
+    # Wait for server to fully boot and prices to be warm
+    time.sleep(30)
+    print(f"[StockOI] Background OI refresh started for {len(OI_STOCKS)} stocks")
+
+    while True:
+        try:
+            # Get credentials from latest cached prices meta
+            # They're passed via /zerodha_oi calls and cached in CACHE
+            key   = CACHE.get_val("_kite_key") or ""
+            token = CACHE.get_val("_kite_token") or ""
+            if not key or not token:
+                print("[StockOI] No credentials cached yet — waiting...")
+                time.sleep(60)
+                continue
+
+            prices = CACHE.get_val("all_prices") or {}
+            fetched = 0
+            for sym in sorted(OI_STOCKS):
+                try:
+                    spot = prices.get(sym, {}).get("px", 0)
+                    result = get_oi(sym, key, token, spot)
+                    if result:
+                        fetched += 1
+                        print(f"[StockOI ✅] {sym} PCR:{result.get('pcr','?')} MP:{result.get('max_pain','?')}")
+                    time.sleep(3)  # Zerodha rate limit: 3 req/sec
+                except Exception as e:
+                    print(f"[StockOI ❌] {sym}: {e}")
+                    time.sleep(3)
+
+            print(f"[StockOI] Cycle done — {fetched}/{len(OI_STOCKS)} fetched. Sleeping 5min.")
+            time.sleep(300)  # 5 min between full cycles
+
+        except Exception as e:
+            print(f"[StockOI] Cycle error: {e}")
+            time.sleep(60)
+
 # Start warmup for both direct run AND gunicorn
 _warmup_thread = threading.Thread(target=_warmup, daemon=True)
 _warmup_thread.start()
+
+# Start background stock OI refresh thread
+_stock_oi_thread = threading.Thread(target=_bg_stock_oi, daemon=True)
+_stock_oi_thread.start()
+print(f"[StockOI] Background thread started for {len(OI_STOCKS)} liquid F&O stocks")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=False)
