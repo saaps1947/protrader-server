@@ -287,6 +287,24 @@ def fetch_kite_instruments_nfo(key, token):
         print(f"[Kite] Instruments error: {e}")
     return CACHE.get_val(cache_key)  # stale
 
+def fetch_kite_instruments_bfo(key, token):
+    """Fetch BFO instruments CSV from Zerodha (BSE derivatives — SENSEX options). Cached 4 hours."""
+    cache_key = "instruments_bfo"
+    if CACHE.fresh(cache_key, TTL["instruments"]):
+        return CACHE.get_val(cache_key)
+    try:
+        r = requests.get("https://api.kite.trade/instruments/BFO",
+            headers=_kite_headers(key,token), timeout=30)
+        if r.status_code in [401,403]:
+            return None
+        if r.status_code == 200:
+            CACHE.set(cache_key, r.text)
+            print("[Kite] BFO instruments CSV cached (SENSEX options)")
+            return r.text
+    except Exception as e:
+        print(f"[Kite] BFO Instruments error: {e}")
+    return CACHE.get_val(cache_key)
+
 
 # ═══════════════════════════════════════════════════════════════
 # LAYER 3 — MARKET DATA ENGINE
@@ -932,8 +950,14 @@ def get_oi(sym, key, token, spot=0):
         try:
             with open(disk_file) as f:
                 c = _json.load(f)
-                age = int((time.time()-c["ts"])/60)
-                d = dict(c["data"]); d["cached"]=True; d["cache_age_min"]=age
+                age_min = int((time.time()-c["ts"])/60)
+                # Don't serve disk cache older than 30 min during market hours
+                ist_now = datetime.now(IST)
+                market_open = ist_now.hour >= 9 and ist_now.hour < 16
+                if market_open and age_min > 30:
+                    print(f"[OI] Disk cache for {sym} is {age_min}min old — too stale during market hours")
+                    return None
+                d = dict(c["data"]); d["cached"]=True; d["cache_age_min"]=age_min
                 return d
         except: return None
 
@@ -971,7 +995,11 @@ def get_oi(sym, key, token, spot=0):
         if not spot: return load_disk()
 
         # Step 2 — instruments CSV (cached 4h)
-        csv = fetch_kite_instruments_nfo(key, token)
+        # SENSEX options are on BSE's BFO exchange, not NSE's NFO
+        if sym == "SENSEX":
+            csv = fetch_kite_instruments_bfo(key, token)
+        else:
+            csv = fetch_kite_instruments_nfo(key, token)
         if not csv: return load_disk()
 
         lines = csv.strip().split("\n")
@@ -980,17 +1008,18 @@ def get_oi(sym, key, token, spot=0):
         # Smart ATM ±10 strikes only
         target_strikes = set(range(atm - step*10, atm + step*11, step))
 
-        # Find nearest expiry — scan ALL lines but filter by symbol first
-        # NFO CSV is 150k+ rows sorted alphabetically — NIFTY is at row ~70k-90k
-        # 5000 line limit was silently missing most symbols
+        # Find nearest expiry — scan ALL lines with early symbol filter
+        # NFO/BFO CSVs are 150k+ rows. Filter by tradingsymbol prefix.
+        # SENSEX options in BFO are prefixed "SENSEX"
+        # For stocks: "HDFCBANK24JUN..." etc.
+        sym_prefix = sym  # default matches tradingsymbol start
         today_n = datetime.now(IST).replace(tzinfo=None)
         best_exp=None; best_days=999
         for line in lines[1:]:
             cols=line.split(",")
             if len(cols)<10: continue
-            # Fast pre-filter before expensive operations
             ts = cols[2] if len(cols)>2 else ""
-            if not ts.startswith(sym): continue
+            if not ts.startswith(sym_prefix): continue
             if cols[9] not in ["CE","PE"]: continue
             try:
                 exp=datetime.strptime(cols[5],"%Y-%m-%d")
