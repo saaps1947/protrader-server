@@ -1028,6 +1028,7 @@ def get_oi(sym, key, token, spot=0):
             except: continue
 
         if not best_exp: return load_disk()
+        best_days = best_days  # days to expiry — used for IV calculation
 
         # Collect instruments for ATM ±10
         # SENSEX uses BFO exchange prefix, all others use NFO
@@ -1097,9 +1098,33 @@ def get_oi(sym, key, token, spot=0):
         pcr_interp=("EXTREME_BULL" if pcr>1.4 else "BULLISH" if pcr>1.1
                     else "NEUTRAL" if pcr>0.9 else "BEARISH" if pcr>0.7 else "EXTREME_BEAR")
 
+        # Step 5b — Estimate IV from ATM option premiums
+        # Use ATM straddle price as proxy: IV ≈ (CE_premium + PE_premium) / spot * sqrt(365/DTE) * 100
+        iv_est = 0
+        try:
+            atm_key = f"NFO:{sym}{best_exp.replace('-','')[2:]}{'%05d' % atm}CE" if sym != "SENSEX" else None
+            # Simpler: use average of ATM CE + PE last price vs spot
+            atm_ce_q = None; atm_pe_q = None
+            for inst in instruments:
+                if inst["strike"]==atm:
+                    q2 = qdata.get(inst["sym"],{})
+                    if inst["type"]=="CE": atm_ce_q=q2
+                    elif inst["type"]=="PE": atm_pe_q=q2
+            if atm_ce_q and atm_pe_q and spot:
+                ce_ltp = atm_ce_q.get("last_price",0) or 0
+                pe_ltp = atm_pe_q.get("last_price",0) or 0
+                straddle = ce_ltp + pe_ltp
+                dte = max(best_days, 1)
+                # Simplified IV proxy: straddle/(spot * sqrt(dte/365)) * 100
+                import math
+                iv_est = round(straddle / (spot * math.sqrt(dte/365)) * 100, 1)
+                iv_est = min(iv_est, 80)  # cap at realistic max
+        except Exception as iv_err:
+            print(f"[OI] IV calc error: {iv_err}")
+
         result = {
             "ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,
-            "pcr":pcr,"max_pain":int(mp),"iv":0,
+            "pcr":pcr,"max_pain":int(mp),"iv":iv_est,
             "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
             "spot":round(spot,1),"buildup":buildup,"pcr_interp":pcr_interp,
             "mp_dist":round(spot-mp,0) if mp else 0,
