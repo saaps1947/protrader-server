@@ -101,6 +101,7 @@ INSTRUMENTS = {
 }
 
 OI_INDICES = {"NIFTY","BANKNIFTY","FINNIFTY","SENSEX"}  # Index option chains
+OI_MCX     = {"CRUDEOIL","GOLD"}                        # MCX commodity options
 
 # 18 most liquid F&O stocks — meaningful OI, real CE/PE walls
 # Verified by ADV (average daily volume) in NSE F&O segment
@@ -121,7 +122,7 @@ OI_STOCKS = {
     "BHARTIARTL",
 }
 
-OI_ALL = OI_INDICES | OI_STOCKS  # Everything with OI support
+OI_ALL = OI_INDICES | OI_STOCKS | OI_MCX  # Everything with OI support
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -303,6 +304,24 @@ def fetch_kite_instruments_bfo(key, token):
             return r.text
     except Exception as e:
         print(f"[Kite] BFO Instruments error: {e}")
+    return CACHE.get_val(cache_key)
+
+def fetch_kite_instruments_mcx(key, token):
+    """Fetch MCX instruments CSV from Zerodha (Crude Oil, Gold options). Cached 4 hours."""
+    cache_key = "instruments_mcx"
+    if CACHE.fresh(cache_key, TTL["instruments"]):
+        return CACHE.get_val(cache_key)
+    try:
+        r = requests.get("https://api.kite.trade/instruments/MCX",
+            headers=_kite_headers(key,token), timeout=30)
+        if r.status_code in [401,403]:
+            return None
+        if r.status_code == 200:
+            CACHE.set(cache_key, r.text)
+            print("[Kite] MCX instruments CSV cached (Crude Oil, Gold options)")
+            return r.text
+    except Exception as e:
+        print(f"[Kite] MCX Instruments error: {e}")
     return CACHE.get_val(cache_key)
 
 
@@ -976,12 +995,14 @@ def get_oi(sym, key, token, spot=0):
         # Step 1 — spot price
         if not spot:
             if sym in OI_INDICES:
-                # Indices use special Kite symbols
                 idx_map = {"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK",
                            "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
                 kite_sym = idx_map.get(sym)
+            elif sym in OI_MCX:
+                # MCX commodities — use front-month futures as spot proxy
+                mcx_kite_sym = CACHE.get_val(f"mcx_sym_{sym}")
+                kite_sym = mcx_kite_sym  # cached from get_all_prices MCX fetch
             else:
-                # Stocks — use NSE:SYMBOL directly
                 kite_sym = INSTRUMENTS.get(sym,{}).get("kite","")
 
             if kite_sym:
@@ -995,11 +1016,13 @@ def get_oi(sym, key, token, spot=0):
         if not spot: return load_disk()
 
         # Step 2 — instruments CSV (cached 4h)
-        # SENSEX options are on BSE's BFO exchange, not NSE's NFO
+        # Route to correct exchange instruments file
         if sym == "SENSEX":
-            csv = fetch_kite_instruments_bfo(key, token)
+            csv = fetch_kite_instruments_bfo(key, token)   # BSE/BFO
+        elif sym in OI_MCX:
+            csv = fetch_kite_instruments_mcx(key, token)   # MCX commodities
         else:
-            csv = fetch_kite_instruments_nfo(key, token)
+            csv = fetch_kite_instruments_nfo(key, token)   # NSE/NFO (default)
         if not csv: return load_disk()
 
         lines = csv.strip().split("\n")
@@ -1031,8 +1054,13 @@ def get_oi(sym, key, token, spot=0):
         best_days = best_days  # days to expiry — used for IV calculation
 
         # Collect instruments for ATM ±10
-        # SENSEX uses BFO exchange prefix, all others use NFO
-        exchange_prefix = "BFO" if sym == "SENSEX" else "NFO"
+        # Each exchange uses its own prefix for Kite quote API
+        if sym == "SENSEX":
+            exchange_prefix = "BFO"
+        elif sym in OI_MCX:
+            exchange_prefix = "MCX"
+        else:
+            exchange_prefix = "NFO"
         instruments=[]
         for line in lines[1:]:
             cols=line.split(",")
@@ -1753,7 +1781,8 @@ def _bg_stock_oi():
 
             prices = CACHE.get_val("all_prices") or {}
             fetched = 0
-            for sym in sorted(OI_STOCKS):
+            # Refresh OI for stocks + MCX commodities
+            for sym in sorted(OI_STOCKS | OI_MCX):
                 try:
                     spot = prices.get(sym, {}).get("px", 0)
                     result = get_oi(sym, key, token, spot)
@@ -1765,7 +1794,8 @@ def _bg_stock_oi():
                     print(f"[StockOI ❌] {sym}: {e}")
                     time.sleep(3)
 
-            print(f"[StockOI] Cycle done — {fetched}/{len(OI_STOCKS)} fetched. Sleeping 5min.")
+            total = len(OI_STOCKS | OI_MCX)
+            print(f"[StockOI] Cycle done — {fetched}/{total} fetched (incl. MCX). Sleeping 5min.")
             time.sleep(300)  # 5 min between full cycles
 
         except Exception as e:
