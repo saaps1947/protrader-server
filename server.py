@@ -999,9 +999,30 @@ def get_oi(sym, key, token, spot=0):
                            "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
                 kite_sym = idx_map.get(sym)
             elif sym in OI_MCX:
-                # MCX commodities — use front-month futures as spot proxy
-                mcx_kite_sym = CACHE.get_val(f"mcx_sym_{sym}")
-                kite_sym = mcx_kite_sym  # cached from get_all_prices MCX fetch
+                # MCX commodities — try cached front-month kite symbol first
+                kite_sym = CACHE.get_val(f"mcx_sym_{sym}")
+                if not kite_sym:
+                    # Fallback: find front-month MCX futures directly from instruments CSV
+                    mcx_csv = fetch_kite_instruments_mcx(key, token)
+                    if mcx_csv:
+                        today_n = datetime.now(IST).replace(tzinfo=None)
+                        best_fut_exp = None; best_fut_days = 999; best_fut_sym = None
+                        for line in mcx_csv.strip().split("\n")[1:]:
+                            cols = line.split(",")
+                            if len(cols) < 10: continue
+                            if not cols[2].startswith(sym): continue
+                            if cols[9] != "FUT": continue
+                            try:
+                                exp = datetime.strptime(cols[5], "%Y-%m-%d")
+                                d2 = (exp - today_n).days
+                                if 0 <= d2 < best_fut_days:
+                                    best_fut_days = d2
+                                    best_fut_sym = f"MCX:{cols[2]}"
+                            except: continue
+                        if best_fut_sym:
+                            kite_sym = best_fut_sym
+                            CACHE.set(f"mcx_sym_{sym}", kite_sym)
+                            print(f"[OI] MCX spot resolved: {sym} → {kite_sym}")
             else:
                 kite_sym = INSTRUMENTS.get(sym,{}).get("kite","")
 
@@ -1009,9 +1030,15 @@ def get_oi(sym, key, token, spot=0):
                 r = requests.get("https://api.kite.trade/quote",
                     params={"i": kite_sym}, headers=hdrs, timeout=10)
                 if r.status_code in [401,403]:
+                    print(f"[OI] Auth failed for {sym} — token expired?")
                     return load_disk()
-                for v in (r.json().get("data") or {}).values():
-                    spot = v.get("last_price",0); break
+                if r.status_code == 200:
+                    for v in (r.json().get("data") or {}).values():
+                        spot = v.get("last_price",0); break
+                else:
+                    print(f"[OI] Spot fetch HTTP {r.status_code} for {sym}")
+            else:
+                print(f"[OI] No kite_sym found for {sym}")
 
         if not spot: return load_disk()
 
@@ -1568,6 +1595,36 @@ def market():
                     "source":"zerodha" if "zerodha" in sources else "yahoo",
                     "time":now_ist().strftime("%H:%M:%S"),
                     "cached_age_s": int(CACHE.age("all_prices") or 0)})
+
+@app.route("/oi_debug")
+def oi_debug():
+    """Debug endpoint — shows OI cache status for all symbols."""
+    result = {}
+    for sym in sorted(OI_ALL):
+        cached = CACHE.get_val(f"oi_{sym}")
+        disk_file = f"/tmp/oi_cache/{sym}.json"
+        import os, json as _j
+        disk_age = None
+        try:
+            with open(disk_file) as f:
+                c = _j.load(f)
+                disk_age = int((time.time()-c["ts"])/60)
+        except: pass
+        result[sym] = {
+            "in_memory": bool(cached),
+            "mem_pcr": cached.get("pcr") if cached else None,
+            "disk_age_min": disk_age,
+            "mcx_sym": CACHE.get_val(f"mcx_sym_{sym}") if sym in OI_MCX else None
+        }
+    key = CACHE.get_val("_kite_key") or ""
+    token = CACHE.get_val("_kite_token") or ""
+    return jsonify({
+        "ok": True,
+        "has_credentials": bool(key and token),
+        "key_preview": key[:8]+"..." if key else None,
+        "symbols": result,
+        "time": ist_str()
+    })
 
 @app.route("/zerodha_oi")
 def zerodha_oi():
