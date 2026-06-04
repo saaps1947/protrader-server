@@ -251,6 +251,38 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
         cur_vol = volumes[-1] if volumes else 0
         vol_ratio = round(cur_vol/avg_vol,2) if avg_vol else 0
 
+        # ── 15-DAY TREND ANALYSIS (daily candles) ──
+        # Fetch daily candles separately for longer-term trend context
+        trend15 = "UNKNOWN"; trend_strength = 0; hh_hl = False; lh_ll = False
+        try:
+            url_d = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1mo&includePrePost=false"
+            r_d = requests.get(url_d, headers={"User-Agent":"Mozilla/5.0"}, timeout=8).json()
+            res_d = r_d["chart"]["result"][0]
+            q_d = res_d["indicators"]["quote"][0]
+            dc = [q_d["close"][i] for i in range(len(res_d.get("timestamp",[]))) if q_d["close"][i]]
+            dh = [q_d["high"][i] for i in range(len(res_d.get("timestamp",[]))) if q_d["close"][i]]
+            dl = [q_d["low"][i] for i in range(len(res_d.get("timestamp",[]))) if q_d["close"][i]]
+            if len(dc) >= 10:
+                # SMA5 vs SMA10 on daily = short vs medium trend
+                d_s5 = sum(dc[-5:])/5
+                d_s10 = sum(dc[-10:])/10
+                # Count up-days vs down-days in last 15 sessions
+                days = dc[-15:] if len(dc)>=15 else dc
+                up_days = sum(1 for i in range(1,len(days)) if days[i]>days[i-1])
+                dn_days = len(days)-1-up_days
+                trend_strength = round((up_days-dn_days)/(len(days)-1)*100) if len(days)>1 else 0
+                # Higher Highs + Higher Lows (last 5 daily pivots)
+                if len(dh)>=5 and len(dl)>=5:
+                    hh_hl = dh[-1]>dh[-3] and dl[-1]>dl[-3]   # recent pivots higher
+                    lh_ll = dh[-1]<dh[-3] and dl[-1]<dl[-3]   # recent pivots lower
+                if d_s5 > d_s10 and hh_hl: trend15="STRONG_BULL"
+                elif d_s5 > d_s10:          trend15="BULL"
+                elif d_s5 < d_s10 and lh_ll: trend15="STRONG_BEAR"
+                elif d_s5 < d_s10:           trend15="BEAR"
+                else:                         trend15="NEUTRAL"
+        except Exception as te:
+            pass  # daily trend optional — don't fail main fetch
+
         return {
             "px":px, "chg":round(px-pc,2),
             "pct":round((px-pc)/pc*100,2) if pc else 0,
@@ -262,6 +294,10 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
             "rsi":rsi14(),
             "crossover":cross,
             "trend":"BULLISH" if (s20 and s50 and s20>s50) else "BEARISH" if (s20 and s50 and s20<s50) else "NEUTRAL",
+            "trend15":trend15,              # 15-day daily trend: STRONG_BULL/BULL/NEUTRAL/BEAR/STRONG_BEAR
+            "trend_strength":trend_strength, # % of up-days in last 15 sessions (-100 to +100)
+            "hh_hl":hh_hl,                  # Higher Highs + Higher Lows = uptrend structure
+            "lh_ll":lh_ll,                  # Lower Highs + Lower Lows = downtrend structure
             "breakout":  bool(highs and px >= max(highs)*0.998),
             "breakdown": bool(lows  and px <= min(lows)*1.002),
             "volume": cur_vol, "avg_volume": avg_vol, "vol_ratio": vol_ratio,
