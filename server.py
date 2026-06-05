@@ -251,37 +251,38 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
         cur_vol = volumes[-1] if volumes else 0
         vol_ratio = round(cur_vol/avg_vol,2) if avg_vol else 0
 
-        # ── 15-DAY TREND ANALYSIS (daily candles) ──
-        # Fetch daily candles separately for longer-term trend context
+        # ── 15-DAY TREND + PREVIOUS DAY HIGH/LOW ──
         trend15 = "UNKNOWN"; trend_strength = 0; hh_hl = False; lh_ll = False
+        prev_day_high = 0; prev_day_low = 0  # PDH / PDL
         try:
             url_d = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1mo&includePrePost=false"
             r_d = requests.get(url_d, headers={"User-Agent":"Mozilla/5.0"}, timeout=8).json()
             res_d = r_d["chart"]["result"][0]
             q_d = res_d["indicators"]["quote"][0]
             dc = [q_d["close"][i] for i in range(len(res_d.get("timestamp",[]))) if q_d["close"][i]]
-            dh = [q_d["high"][i] for i in range(len(res_d.get("timestamp",[]))) if q_d["close"][i]]
-            dl = [q_d["low"][i] for i in range(len(res_d.get("timestamp",[]))) if q_d["close"][i]]
+            dh = [q_d["high"][i]  for i in range(len(res_d.get("timestamp",[]))) if q_d["high"][i]]
+            dl = [q_d["low"][i]   for i in range(len(res_d.get("timestamp",[]))) if q_d["low"][i]]
+            if len(dc) >= 2:
+                # Previous day high/low (index -2 = yesterday's completed session)
+                prev_day_high = round(dh[-2], 2) if len(dh)>=2 else 0
+                prev_day_low  = round(dl[-2], 2) if len(dl)>=2 else 0
             if len(dc) >= 10:
-                # SMA5 vs SMA10 on daily = short vs medium trend
                 d_s5 = sum(dc[-5:])/5
                 d_s10 = sum(dc[-10:])/10
-                # Count up-days vs down-days in last 15 sessions
                 days = dc[-15:] if len(dc)>=15 else dc
                 up_days = sum(1 for i in range(1,len(days)) if days[i]>days[i-1])
                 dn_days = len(days)-1-up_days
                 trend_strength = round((up_days-dn_days)/(len(days)-1)*100) if len(days)>1 else 0
-                # Higher Highs + Higher Lows (last 5 daily pivots)
                 if len(dh)>=5 and len(dl)>=5:
-                    hh_hl = dh[-1]>dh[-3] and dl[-1]>dl[-3]   # recent pivots higher
-                    lh_ll = dh[-1]<dh[-3] and dl[-1]<dl[-3]   # recent pivots lower
+                    hh_hl = dh[-1]>dh[-3] and dl[-1]>dl[-3]
+                    lh_ll = dh[-1]<dh[-3] and dl[-1]<dl[-3]
                 if d_s5 > d_s10 and hh_hl: trend15="STRONG_BULL"
                 elif d_s5 > d_s10:          trend15="BULL"
                 elif d_s5 < d_s10 and lh_ll: trend15="STRONG_BEAR"
                 elif d_s5 < d_s10:           trend15="BEAR"
                 else:                         trend15="NEUTRAL"
         except Exception as te:
-            pass  # daily trend optional — don't fail main fetch
+            pass
 
         return {
             "px":px, "chg":round(px-pc,2),
@@ -294,10 +295,10 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
             "rsi":rsi14(),
             "crossover":cross,
             "trend":"BULLISH" if (s20 and s50 and s20>s50) else "BEARISH" if (s20 and s50 and s20<s50) else "NEUTRAL",
-            "trend15":trend15,              # 15-day daily trend: STRONG_BULL/BULL/NEUTRAL/BEAR/STRONG_BEAR
-            "trend_strength":trend_strength, # % of up-days in last 15 sessions (-100 to +100)
-            "hh_hl":hh_hl,                  # Higher Highs + Higher Lows = uptrend structure
-            "lh_ll":lh_ll,                  # Lower Highs + Lower Lows = downtrend structure
+            "trend15":trend15, "trend_strength":trend_strength,
+            "hh_hl":hh_hl, "lh_ll":lh_ll,
+            "prev_day_high":prev_day_high,   # PDH — previous session high
+            "prev_day_low":prev_day_low,     # PDL — previous session low
             "breakout":  bool(highs and px >= max(highs)*0.998),
             "breakdown": bool(lows  and px <= min(lows)*1.002),
             "volume": cur_vol, "avg_volume": avg_vol, "vol_ratio": vol_ratio,
@@ -392,25 +393,68 @@ def calc_vwap(candles):
 def calc_orb(candles):
     """
     Opening Range Breakout — first 15 minutes (3 × 5min candles after 9:15).
-    Returns ORB high, ORB low, and whether price has broken out.
+    Tracks failed breakouts: if price breaks out then returns inside range,
+    the breakout is invalidated. A second breakout requires volume confirmation.
     """
     if not candles: return None
     today = datetime.now(IST).date()
-    # 9:15 IST = 3:45 UTC, 9:30 IST = 4:00 UTC
     orb_start = int(datetime(today.year, today.month, today.day, 3, 45, tzinfo=timezone.utc).timestamp())
     orb_end   = int(datetime(today.year, today.month, today.day, 4,  0, tzinfo=timezone.utc).timestamp())
     orb_c = [c for c in candles if orb_start <= c.get("t",0) < orb_end]
     if not orb_c: return None
+
     orb_h = max(c["h"] for c in orb_c)
     orb_l = min(c["l"] for c in orb_c)
-    cur   = candles[-1]["c"]
+    range_pct = (orb_h - orb_l) / orb_l * 100 if orb_l else 0
+
+    # Get post-ORB candles (after 9:30 IST = 4:00 UTC)
+    post_orb = [c for c in candles if c.get("t",0) >= orb_end]
+    cur = candles[-1]["c"]
+
+    # Detect if breakout occurred then failed (price returned inside range)
+    breakout_occurred = False
+    breakdown_occurred = False
+    breakout_failed = False   # was above, came back in
+    breakdown_failed = False  # was below, came back in
+
+    for c in post_orb:
+        if c["c"] > orb_h * 1.001: breakout_occurred = True
+        if c["c"] < orb_l * 0.999: breakdown_occurred = True
+        # After breakout, if candle CLOSES back inside → failed
+        if breakout_occurred and c["c"] < orb_h * 1.001 and c["c"] > orb_l * 0.999:
+            breakout_failed = True
+        if breakdown_occurred and c["c"] > orb_l * 0.999 and c["c"] < orb_h * 1.001:
+            breakdown_failed = True
+        # Reset: if price breaks out again after re-entering, clear the failed flag
+        if breakout_failed and c["c"] > orb_h * 1.001: breakout_failed = False
+        if breakdown_failed and c["c"] < orb_l * 0.999: breakdown_failed = False
+
+    # Current state
+    above_orb = cur > orb_h * 1.001
+    below_orb = cur < orb_l * 0.999
+    inside_orb = not above_orb and not below_orb
+
+    # Volume check on last candle (for re-entry confirmation)
+    vols = [c.get("v",0) for c in candles[-20:]] if len(candles)>=5 else []
+    avg_vol = sum(vols[:-1])/len(vols[:-1]) if len(vols)>1 else 0
+    cur_vol = vols[-1] if vols else 0
+    vol_confirmed = cur_vol >= avg_vol * 1.5 if avg_vol else False
+
+    # Valid breakout: above ORB AND not failed (or failed but back above with volume)
+    valid_breakout  = above_orb and not breakout_failed
+    valid_breakdown = below_orb and not breakdown_failed
+
     return {
         "high": round(orb_h, 2),
         "low":  round(orb_l, 2),
-        "range_pct": round((orb_h-orb_l)/orb_l*100, 2),
-        "breakout":  cur > orb_h * 1.001,
-        "breakdown": cur < orb_l * 0.999,
-        "inside":    orb_l * 0.999 <= cur <= orb_h * 1.001,
+        "range_pct": round(range_pct, 2),
+        "breakout":    valid_breakout,      # clean break — price outside + never returned
+        "breakdown":   valid_breakdown,
+        "inside":      inside_orb,
+        "breakout_failed":  breakout_failed,  # was above, came back = sideways trap
+        "breakdown_failed": breakdown_failed,
+        "vol_confirmed": vol_confirmed,       # volume supports the move
+        "retest_zone": breakout_failed and above_orb,  # failed then back above = re-breakout
     }
 
 def calc_volume_analysis(candles):
@@ -1631,6 +1675,109 @@ def market():
                     "source":"zerodha" if "zerodha" in sources else "yahoo",
                     "time":now_ist().strftime("%H:%M:%S"),
                     "cached_age_s": int(CACHE.age("all_prices") or 0)})
+
+@app.route("/place_order", methods=["POST"])
+def place_order():
+    """Place a real Zerodha order. Resolves correct tradingsymbol from instruments CSV."""
+    try:
+        data = request.get_json(force=True) or {}
+        sym   = data.get("sym","").upper()
+        strike= int(data.get("strike",0))
+        opt   = data.get("option_type","CE").upper()  # CE or PE
+        action= data.get("action","BUY").upper()       # BUY or SELL
+        key   = data.get("key","") or CACHE.get_val("_kite_key") or ""
+        token = data.get("token","") or CACHE.get_val("_kite_token") or ""
+        qty   = int(data.get("qty",0))
+
+        if not key or not token:
+            return jsonify({"ok":False,"error":"Not connected to Zerodha — reconnect first"})
+        if not sym or not strike:
+            return jsonify({"ok":False,"error":"Missing symbol or strike"})
+
+        hdrs = _kite_headers(key, token)
+
+        # Step 1: Get nearest expiry and find exact tradingsymbol
+        if sym == "SENSEX":
+            csv = fetch_kite_instruments_bfo(key, token)
+            exchange = "BFO"
+        elif sym in OI_MCX:
+            csv = fetch_kite_instruments_mcx(key, token)
+            exchange = "MCX"
+        else:
+            csv = fetch_kite_instruments_nfo(key, token)
+            exchange = "NFO"
+
+        if not csv:
+            return jsonify({"ok":False,"error":"Could not fetch instruments — check token"})
+
+        # Find closest expiry
+        today_n = datetime.now(IST).replace(tzinfo=None)
+        best_exp = None; best_days = 999
+        for line in csv.strip().split("\n")[1:]:
+            cols = line.split(",")
+            if len(cols)<10: continue
+            if not cols[2].startswith(sym): continue
+            if cols[9] not in ["CE","PE"]: continue
+            try:
+                exp = datetime.strptime(cols[5],"%Y-%m-%d")
+                d2 = (exp-today_n).days
+                if 0<=d2<best_days: best_days=d2; best_exp=cols[5]
+            except: continue
+
+        if not best_exp:
+            return jsonify({"ok":False,"error":f"No valid expiry found for {sym}"})
+
+        # Find exact tradingsymbol for this strike and option type
+        tradingsymbol = None; instrument_token = None
+        for line in csv.strip().split("\n")[1:]:
+            cols = line.split(",")
+            if len(cols)<10: continue
+            if not cols[2].startswith(sym): continue
+            if cols[9] != opt: continue
+            if cols[5] != best_exp: continue
+            try:
+                if int(float(cols[6])) == strike:
+                    tradingsymbol = cols[2]
+                    instrument_token = cols[0]
+                    break
+            except: continue
+
+        if not tradingsymbol:
+            return jsonify({"ok":False,"error":f"Tradingsymbol not found for {sym} {strike} {opt} exp:{best_exp}"})
+
+        # Step 2: Default lot size if not provided
+        default_lots = {"NIFTY":75,"BANKNIFTY":15,"FINNIFTY":40,"SENSEX":10,
+                        "CRUDEOIL":100,"GOLD":100}
+        if not qty:
+            qty = default_lots.get(sym, 50)
+
+        # Step 3: Place order via Kite
+        order_payload = {
+            "tradingsymbol": tradingsymbol,
+            "exchange": exchange,
+            "transaction_type": action,
+            "order_type": "MARKET",
+            "quantity": qty,
+            "product": "NRML",
+            "validity": "DAY"
+        }
+        r = requests.post("https://api.kite.trade/orders/regular",
+            data=order_payload, headers=hdrs, timeout=15)
+        resp = r.json()
+
+        if r.status_code == 200 and resp.get("status") == "success":
+            order_id = resp.get("data",{}).get("order_id","")
+            print(f"[Order ✅] {action} {tradingsymbol} qty:{qty} order_id:{order_id}")
+            return jsonify({"ok":True,"order_id":order_id,"tradingsymbol":tradingsymbol,
+                           "exchange":exchange,"qty":qty,"expiry":best_exp})
+        else:
+            err = resp.get("message","Unknown error")
+            print(f"[Order ❌] {tradingsymbol}: {err}")
+            return jsonify({"ok":False,"error":err,"tradingsymbol":tradingsymbol})
+
+    except Exception as e:
+        print(f"[Order] Exception: {e}")
+        return jsonify({"ok":False,"error":str(e)})
 
 @app.route("/oi_debug")
 def oi_debug():
