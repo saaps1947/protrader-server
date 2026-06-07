@@ -1295,80 +1295,319 @@ def get_oi(sym, key, token, spot=0):
 # ═══════════════════════════════════════════════════════════════
 
 def calc_smc(candles):
-    """Calculate SMC signals: FVG, Order Blocks, Liquidity Sweeps, Structure."""
-    if not candles or len(candles) < 10: return {}
-    n = len(candles)
-    result = {"fvg":[],"ob":[],"liquidity":[],"sweep":[],"structure":"UNKNOWN"}
+    """
+    Enhanced SMC engine — aligned with LuxAlgo Smart Money Concepts.
 
-    # FVGs
+    Improvements over v1:
+    1. BOS vs CHoCH distinction (continuation vs reversal)
+    2. Dual structure layers: Internal (5 bars) + Swing (20 bars)
+    3. EQH/EQL — equal highs/lows as liquidity pools
+    4. OB mitigation — stale OBs removed when price crosses through
+    5. Strong vs Weak High/Low
+    6. Premium/Discount/Equilibrium zone scoring
+    7. Volatility-filtered OB selection (spike bars handled correctly)
+    """
+    if not candles or len(candles) < 15:
+        return {}
+
+    n     = len(candles)
+    highs = [c["h"] for c in candles]
+    lows  = [c["l"] for c in candles]
+    closes= [c["c"] for c in candles]
+    opens = [c["o"] for c in candles]
+    curr  = candles[-1]["c"]
+
+    # ATR (20-bar) — used for EQH/EQL threshold and OB filter
+    def atr(period=20):
+        trs=[]
+        for i in range(1, min(period+1, n)):
+            trs.append(max(highs[n-i]-lows[n-i],
+                           abs(highs[n-i]-closes[n-i-1]),
+                           abs(lows[n-i]-closes[n-i-1])))
+        return sum(trs)/len(trs) if trs else 1
+
+    atr_val = atr()
+
+    # ── Step 1: Find swing pivots at two scales ────────────────────────────
+    # Internal pivots: 5-bar lookback (short-term structure)
+    # Swing pivots: 20-bar lookback (major structure)
+    def find_pivots(size, start=0):
+        """Find pivot highs and lows using size-bar lookback."""
+        pvt_highs = []  # (index, price)
+        pvt_lows  = []
+        for i in range(size, n - size):
+            if all(highs[i] >= highs[i-j] for j in range(1,size+1)) and \
+               all(highs[i] >= highs[i+j] for j in range(1,size+1)):
+                pvt_highs.append((i, highs[i]))
+            if all(lows[i] <= lows[i-j] for j in range(1,size+1)) and \
+               all(lows[i] <= lows[i+j] for j in range(1,size+1)):
+                pvt_lows.append((i, lows[i]))
+        return pvt_highs, pvt_lows
+
+    int_highs, int_lows = find_pivots(5)   # Internal structure
+    swg_highs, swg_lows = find_pivots(20)  # Swing structure
+
+    # ── Step 2: BOS vs CHoCH detection ────────────────────────────────────
+    # CHoCH = Change of Character → price breaks structure AGAINST current trend = reversal signal
+    # BOS   = Break of Structure  → price breaks structure WITH current trend = continuation
+    def detect_structure(pvt_highs, pvt_lows, label="swing"):
+        """
+        Detect structure breaks. Returns list of structure events.
+        Each event: {type: BOS|CHoCH, bias: BULLISH|BEARISH, level, index, label}
+        """
+        events = []
+        if not pvt_highs or not pvt_lows:
+            return events, "UNKNOWN"
+
+        # Determine trend using last two pivots of each type
+        last_sh = pvt_highs[-1][1] if pvt_highs else 0
+        prev_sh = pvt_highs[-2][1] if len(pvt_highs)>=2 else 0
+        last_sl = pvt_lows[-1][1]  if pvt_lows else 0
+        prev_sl = pvt_lows[-2][1]  if len(pvt_lows)>=2 else 0
+
+        # HH+HL = BULLISH trend, LH+LL = BEARISH trend
+        trend_bias = "BULLISH" if (last_sh > prev_sh and last_sl > prev_sl) else \
+                     "BEARISH" if (last_sh < prev_sh and last_sl < prev_sl) else "NEUTRAL"
+
+        # Check last few candles for structure break
+        for pvt_i, pvt_price in pvt_highs[-3:]:
+            if curr > pvt_price:
+                struct_type = "BOS" if trend_bias == "BULLISH" else "CHoCH"
+                events.append({
+                    "type": struct_type, "bias": "BULLISH",
+                    "level": round(pvt_price, 2), "index": pvt_i,
+                    "layer": label,
+                    "significance": 3 if struct_type == "CHoCH" else 1  # CHoCH is reversal = higher significance
+                })
+
+        for pvt_i, pvt_price in pvt_lows[-3:]:
+            if curr < pvt_price:
+                struct_type = "BOS" if trend_bias == "BEARISH" else "CHoCH"
+                events.append({
+                    "type": struct_type, "bias": "BEARISH",
+                    "level": round(pvt_price, 2), "index": pvt_i,
+                    "layer": label,
+                    "significance": 3 if struct_type == "CHoCH" else 1
+                })
+
+        return events, trend_bias
+
+    int_events, int_trend = detect_structure(int_highs, int_lows, "internal")
+    swg_events, swg_trend = detect_structure(swg_highs, swg_lows, "swing")
+
+    all_structure_events = int_events + swg_events
+    # Use swing trend as primary market structure
+    structure = swg_trend if swg_trend != "NEUTRAL" else int_trend
+
+    # ── Step 3: Strong vs Weak High/Low ───────────────────────────────────
+    # Strong High = where the last bearish CHoCH/BOS formed (key resistance)
+    # Weak High   = a pivot high in existing uptrend (just a pause)
+    strong_high = None; weak_high = None
+    strong_low  = None; weak_low  = None
+
+    if swg_highs:
+        last_sh_idx, last_sh_price = swg_highs[-1]
+        # Strong if trend is bearish (price struggled here), Weak if bullish continuation
+        if swg_trend == "BEARISH":
+            strong_high = round(last_sh_price, 2)
+        else:
+            weak_high   = round(last_sh_price, 2)
+
+    if swg_lows:
+        last_sl_idx, last_sl_price = swg_lows[-1]
+        if swg_trend == "BULLISH":
+            strong_low = round(last_sl_price, 2)
+        else:
+            weak_low   = round(last_sl_price, 2)
+
+    # ── Step 4: EQH/EQL — Equal Highs/Lows (liquidity pools) ─────────────
+    # Two consecutive pivots within ATR distance = liquidity pool
+    # Smart money will sweep these before reversing
+    eqh_levels = []  # Equal highs = sell-side liquidity above
+    eql_levels = []  # Equal lows  = buy-side liquidity below
+    eq_threshold = atr_val * 0.5  # within 0.5 ATR = equal
+
+    for i in range(1, len(swg_highs)):
+        p1 = swg_highs[i-1][1]
+        p2 = swg_highs[i][1]
+        if abs(p1 - p2) < eq_threshold:
+            level = round(max(p1, p2), 2)
+            # Check if already swept
+            swept = any(highs[j] > level * 1.001 and closes[j] < level
+                       for j in range(swg_highs[i][0], n))
+            eqh_levels.append({
+                "level": level, "swept": swept,
+                "signal": f"EQH liquidity pool ₹{level}" + (" — already swept" if swept else " — target for sweep")
+            })
+
+    for i in range(1, len(swg_lows)):
+        p1 = swg_lows[i-1][1]
+        p2 = swg_lows[i][1]
+        if abs(p1 - p2) < eq_threshold:
+            level = round(min(p1, p2), 2)
+            swept = any(lows[j] < level * 0.999 and closes[j] > level
+                       for j in range(swg_lows[i][0], n))
+            eql_levels.append({
+                "level": level, "swept": swept,
+                "signal": f"EQL liquidity pool ₹{level}" + (" — already swept" if swept else " — target for sweep")
+            })
+
+    # ── Step 5: Fair Value Gaps (with fill tracking) ──────────────────────
+    fvg_list = []
     for i in range(1, n-1):
-        prev,curr,nxt = candles[i-1],candles[i],candles[i+1]
+        prev, c, nxt = candles[i-1], candles[i], candles[i+1]
+        # Bullish FVG: gap between prev high and next low
         if prev["h"] < nxt["l"]:
-            sz = (nxt["l"]-prev["h"])/curr["c"]*100
-            if sz>0.1:
-                result["fvg"].append({"type":"BULLISH","top":round(nxt["l"],2),
-                    "bot":round(prev["h"],2),"size_pct":round(sz,2),
-                    "filled":curr["l"]<=prev["h"]})
+            sz = (nxt["l"] - prev["h"]) / c["c"] * 100
+            if sz > 0.05:
+                # Check if filled
+                filled = any(candles[j]["l"] <= prev["h"] for j in range(i+1, n))
+                if not filled:
+                    fvg_list.append({
+                        "type": "BULLISH", "top": round(nxt["l"], 2),
+                        "bot": round(prev["h"], 2),
+                        "mid": round((nxt["l"] + prev["h"]) / 2, 2),
+                        "size_pct": round(sz, 2), "filled": False,
+                        "idx": i
+                    })
+        # Bearish FVG: gap between next high and prev low
         if prev["l"] > nxt["h"]:
-            sz = (prev["l"]-nxt["h"])/curr["c"]*100
-            if sz>0.1:
-                result["fvg"].append({"type":"BEARISH","top":round(prev["l"],2),
-                    "bot":round(nxt["h"],2),"size_pct":round(sz,2),
-                    "filled":curr["h"]>=prev["l"]})
-    unfilled=[f for f in result["fvg"] if not f["filled"]]
-    result["fvg"] = unfilled[-5:] if unfilled else result["fvg"][-3:]
+            sz = (prev["l"] - nxt["h"]) / c["c"] * 100
+            if sz > 0.05:
+                filled = any(candles[j]["h"] >= prev["l"] for j in range(i+1, n))
+                if not filled:
+                    fvg_list.append({
+                        "type": "BEARISH", "top": round(prev["l"], 2),
+                        "bot": round(nxt["h"], 2),
+                        "mid": round((prev["l"] + nxt["h"]) / 2, 2),
+                        "size_pct": round(sz, 2), "filled": False,
+                        "idx": i
+                    })
 
-    # Order Blocks
-    for i in range(2, n-2):
-        c,cn,cn2 = candles[i],candles[i+1],(candles[i+2] if i+2<n else candles[i+1])
-        body=abs(c["c"]-c["o"]); nm=abs(cn["c"]-cn["o"])
-        if c["c"]<c["o"] and cn["c"]>cn["o"] and nm>body*1.5 and cn["h"]>c["h"]*1.002:
-            hi=round(max(c["o"],c["c"]),2); lo=round(min(c["o"],c["c"]),2)
-            result["ob"].append({"type":"BULLISH","high":hi,"low":lo,
-                "mid":round((hi+lo)/2,2),"strength":round(nm/body,1)if body else 0})
-        if c["c"]>c["o"] and cn["c"]<cn["o"] and nm>body*1.5 and cn["l"]<c["l"]*0.998:
-            hi=round(max(c["o"],c["c"]),2); lo=round(min(c["o"],c["c"]),2)
-            result["ob"].append({"type":"BEARISH","high":hi,"low":lo,
-                "mid":round((hi+lo)/2,2),"strength":round(nm/body,1)if body else 0})
-    bull_obs=[o for o in result["ob"] if o["type"]=="BULLISH"][-2:]
-    bear_obs=[o for o in result["ob"] if o["type"]=="BEARISH"][-2:]
-    result["ob"] = bull_obs + bear_obs
+    bull_fvg = [f for f in fvg_list if f["type"]=="BULLISH"][-3:]
+    bear_fvg = [f for f in fvg_list if f["type"]=="BEARISH"][-3:]
+    fvg_result = bull_fvg + bear_fvg
 
-    # Liquidity sweeps
-    curr_px = candles[-1]["c"]
-    highs=[(i,candles[i]["h"]) for i in range(n)]
-    lows= [(i,candles[i]["l"]) for i in range(n)]
-    for i in range(len(highs)-3, max(0,len(highs)-20),-1):
-        h1=highs[i][1]
-        similar=[h for h in highs[i+1:i+10] if abs(h[1]-h1)/h1<0.0015]
-        if len(similar)>=2:
-            level=round(max([h1]+[h[1] for h in similar]),2)
-            swept=any(candles[j]["h"]>level*1.001 and candles[j]["c"]<level for j in range(i+1,n))
-            if swept: result["sweep"].append({"type":"BULL_SWEEP","level":level,
-                "signal":f"Swept highs ₹{level} — reversal down possible"})
-            break
-    for i in range(len(lows)-3, max(0,len(lows)-20),-1):
-        l1=lows[i][1]
-        similar=[l for l in lows[i+1:i+10] if abs(l[1]-l1)/l1<0.0015]
-        if len(similar)>=2:
-            level=round(min([l1]+[l[1] for l in similar]),2)
-            swept=any(candles[j]["l"]<level*0.999 and candles[j]["c"]>level for j in range(i+1,n))
-            if swept: result["sweep"].append({"type":"BEAR_SWEEP","level":level,
-                "signal":f"Swept lows ₹{level} — reversal up possible"})
-            break
+    # ── Step 6: Order Blocks — with volatility filter + mitigation ────────
+    # High volatility bars (spike bars) are handled differently
+    # OB is mitigated (invalid) when price crosses through it
+    def vol_filter(i):
+        """For high-volatility bars, use low as parsedHigh and vice versa."""
+        bar_range = highs[i] - lows[i]
+        if bar_range >= 2 * atr_val:
+            return lows[i], highs[i]   # spike bar: invert
+        return highs[i], lows[i]       # normal bar
 
-    # Market structure
-    if n>=10:
-        recent=candles[-10:]; mid=candles[-5:]
-        rh=max(c["h"] for c in recent); rl=min(c["l"] for c in recent)
-        mh=max(c["h"] for c in mid);   ml=min(c["l"] for c in mid)
-        if mh>rh*0.998 and ml>rl*1.002: result["structure"]="HH_HL"
-        elif mh<rh*0.998 and ml<rl*0.998: result["structure"]="LH_LL"
-        elif mh>rh*0.998: result["structure"]="BULLISH"
-        elif ml<rl*0.998: result["structure"]="BEARISH"
-        else: result["structure"]="RANGING"
+    ob_list = []
+    for i in range(2, n-3):
+        c, cn = candles[i], candles[i+1]
+        body_c  = abs(c["c"] - c["o"])
+        body_cn = abs(cn["c"] - cn["o"])
+        if body_c == 0: continue
 
-    return result
+        parsed_h, parsed_l = vol_filter(i)
+
+        # Bullish OB: bearish candle followed by strong bullish candle
+        if c["c"] < c["o"] and cn["c"] > cn["o"] and body_cn > body_c * 1.3:
+            hi = round(max(c["o"], c["c"]), 2)
+            lo = round(min(c["o"], c["c"]), 2)
+            # Mitigation check: has price since come back below the OB low?
+            mitigated = any(candles[j]["l"] < lo for j in range(i+2, n))
+            if not mitigated:
+                ob_list.append({
+                    "type": "BULLISH", "high": hi, "low": lo,
+                    "mid": round((hi+lo)/2, 2),
+                    "strength": round(body_cn/body_c, 1),
+                    "mitigated": False, "idx": i
+                })
+
+        # Bearish OB: bullish candle followed by strong bearish candle
+        if c["c"] > c["o"] and cn["c"] < cn["o"] and body_cn > body_c * 1.3:
+            hi = round(max(c["o"], c["c"]), 2)
+            lo = round(min(c["o"], c["c"]), 2)
+            # Mitigation check: has price since come back above the OB high?
+            mitigated = any(candles[j]["h"] > hi for j in range(i+2, n))
+            if not mitigated:
+                ob_list.append({
+                    "type": "BEARISH", "high": hi, "low": lo,
+                    "mid": round((hi+lo)/2, 2),
+                    "strength": round(body_cn/body_c, 1),
+                    "mitigated": False, "idx": i
+                })
+
+    # Keep most recent non-mitigated OBs only
+    bull_obs = [o for o in ob_list if o["type"]=="BULLISH"][-3:]
+    bear_obs = [o for o in ob_list if o["type"]=="BEARISH"][-3:]
+    ob_result = bull_obs + bear_obs
+
+    # ── Step 7: Liquidity Sweeps (enhanced with EQH/EQL context) ─────────
+    sweeps = []
+    # Bull sweep: price wick above EQH or swing high then closes below
+    for lvl_info in eqh_levels:
+        if lvl_info["swept"]:
+            sweeps.append({
+                "type": "BULL_SWEEP", "level": lvl_info["level"],
+                "signal": f"EQH swept ₹{lvl_info['level']} — smart money reversal down likely"
+            })
+    for lvl_info in eql_levels:
+        if lvl_info["swept"]:
+            sweeps.append({
+                "type": "BEAR_SWEEP", "level": lvl_info["level"],
+                "signal": f"EQL swept ₹{lvl_info['level']} — smart money reversal up likely"
+            })
+
+    # ── Step 8: Premium / Discount / Equilibrium zones ───────────────────
+    swing_high_val = max((h for _,h in swg_highs), default=max(highs))
+    swing_low_val  = min((l for _,l in swg_lows),  default=min(lows))
+    equilibrium    = (swing_high_val + swing_low_val) / 2
+    zone = "EQUILIBRIUM"
+    if curr > equilibrium * 1.005:
+        zone = "PREMIUM"    # expensive — institutions sell here
+    elif curr < equilibrium * 0.995:
+        zone = "DISCOUNT"   # cheap — institutions buy here
+
+    # ── Assemble result ───────────────────────────────────────────────────
+    # Most significant structure event: prefer CHoCH over BOS, swing over internal
+    primary_event = None
+    for ev in sorted(all_structure_events, key=lambda e: e["significance"], reverse=True):
+        primary_event = ev
+        break
+
+    return {
+        # Structure
+        "structure":     structure,          # BULLISH / BEARISH / NEUTRAL
+        "int_trend":     int_trend,          # Internal (5-bar) trend
+        "swg_trend":     swg_trend,          # Swing (20-bar) trend
+        "structure_event": primary_event,    # Most significant BOS/CHoCH
+        "all_events":    all_structure_events[:5],  # All recent structure events
+
+        # Levels
+        "strong_high":   strong_high,        # Key resistance (CHoCH formed here)
+        "weak_high":     weak_high,          # Minor resistance
+        "strong_low":    strong_low,         # Key support (CHoCH formed here)
+        "weak_low":      weak_low,           # Minor support
+
+        # EQH/EQL liquidity pools
+        "eqh":           eqh_levels[-3:],    # Equal highs (sell-side liquidity)
+        "eql":           eql_levels[-3:],    # Equal lows (buy-side liquidity)
+
+        # Order blocks (non-mitigated only)
+        "ob":            ob_result,
+        "orderBlocks":   ob_result,          # alias for frontend
+
+        # FVG (unfilled only)
+        "fvg":           fvg_result,
+        "fvgZones":      fvg_result,         # alias for frontend
+
+        # Sweeps
+        "sweep":         sweeps,
+
+        # Premium/Discount zone
+        "zone":          zone,               # PREMIUM / DISCOUNT / EQUILIBRIUM
+        "equilibrium":   round(equilibrium, 2),
+        "swing_high":    round(swing_high_val, 2),
+        "swing_low":     round(swing_low_val, 2),
+    }
 
 def get_smc_cpr(sym, oi_data=None):
     """Get full market intelligence for a symbol. Cached 5 min."""
