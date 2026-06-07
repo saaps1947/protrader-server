@@ -122,7 +122,16 @@ OI_STOCKS = {
     "BHARTIARTL",
 }
 
-OI_ALL = OI_INDICES | OI_STOCKS | OI_MCX  # Everything with OI support
+# Extended Nifty50 stocks — OI fetched every 15 min (less liquid options)
+OI_STOCKS_EXT = {
+    "APOLLOHOSP","ASIANPAINT","BEL","BPCL","BRITANNIA","CIPLA","COALINDIA",
+    "DIVISLAB","DRREDDY","EICHERMOT","GRASIM","HAL","HEROMOTOCO","HINDALCO",
+    "HINDUNILVR","INDIGO","ITC","JSWSTEEL","LTIM","MM","NESTLEIND","NTPC",
+    "ONGC","POWERGRID","SHRIRAMFIN","SUNPHARMA","TATACONSUM","TATASTEEL",
+    "TECHM","TITAN","TRENT","ULTRACEMCO",
+}
+
+OI_ALL = OI_INDICES | OI_STOCKS | OI_STOCKS_EXT | OI_MCX  # Full coverage
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1999,56 +2008,93 @@ def _warmup():
 
 def _bg_stock_oi():
     """
-    Background thread: refresh OI for all 18 liquid F&O stocks every 5 min.
-    Runs independently of /market — results cached, served instantly.
-    Staggered 3s apart to avoid Zerodha rate limits (3 req/sec).
+    Background thread: refresh OI for 18 liquid F&O stocks + MCX every 5 min.
+    These have the most active option chains — need frequent updates.
     """
-    import os as _os
-    # Wait for server to fully boot and prices to be warm
-    time.sleep(30)
-    print(f"[StockOI] Background OI refresh started for {len(OI_STOCKS)} stocks")
-
+    time.sleep(30)  # wait for server boot
+    print(f"[StockOI] Started — {len(OI_STOCKS)} liquid stocks + {len(OI_MCX)} MCX (5-min cycle)")
     while True:
         try:
-            # Get credentials from latest cached prices meta
-            # They're passed via /zerodha_oi calls and cached in CACHE
             key   = CACHE.get_val("_kite_key") or ""
             token = CACHE.get_val("_kite_token") or ""
             if not key or not token:
-                print("[StockOI] No credentials cached yet — waiting...")
-                time.sleep(60)
-                continue
-
+                print("[StockOI] No credentials yet — waiting...")
+                time.sleep(60); continue
             prices = CACHE.get_val("all_prices") or {}
             fetched = 0
-            # Refresh OI for stocks + MCX commodities
             for sym in sorted(OI_STOCKS | OI_MCX):
                 try:
-                    spot = prices.get(sym, {}).get("px", 0)
-                    result = get_oi(sym, key, token, spot)
+                    result = get_oi(sym, key, token, prices.get(sym,{}).get("px",0))
                     if result:
                         fetched += 1
                         print(f"[StockOI ✅] {sym} PCR:{result.get('pcr','?')} MP:{result.get('max_pain','?')}")
-                    time.sleep(3)  # Zerodha rate limit: 3 req/sec
+                    time.sleep(3)
                 except Exception as e:
                     print(f"[StockOI ❌] {sym}: {e}")
                     time.sleep(3)
-
             total = len(OI_STOCKS | OI_MCX)
-            print(f"[StockOI] Cycle done — {fetched}/{total} fetched (incl. MCX). Sleeping 5min.")
-            time.sleep(300)  # 5 min between full cycles
-
+            print(f"[StockOI] Cycle done — {fetched}/{total}. Sleeping 5min.")
+            time.sleep(300)
         except Exception as e:
-            print(f"[StockOI] Cycle error: {e}")
+            print(f"[StockOI] Error: {e}")
             time.sleep(60)
+
+
+def _bg_stock_oi_extended():
+    """
+    Background thread: refresh OI for 32 extended Nifty50 stocks every 15 min.
+    Less liquid options — 15-min refresh is sufficient to catch signals.
+    96s cycle (32 stocks × 3s) fits well inside 900s (15 min).
+    Only runs during NSE market hours 9:15 AM - 3:30 PM IST.
+    """
+    time.sleep(90)  # stagger: start 90s after primary thread
+    print(f"[ExtOI] Started — {len(OI_STOCKS_EXT)} extended stocks (15-min cycle)")
+    while True:
+        try:
+            key   = CACHE.get_val("_kite_key") or ""
+            token = CACHE.get_val("_kite_token") or ""
+            if not key or not token:
+                time.sleep(120); continue
+            now_ist = datetime.now(IST)
+            # Only during NSE market hours
+            nse_open = now_ist.weekday() < 5 and (
+                (now_ist.hour == 9 and now_ist.minute >= 15) or
+                (10 <= now_ist.hour <= 14) or
+                (now_ist.hour == 15 and now_ist.minute <= 30)
+            )
+            if not nse_open:
+                time.sleep(300); continue
+            prices  = CACHE.get_val("all_prices") or {}
+            fetched = 0
+            for sym in sorted(OI_STOCKS_EXT):
+                try:
+                    result = get_oi(sym, key, token, prices.get(sym,{}).get("px",0))
+                    if result:
+                        fetched += 1
+                        print(f"[ExtOI ✅] {sym} PCR:{result.get('pcr','?')}")
+                    time.sleep(3)
+                except Exception as e:
+                    print(f"[ExtOI ❌] {sym}: {e}")
+                    time.sleep(3)
+            print(f"[ExtOI] Cycle done — {fetched}/{len(OI_STOCKS_EXT)}. Sleeping 15min.")
+            time.sleep(900)
+        except Exception as e:
+            print(f"[ExtOI] Error: {e}")
+            time.sleep(120)
+
 
 # Start warmup for both direct run AND gunicorn
 _warmup_thread = threading.Thread(target=_warmup, daemon=True)
 _warmup_thread.start()
 
-# Start background stock OI refresh thread
+# Start background stock OI refresh thread — liquid stocks every 5 min
 _stock_oi_thread = threading.Thread(target=_bg_stock_oi, daemon=True)
 _stock_oi_thread.start()
+
+# Start extended OI thread — remaining Nifty50 every 15 min
+_ext_oi_thread = threading.Thread(target=_bg_stock_oi_extended, daemon=True)
+_ext_oi_thread.start()
+print(f"[OI] Total coverage: {len(OI_ALL)} instruments ({len(OI_INDICES)} indices + {len(OI_STOCKS)} liquid + {len(OI_STOCKS_EXT)} extended + {len(OI_MCX)} MCX)")
 print(f"[StockOI] Background thread started for {len(OI_STOCKS)} liquid F&O stocks")
 
 if __name__ == "__main__":
