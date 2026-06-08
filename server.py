@@ -1671,6 +1671,17 @@ def get_smc_cpr(sym, oi_data=None):
     regime = detect_market_regime(candles5, oi_data, vwap, orb, vol)
     result["regime"] = regime
 
+    # ── Trend15, PDH, PDL — from daily candle fetch ──
+    # Include these for snapshot capture (not available in /market when Zerodha is connected)
+    if d5:
+        result["trend15"]         = d5.get("trend15","UNKNOWN")
+        result["trend_strength"]  = d5.get("trend_strength",0)
+        result["hh_hl"]           = d5.get("hh_hl",False)
+        result["lh_ll"]           = d5.get("lh_ll",False)
+        result["pdh"]             = d5.get("prev_day_high",0)
+        result["pdl"]             = d5.get("prev_day_low",0)
+        result["above_vwap"]      = (d5.get("px",0) > vwap) if vwap else None
+
     # ── AI narrative ──
     px = d5.get("px",0) if d5 else 0
     narrative = generate_narrative(
@@ -1887,6 +1898,43 @@ def market():
                     "breakdown":  tech.get("breakdown",False),
                     "above_sma20":tech.get("above_sma20"),
                 }
+                # ── 15D trend + PDH/PDL ──
+                d["trend15"]         = tech.get("trend15","UNKNOWN")
+                d["trend_strength"]  = tech.get("trend_strength",0)
+                d["hh_hl"]           = tech.get("hh_hl",False)
+                d["lh_ll"]           = tech.get("lh_ll",False)
+                d["prev_day_high"]   = tech.get("prev_day_high",0)
+                d["prev_day_low"]    = tech.get("prev_day_low",0)
+                d["prev_close"]      = tech.get("prev_close",0)
+
+                # ── CPR from previous day OHLC ──
+                pdh = tech.get("prev_day_high",0)
+                pdl = tech.get("prev_day_low",0)
+                pdc = tech.get("prev_close",0)
+                if pdh and pdl and pdc:
+                    pivot = (pdh+pdl+pdc)/3
+                    tc    = (pdh+pdl)/2
+                    bc    = 2*pivot - tc
+                    width = round(abs(tc-bc)/pivot*100,3) if pivot else 0
+                    d["cpr"] = {
+                        "pivot": round(pivot,2), "tc": round(tc,2), "bc": round(bc,2),
+                        "type": "NARROW" if width<0.3 else "WIDE",
+                        "width_pct": width,
+                        "bias": "BULLISH" if pdc>pivot else "BEARISH"
+                    }
+
+                # ── Intraday VWAP (approximate from today's H/L/C/px) ──
+                px  = d.get("px",0) or 0
+                hi  = d.get("high",0) or 0
+                lo  = d.get("low",0) or 0
+                if px and hi and lo:
+                    # True VWAP requires tick data. Best approximation:
+                    # typical_price = (H+L+C)/3 for the session so far
+                    # Use today's open as anchor if available
+                    op  = d.get("open",0) or px
+                    # Session VWAP estimate: average of open,high,low,close weights
+                    d["vwap"] = round((op+hi+lo+px)/4, 2)
+                    d["above_vwap"] = px > d["vwap"]
             # Merge cached stock OI — liquid stocks (5-min) AND extended stocks (15-min)
             if sym in OI_STOCKS or sym in OI_STOCKS_EXT:
                 oi_data = CACHE.get_val(f"oi_{sym}")
