@@ -126,7 +126,7 @@ OI_STOCKS = {
 OI_STOCKS_EXT = {
     "APOLLOHOSP","ASIANPAINT","BEL","BPCL","BRITANNIA","CIPLA","COALINDIA",
     "DIVISLAB","DRREDDY","EICHERMOT","GRASIM","HAL","HEROMOTOCO","HINDALCO",
-    "HINDUNILVR","INDIGO","ITC","JSWSTEEL","LTIM","MM","NESTLEIND","NTPC",
+    "HINDUNILVR","INDIGO","ITC","JSWSTEEL","LTIM","M&M","NESTLEIND","NTPC",
     "ONGC","POWERGRID","SHRIRAMFIN","SUNPHARMA","TATACONSUM","TATASTEEL",
     "TECHM","TITAN","TRENT","ULTRACEMCO",
 }
@@ -1887,8 +1887,8 @@ def market():
                     "breakdown":  tech.get("breakdown",False),
                     "above_sma20":tech.get("above_sma20"),
                 }
-            # Merge cached stock OI — if available, include in response
-            if sym in OI_STOCKS:
+            # Merge cached stock OI — liquid stocks (5-min) AND extended stocks (15-min)
+            if sym in OI_STOCKS or sym in OI_STOCKS_EXT:
                 oi_data = CACHE.get_val(f"oi_{sym}")
                 if oi_data:
                     d["oi"] = {
@@ -1903,6 +1903,7 @@ def market():
                         "expiry":    oi_data.get("expiry",""),
                         "atm":       oi_data.get("atm",0),
                         "cached":    True,
+                        "refresh":   "5min" if sym in OI_STOCKS else "15min",
                     }
         result[sym] = d
 
