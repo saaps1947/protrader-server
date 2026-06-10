@@ -879,6 +879,22 @@ def get_technicals(sym):
 
     d = fetch_yahoo_candles(ticker, "5m", "2d")
     if d and d.get("sma20"):
+        # MCX commodities: Yahoo returns USD prices (CL=F in $/barrel, GC=F in $/troy oz)
+        # Convert to INR using live USD/INR rate
+        # CRUDEOIL MCX lot = 100 barrels, price per barrel in INR
+        # GOLD MCX = per 10g in INR; GC=F is per troy oz (31.1g) in USD
+        mcx_scale = 1.0
+        if inst.get("mcx"):
+            usdinr = get_usdinr()
+            if sym == "CRUDEOIL":
+                mcx_scale = usdinr          # $/barrel → ₹/barrel
+            elif sym == "GOLD":
+                mcx_scale = usdinr * 10 / 31.1035  # $/troy_oz → ₹/10g
+            if mcx_scale > 1:
+                for field in ["sma20","sma50","high","low","open","prev_close",
+                              "prev_day_high","prev_day_low"]:
+                    if d.get(field): d[field] = round(d[field] * mcx_scale, 2)
+
         tech = {
             "sma20":        d["sma20"],
             "sma50":        d["sma50"],
@@ -894,7 +910,6 @@ def get_technicals(sym):
             "prev_close":   d.get("prev_close",0),
             "volume":       d.get("volume",0),
             "vol_ratio":    d.get("vol_ratio",0),
-            # ── 15D trend + PDH/PDL — FIXED: these were computed but not cached ──
             "prev_day_high":   d.get("prev_day_high",0),
             "prev_day_low":    d.get("prev_day_low",0),
             "trend15":         d.get("trend15","UNKNOWN"),
@@ -903,7 +918,6 @@ def get_technicals(sym):
             "lh_ll":           d.get("lh_ll",False),
         }
         CACHE.set(cache_key, tech)
-        # Store candles separately — used by SMC/VWAP but NOT sent in /market
         if d.get("candles"):
             CACHE.set(f"candles5_{sym}", d["candles"])
         return tech
