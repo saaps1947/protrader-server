@@ -1895,21 +1895,23 @@ def market():
     for sym, p in prices.items():
         d = dict(p)
         inst = INSTRUMENTS.get(sym,{})
-        if not inst.get("mcx"):
-            cache_key = f"tech_{sym}"
-            tech = CACHE.get_val(cache_key)
-            if tech:
-                d["sma20"] = tech.get("sma20")
-                d["sma50"] = tech.get("sma50")
-                d["technicals"] = {
-                    "rsi14":      tech.get("rsi"),
-                    "trend":      tech.get("trend","NEUTRAL"),
-                    "crossover":  tech.get("crossover","NONE"),
-                    "breakout":   tech.get("breakout",False),
-                    "breakdown":  tech.get("breakdown",False),
-                    "above_sma20":tech.get("above_sma20"),
-                }
-                # ── 15D trend + PDH/PDL ──
+
+        # ── Technicals (SMA/RSI/trend) — for all symbols including MCX ──
+        cache_key = f"tech_{sym}"
+        tech = CACHE.get_val(cache_key)
+        if tech:
+            d["sma20"] = tech.get("sma20")
+            d["sma50"] = tech.get("sma50")
+            d["technicals"] = {
+                "rsi14":      tech.get("rsi"),
+                "trend":      tech.get("trend","NEUTRAL"),
+                "crossover":  tech.get("crossover","NONE"),
+                "breakout":   tech.get("breakout",False),
+                "breakdown":  tech.get("breakdown",False),
+                "above_sma20":tech.get("above_sma20"),
+            }
+            if not inst.get("mcx"):
+                # ── 15D trend + PDH/PDL + CPR + VWAP — NSE/BSE only ──
                 d["trend15"]         = tech.get("trend15","UNKNOWN")
                 d["trend_strength"]  = tech.get("trend_strength",0)
                 d["hh_hl"]           = tech.get("hh_hl",False)
@@ -1917,8 +1919,6 @@ def market():
                 d["prev_day_high"]   = tech.get("prev_day_high",0)
                 d["prev_day_low"]    = tech.get("prev_day_low",0)
                 d["prev_close"]      = tech.get("prev_close",0)
-
-                # ── CPR from previous day OHLC ──
                 pdh = tech.get("prev_day_high",0)
                 pdl = tech.get("prev_day_low",0)
                 pdc = tech.get("prev_close",0)
@@ -1933,17 +1933,11 @@ def market():
                         "width_pct": width,
                         "bias": "BULLISH" if pdc>pivot else "BEARISH"
                     }
-
-                # ── Intraday VWAP (approximate from today's H/L/C/px) ──
                 px  = d.get("px",0) or 0
                 hi  = d.get("high",0) or 0
                 lo  = d.get("low",0) or 0
                 if px and hi and lo:
-                    # True VWAP requires tick data. Best approximation:
-                    # typical_price = (H+L+C)/3 for the session so far
-                    # Use today's open as anchor if available
                     op  = d.get("open",0) or px
-                    # Session VWAP estimate: average of open,high,low,close weights
                     d["vwap"] = round((op+hi+lo+px)/4, 2)
                     d["above_vwap"] = px > d["vwap"]
             # Merge cached stock OI — liquid stocks (5-min) AND extended stocks (15-min)
