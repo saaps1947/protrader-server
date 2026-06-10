@@ -880,16 +880,27 @@ def get_technicals(sym):
     d = fetch_yahoo_candles(ticker, "5m", "2d")
     if d and d.get("sma20"):
         tech = {
-            "sma20":d["sma20"],"sma50":d["sma50"],
-            "rsi":d.get("rsi"),
-            "trend":d.get("trend","NEUTRAL"),
-            "crossover":d.get("crossover","NONE"),
-            "breakout":d.get("breakout",False),
-            "breakdown":d.get("breakdown",False),
-            "above_sma20": d["px"] > d["sma20"] if d.get("px") and d.get("sma20") else None,
-            "high":d.get("high",0),"low":d.get("low",0),
-            "open":d.get("open",0),"prev_close":d.get("prev_close",0),
-            "volume":d.get("volume",0),"vol_ratio":d.get("vol_ratio",0),
+            "sma20":        d["sma20"],
+            "sma50":        d["sma50"],
+            "rsi":          d.get("rsi"),
+            "trend":        d.get("trend","NEUTRAL"),
+            "crossover":    d.get("crossover","NONE"),
+            "breakout":     d.get("breakout",False),
+            "breakdown":    d.get("breakdown",False),
+            "above_sma20":  d["px"] > d["sma20"] if d.get("px") and d.get("sma20") else None,
+            "high":         d.get("high",0),
+            "low":          d.get("low",0),
+            "open":         d.get("open",0),
+            "prev_close":   d.get("prev_close",0),
+            "volume":       d.get("volume",0),
+            "vol_ratio":    d.get("vol_ratio",0),
+            # ── 15D trend + PDH/PDL — FIXED: these were computed but not cached ──
+            "prev_day_high":   d.get("prev_day_high",0),
+            "prev_day_low":    d.get("prev_day_low",0),
+            "trend15":         d.get("trend15","UNKNOWN"),
+            "trend_strength":  d.get("trend_strength",0),
+            "hh_hl":           d.get("hh_hl",False),
+            "lh_ll":           d.get("lh_ll",False),
         }
         CACHE.set(cache_key, tech)
         # Store candles separately — used by SMC/VWAP but NOT sent in /market
