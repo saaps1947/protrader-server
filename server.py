@@ -2653,7 +2653,7 @@ def _bt_run_job(job_id, params):
         done=0
         with ThreadPoolExecutor(max_workers=5) as ex:
             futs = {ex.submit(_fetch_sym, sym): sym for sym in test_syms}
-            for fut in _as_completed(futs, timeout=300):
+            for fut in as_completed(futs, timeout=300):
                 try:
                     sym, b5, b1d = fut.result()
                 except Exception as fe:
