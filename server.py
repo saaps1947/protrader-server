@@ -2404,5 +2404,384 @@ _ext_oi_thread.start()
 print(f"[OI] Total coverage: {len(OI_ALL)} instruments ({len(OI_INDICES)} indices + {len(OI_STOCKS)} liquid + {len(OI_STOCKS_EXT)} extended + {len(OI_MCX)} MCX)")
 print(f"[StockOI] Background thread started for {len(OI_STOCKS)} liquid F&O stocks")
 
+
+# ═══════════════════════════════════════════════════════════════════
+# BACKTEST ENGINE
+# Uses Yahoo Finance historical candles + NSE OI archives
+# ═══════════════════════════════════════════════════════════════════
+import uuid as _uuid
+_bt_jobs = {}   # job_id → {status, progress, message, result}
+
+def _bt_fetch_candles(ticker, interval="5m", days=61):
+    """Fetch historical OHLCV from Yahoo Finance. Returns list of bars."""
+    try:
+        period1 = int((datetime.now(IST) - timedelta(days=days)).timestamp())
+        period2 = int(datetime.now(IST).timestamp())
+        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+               f"?interval={interval}&period1={period1}&period2={period2}")
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=20)
+        d = r.json()
+        res = d.get("chart",{}).get("result",[{}])[0]
+        ts_list = res.get("timestamp",[])
+        q = res.get("indicators",{}).get("quote",[{}])[0]
+        bars = []
+        for i,ts in enumerate(ts_list):
+            o = (q.get("open")   or [None]*len(ts_list))[i]
+            h = (q.get("high")   or [None]*len(ts_list))[i]
+            l = (q.get("low")    or [None]*len(ts_list))[i]
+            c = (q.get("close")  or [None]*len(ts_list))[i]
+            v = (q.get("volume") or [0]   *len(ts_list))[i]
+            if not all([o,h,l,c]): continue
+            bars.append({"ts":ts,"o":round(o,2),"h":round(h,2),"l":round(l,2),"c":round(c,2),"v":int(v or 0)})
+        return bars
+    except Exception as e:
+        print(f"[BT] Candle fetch failed {ticker}: {e}")
+        return []
+
+def _bt_fetch_nse_oi(date_obj):
+    """Fetch NSE F&O daily bhavcopy. Returns {SYMBOL: {pcr, ce_oi, pe_oi}}."""
+    cache_key = f"bt_nse_oi_{date_obj}"
+    cached = CACHE.get_val(cache_key)
+    if cached: return cached
+    try:
+        date_str = date_obj.strftime("%d%b%Y").upper()
+        url = f"https://archives.nseindia.com/content/fo/fo{date_str}bhav.csv.zip"
+        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
+        import zipfile, io as _io, csv as _csv
+        zf = zipfile.ZipFile(_io.BytesIO(r.content))
+        data = zf.read(zf.namelist()[0]).decode("utf-8")
+        by_sym = {}
+        for row in _csv.DictReader(_io.StringIO(data)):
+            sym = (row.get("SYMBOL") or row.get(" SYMBOL") or "").strip()
+            opt = (row.get("OPTION_TYP") or row.get(" OPTION_TYP") or "").strip()
+            oi  = float((row.get("OPEN_INT") or row.get(" OPEN_INT") or "0").strip() or 0)
+            if sym not in by_sym: by_sym[sym] = {"CE":0.0,"PE":0.0}
+            if opt=="CE": by_sym[sym]["CE"] += oi
+            if opt=="PE": by_sym[sym]["PE"] += oi
+        result = {}
+        for sym,oi in by_sym.items():
+            ce,pe = oi["CE"],oi["PE"]
+            result[sym] = {"pcr":round(pe/ce,2) if ce>0 else 0,"ce_oi":ce,"pe_oi":pe}
+        CACHE.set(cache_key, result)
+        return result
+    except Exception as e:
+        print(f"[BT] NSE OI failed {date_obj}: {e}")
+        return {}
+
+def _bt_score(px, sma20, sma50, rsi, vwap, pdh, pdl, cpr_tc, cpr_bc, cpr_narrow,
+              orb_h, orb_l, mins, trend15, pcr):
+    """Replicate signal scoring engine for one bar. Returns (bull, bear)."""
+    bull=0; bear=0
+    aboveVwap = px>vwap if vwap else px>sma20
+    # SMA layer
+    if px>sma20 and px>sma50: bull+=1
+    if px<sma20 and px<sma50: bear+=1
+    if sma20>sma50: bull+=1
+    elif sma20<sma50: bear+=1
+    # RSI layer
+    if rsi<32 and px>sma20: bull+=2
+    elif 35<=rsi<=55 and px>sma20: bull+=1
+    if rsi>68 and px<sma20: bear+=2
+    elif 45<=rsi<=65 and px<sma20: bear+=1
+    # VWAP layer
+    if aboveVwap: bull+=2
+    else: bear+=2
+    # PDH/PDL
+    if pdh and px>pdh*1.001: bull+=(2 if True else 1)
+    elif pdh and abs(px-pdh)/pdh<0.002: bear+=1
+    if pdl and px<pdl*0.999: bear+=2
+    elif pdl and abs(px-pdl)/pdl<0.002: bull+=1
+    # CPR
+    if cpr_narrow and cpr_tc and px>cpr_tc: bull+=2
+    if cpr_narrow and cpr_bc and px<cpr_bc: bear+=2
+    # ORB
+    if orb_h and orb_l:
+        tier = 3 if mins<11*60 else 2 if mins<14*60 else 1
+        if px>orb_h*1.001: bull+=tier
+        elif px<orb_l*0.999: bear+=tier
+    # 15D trend
+    tmap = {"STRONG_BULL":(3,0),"BULL":(2,0),"NEUTRAL":(0,0),"BEAR":(0,2),"STRONG_BEAR":(0,3)}
+    bt,be = tmap.get(trend15,(0,0)); bull+=bt; bear+=be
+    # Counter-trend penalty
+    if trend15 in ["STRONG_BULL","BULL"] and bear>bull: bear=max(0,bear-2)
+    if trend15 in ["STRONG_BEAR","BEAR"] and bull>bear: bull=max(0,bull-2)
+    # OI (daily PCR)
+    if pcr>1.1: bull+=1
+    if pcr>1.6: bull+=1
+    if pcr<0.9: bear+=1
+    if pcr<0.6: bear+=1
+    return bull, bear
+
+def _bt_simulate(bias, entry, sl, t1, t2, future_bars):
+    """Simulate trade outcome. Returns status + pnl_pct."""
+    effective_sl = sl; t1_hit = False
+    for i,bar in enumerate(future_bars):
+        mins = (bar["ts"]//60)%1440 if isinstance(bar["ts"],int) else 0
+        if mins >= 15*60+15:
+            pct = (bar["c"]-entry)/entry*100 if bias=="BULLISH" else (entry-bar["c"])/entry*100
+            return {"status":"EOD","exit":round(bar["c"],2),"pnl_pct":round(pct,2),"bars":i+1}
+        if bias=="BULLISH":
+            if bar["l"]<=effective_sl:
+                pct=(effective_sl-entry)/entry*100
+                return {"status":"T1_BE_SL" if t1_hit else "SL_HIT","exit":round(effective_sl,2),"pnl_pct":round(pct,2),"bars":i+1}
+            if not t1_hit and bar["h"]>=t1: t1_hit=True; effective_sl=entry
+            if bar["h"]>=t2:
+                return {"status":"T2_HIT","exit":round(t2,2),"pnl_pct":round((t2-entry)/entry*100,2),"bars":i+1}
+        else:
+            if bar["h"]>=effective_sl:
+                pct=(entry-effective_sl)/entry*100
+                return {"status":"T1_BE_SL" if t1_hit else "SL_HIT","exit":round(effective_sl,2),"pnl_pct":round(pct,2),"bars":i+1}
+            if not t1_hit and bar["l"]<=t1: t1_hit=True; effective_sl=entry
+            if bar["l"]<=t2:
+                return {"status":"T2_HIT","exit":round(t2,2),"pnl_pct":round((entry-t2)/entry*100,2),"bars":i+1}
+    return {"status":"OPEN","exit":0,"pnl_pct":0,"bars":len(future_bars)}
+
+def _bt_run_job(job_id, params):
+    """Background backtest computation."""
+    try:
+        days     = int(params.get("days",60))
+        min_conf = int(params.get("min_conf",82))
+        sym_filter = params.get("syms","all")
+        # Which symbols to test
+        if sym_filter=="idx":   test_syms = list(OI_INDICES)
+        elif sym_filter=="stk": test_syms = [s for s in INSTRUMENTS if not INSTRUMENTS[s].get("mcx") and s not in OI_INDICES]
+        else:                   test_syms = [s for s in INSTRUMENTS if not INSTRUMENTS[s].get("mcx")]
+
+        total  = len(test_syms)
+        signals_all = []
+        nse_oi_cache = {}  # date → {sym → oi}
+
+        _bt_jobs[job_id].update({"message":"Fetching market data…","progress":2})
+
+        # Fetch all candles in parallel (max 8 threads)
+        candle_data = {}
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+        def _fetch_sym(sym):
+            ticker = INSTRUMENTS.get(sym,{}).get("yahoo","")
+            if not ticker: return sym, [], []
+            bars5m  = _bt_fetch_candles(ticker,"5m",days+3)
+            bars1d  = _bt_fetch_candles(ticker,"1d",days+35)
+            return sym, bars5m, bars1d
+
+        done=0
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs = {ex.submit(_fetch_sym, sym): sym for sym in test_syms}
+            for fut in _as_completed(futs, timeout=180):
+                sym, b5, b1d = fut.result()
+                candle_data[sym] = {"5m":b5,"1d":b1d}
+                done+=1
+                _bt_jobs[job_id].update({"progress":round(5+done/total*40),"message":f"Loaded {done}/{total} symbols…"})
+
+        _bt_jobs[job_id].update({"message":"Running signal engine…","progress":50})
+
+        # Process each symbol
+        for si, sym in enumerate(test_syms):
+            _bt_jobs[job_id].update({"progress":round(50+si/total*40),"message":f"Scoring {sym}…"})
+            bars5 = candle_data.get(sym,{}).get("5m",[])
+            bars1d= candle_data.get(sym,{}).get("1d",[])
+            if not bars5 or not bars1d: continue
+
+            # Group 5m bars by calendar date
+            from collections import defaultdict as _dd
+            by_date = _dd(list)
+            for b in bars5:
+                dt = datetime.fromtimestamp(b["ts"], tz=IST).date()
+                by_date[dt].append(b)
+
+            # Daily lookup for PDH/PDL/trend15
+            daily_by_date = {}
+            for b in bars1d:
+                dt = datetime.fromtimestamp(b["ts"], tz=IST).date()
+                daily_by_date[dt] = b
+            sorted_daily = sorted(daily_by_date.keys())
+
+            last_signal_bias = None
+            last_signal_date = None
+
+            for dt in sorted(by_date.keys()):
+                day_bars = sorted(by_date[dt], key=lambda b:b["ts"])
+                if len(day_bars) < 5: continue
+
+                # PDH / PDL / CPR from previous day
+                di = sorted_daily.index(dt) if dt in sorted_daily else -1
+                prev_dt = sorted_daily[di-1] if di>0 else None
+                prev_d = daily_by_date.get(prev_dt) if prev_dt else None
+                pdh = prev_d["h"] if prev_d else 0
+                pdl = prev_d["l"] if prev_d else 0
+                pdc = prev_d["c"] if prev_d else 0
+                pivot = (pdh+pdl+pdc)/3 if pdh else 0
+                cpr_tc = (pdh+pdl)/2 if pdh else 0
+                cpr_bc = 2*pivot-cpr_tc if pivot else 0
+                cpr_narrow = (abs(cpr_tc-cpr_bc)/pivot*100 < 0.3) if pivot else False
+
+                # 15D trend from daily bars
+                trend15 = "NEUTRAL"
+                if di >= 12:
+                    d15 = [daily_by_date[sorted_daily[j]] for j in range(max(0,di-15),di) if sorted_daily[j] in daily_by_date]
+                    if len(d15)>=10:
+                        cls = [b["c"] for b in d15]
+                        s5  = sum(cls[-5:])/5; s10 = sum(cls[-10:])/10
+                        hh  = d15[-1]["h"] > d15[-4]["h"]; hl = d15[-1]["l"] > d15[-4]["l"]
+                        lh  = d15[-1]["h"] < d15[-4]["h"]; ll = d15[-1]["l"] < d15[-4]["l"]
+                        if s5>s10 and hh and hl:   trend15="STRONG_BULL"
+                        elif s5>s10:               trend15="BULL"
+                        elif s5<s10 and lh and ll: trend15="STRONG_BEAR"
+                        elif s5<s10:               trend15="BEAR"
+
+                # NSE OI for this date
+                if dt not in nse_oi_cache:
+                    nse_oi_cache[dt] = _bt_fetch_nse_oi(dt)
+                day_oi = nse_oi_cache.get(dt,{})
+                # Map symbol to NSE symbol name
+                nse_sym = sym.replace("-","").replace("&","")
+                pcr = day_oi.get(sym,{}).get("pcr") or day_oi.get(nse_sym,{}).get("pcr") or 0
+
+                # ORB (9:15–9:30 AM bars)
+                orb_bars = [b for b in day_bars if
+                            9*3600+15*60 <= b["ts"]%86400 < 9*3600+30*60]
+                orb_h = max(b["h"] for b in orb_bars) if orb_bars else 0
+                orb_l = min(b["l"] for b in orb_bars) if orb_bars else 0
+
+                # VWAP accumulation
+                cum_tv=0; cum_v=0
+                close_buf=[]
+                avg_vol_buf=[]
+
+                for bi, bar in enumerate(day_bars):
+                    bar_time = datetime.fromtimestamp(bar["ts"], tz=IST)
+                    mins = bar_time.hour*60 + bar_time.minute
+                    if mins < 9*60+30: continue   # before 9:30 AM
+                    if mins > 15*60+30: break
+
+                    tp = (bar["h"]+bar["l"]+bar["c"])/3
+                    cum_tv += tp*bar["v"]; cum_v += bar["v"]
+                    vwap = cum_tv/cum_v if cum_v else bar["c"]
+                    close_buf.append(bar["c"])
+                    avg_vol_buf.append(bar["v"])
+
+                    if len(close_buf) < 5: continue
+
+                    sma20 = sum(close_buf[-20:])/min(20,len(close_buf))
+                    sma50 = sum(close_buf[-50:])/min(50,len(close_buf))
+                    # RSI 14
+                    if len(close_buf)>=15:
+                        diffs=[close_buf[i]-close_buf[i-1] for i in range(max(1,len(close_buf)-14),len(close_buf))]
+                        g=[d for d in diffs if d>0]; lo=[abs(d) for d in diffs if d<0]
+                        ag=sum(g)/14 if g else 0.001; al=sum(lo)/14 if lo else 0.001
+                        rsi = round(100-100/(1+ag/al),1)
+                    else: rsi=50
+
+                    px = bar["c"]
+                    bull, bear = _bt_score(px,sma20,sma50,rsi,vwap,pdh,pdl,
+                                           cpr_tc,cpr_bc,cpr_narrow,orb_h,orb_l,
+                                           mins,trend15,pcr)
+
+                    # Hard blocks
+                    if trend15=="STRONG_BULL" and bear>bull: continue
+                    if trend15=="STRONG_BEAR" and bull>bear: continue
+
+                    # Minimum score
+                    if bull<2 and bear<2: continue
+                    bias = "BULLISH" if bull>bear else "BEARISH" if bear>bull else None
+                    if not bias: continue
+
+                    # Confidence
+                    w=bull if bias=="BULLISH" else bear
+                    lo2=bear if bias=="BULLISH" else bull
+                    conf = min(94,max(62,68+w*3-lo2*2))
+                    if pcr==0: conf=min(conf,79)
+
+                    # Morning thresholds
+                    early=(9*60+30<=mins<9*60+45); late=(9*60+45<=mins<10*60)
+                    if early:
+                        if not(orb_h and orb_l): continue  # ORB not confirmed
+                        if conf<92: continue
+                    elif late:
+                        if conf<89: continue
+                    elif conf<min_conf: continue
+
+                    # Avoid same-day same-direction repeat
+                    if last_signal_bias==bias and last_signal_date==dt: continue
+                    last_signal_bias=bias; last_signal_date=dt
+
+                    # SL / Targets
+                    sl_d = px*0.005
+                    if bias=="BULLISH": sl=px-sl_d; t1=px+sl_d*1.5; t2=px+sl_d*2.5
+                    else:               sl=px+sl_d; t1=px-sl_d*1.5; t2=px-sl_d*2.5
+
+                    outcome = _bt_simulate(bias,px,sl,t1,t2,day_bars[bi+1:])
+
+                    session = ("morning" if mins<10*60 else
+                               "midday"  if mins<14*60 else "afternoon")
+                    signals_all.append({
+                        "sym":sym,"date":str(dt),"time":bar_time.strftime("%H:%M"),
+                        "bias":bias,"conf":conf,"bull":bull,"bear":bear,
+                        "trend15":trend15,"cpr_narrow":cpr_narrow,
+                        "pcr":round(pcr,2),"rsi":round(rsi,1),
+                        "vwap":round(vwap,2),"entry":round(px,2),
+                        "sl":round(sl,2),"t1":round(t1,2),"t2":round(t2,2),
+                        "session":session,
+                        **outcome
+                    })
+
+        # Aggregate results
+        _bt_jobs[job_id].update({"progress":95,"message":"Aggregating results…"})
+        closed = [s for s in signals_all if s["status"]!="OPEN"]
+        wins   = [s for s in closed if s["pnl_pct"]>0]
+        losses = [s for s in closed if s["pnl_pct"]<0]
+
+        def breakdown(fn):
+            from collections import defaultdict as _dd2
+            grps=_dd2(list)
+            for s in closed: grps[fn(s)].append(s)
+            out=[]
+            for k,g in sorted(grps.items()):
+                w=sum(1 for s in g if s["pnl_pct"]>0)
+                l=sum(1 for s in g if s["pnl_pct"]<0)
+                wr=round(w/(w+l)*100) if w+l else 0
+                avg=round(sum(s["pnl_pct"] for s in g)/len(g),2)
+                out.append({"k":str(k),"w":w,"l":l,"wr":wr,"avg":avg,"n":len(g)})
+            return sorted(out,key=lambda x:-x["wr"])
+
+        aw=round(sum(s["pnl_pct"] for s in wins)/len(wins),2) if wins else 0
+        al=round(sum(s["pnl_pct"] for s in losses)/len(losses),2) if losses else 0
+        result = {
+            "total":len(signals_all), "closed":len(closed),
+            "wins":len(wins), "losses":len(losses),
+            "win_rate":round(len(wins)/len(closed)*100) if closed else 0,
+            "avg_win":aw, "avg_loss":al,
+            "profit_factor":round(abs(aw/al),2) if al else 0,
+            "by_session": breakdown(lambda s:s["session"]),
+            "by_trend":   breakdown(lambda s:s["trend15"]),
+            "by_bias":    breakdown(lambda s:s["bias"]),
+            "by_conf":    breakdown(lambda s:"94%" if s["conf"]>=94 else "88-93%" if s["conf"]>=88 else "82-87%" if s["conf"]>=82 else "<82%"),
+            "by_cpr":     breakdown(lambda s:"NARROW" if s["cpr_narrow"] else "WIDE"),
+            "by_sym":     breakdown(lambda s:s["sym"]),
+            "signals":    sorted(signals_all,key=lambda s:s["date"]+s["time"])[-300:],
+        }
+        _bt_jobs[job_id].update({"status":"done","progress":100,"message":"Complete","result":result})
+    except Exception as e:
+        import traceback
+        _bt_jobs[job_id].update({"status":"error","message":str(e),"trace":traceback.format_exc()})
+        print(f"[BT] Job {job_id} failed: {e}")
+
+@app.route("/backtest", methods=["POST"])
+def backtest_start():
+    """Start a backtest job. Returns job_id."""
+    params = request.get_json() or {}
+    job_id = str(_uuid.uuid4())[:8]
+    _bt_jobs[job_id] = {"status":"running","progress":0,"message":"Starting…","result":None}
+    t = threading.Thread(target=_bt_run_job, args=(job_id, params), daemon=True)
+    t.start()
+    return jsonify({"ok":True,"job_id":job_id})
+
+@app.route("/backtest_status/<job_id>")
+def backtest_status(job_id):
+    """Poll backtest job status."""
+    job = _bt_jobs.get(job_id)
+    if not job: return jsonify({"ok":False,"error":"Job not found"}),404
+    return jsonify({"ok":True,**job})
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=False)
+
