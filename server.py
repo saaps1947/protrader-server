@@ -2413,29 +2413,111 @@ import uuid as _uuid
 _bt_jobs = {}   # job_id → {status, progress, message, result}
 
 def _bt_fetch_candles(ticker, interval="5m", days=61):
-    """Fetch historical OHLCV from Yahoo Finance. Returns list of bars."""
+    """Fetch historical OHLCV using proven fetch_yahoo_candles. Reuses proxy + parsing."""
+    rng = f"{min(days,59)}d" if interval=="5m" else f"{days}d"
+    d = fetch_yahoo_candles(ticker, interval=interval, rng=rng)
+    if not d or not d.get("candles"):
+        return []
+    # Rename "t" → "ts" to match backtest engine expectations
+    return [{"ts":c["t"],"o":c["o"],"h":c["h"],"l":c["l"],"c":c["c"],"v":c["v"]}
+            for c in d["candles"]]
+
+# ── Zerodha instrument token cache ───────────────────────────────────────────
+_kite_nse_tokens = {}   # sym → instrument_token
+
+def _bt_get_kite_token(sym, key, token):
+    """Look up NSE equity instrument token for a symbol. Cached per session."""
+    if sym in _kite_nse_tokens:
+        return _kite_nse_tokens[sym]
+    # Known indices — hardcoded tokens (stable, don't change)
+    _static = {
+        "NIFTY":256265, "BANKNIFTY":260105, "FINNIFTY":257801,
+        "SENSEX":265, "MIDCPNIFTY":288009,
+    }
+    if sym in _static:
+        _kite_nse_tokens[sym] = _static[sym]
+        return _static[sym]
+    # Fetch NSE equity instruments CSV and parse
+    cached_csv = CACHE.get_val("instruments_nse_eq")
+    if not cached_csv:
+        try:
+            r = requests.get("https://api.kite.trade/instruments/NSE",
+                headers=_kite_headers(key, token), timeout=20)
+            if r.status_code == 200:
+                cached_csv = r.text
+                CACHE.set("instruments_nse_eq", cached_csv)
+        except Exception as e:
+            print(f"[BT] NSE instruments fetch failed: {e}")
+            return None
+    if not cached_csv:
+        return None
+    # Parse CSV for our symbol
+    import csv as _csv, io as _io
+    for row in _csv.DictReader(_io.StringIO(cached_csv)):
+        ts = (row.get("tradingsymbol") or "").strip()
+        seg = (row.get("segment") or "").strip()
+        tok = (row.get("instrument_token") or "").strip()
+        if ts == sym and seg in ("NSE", "NSE-EQ") and tok:
+            _kite_nse_tokens[sym] = int(tok)
+            return int(tok)
+    print(f"[BT] Token not found for {sym}")
+    return None
+
+def _bt_kite_candles(sym, key, api_token, days=60, interval="5minute"):
+    """
+    Fetch historical candles from Zerodha Kite API.
+    This is the authoritative source — accurate NSE data, proper market hours.
+    interval: "5minute" | "day"
+    Returns list of {ts, o, h, l, c, v} dicts.
+    """
+    instr_token = _bt_get_kite_token(sym, key, api_token)
+    if not instr_token:
+        # Fallback to Yahoo Finance for symbols without Kite token
+        inst = INSTRUMENTS.get(sym, {})
+        yahoo_ticker = inst.get("yahoo", "")
+        if yahoo_ticker:
+            print(f"[BT] Falling back to Yahoo for {sym}")
+            return _bt_fetch_candles(yahoo_ticker, "5m" if interval=="5minute" else "1d", days)
+        return []
+
+    from_dt = (datetime.now(IST) - timedelta(days=days)).strftime("%Y-%m-%d")
+    to_dt   =  datetime.now(IST).strftime("%Y-%m-%d")
+
+    url = (f"https://api.kite.trade/instruments/historical/"
+           f"{instr_token}/{interval}"
+           f"?from={from_dt}&to={to_dt}")
+
     try:
-        period1 = int((datetime.now(IST) - timedelta(days=days)).timestamp())
-        period2 = int(datetime.now(IST).timestamp())
-        url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-               f"?interval={interval}&period1={period1}&period2={period2}")
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=20)
+        r = requests.get(url, headers=_kite_headers(key, api_token), timeout=30)
+        if r.status_code in [401, 403]:
+            print(f"[BT] Kite auth failed for {sym} — token expired?")
+            return []
         d = r.json()
-        res = d.get("chart",{}).get("result",[{}])[0]
-        ts_list = res.get("timestamp",[])
-        q = res.get("indicators",{}).get("quote",[{}])[0]
+        if d.get("status") != "success":
+            print(f"[BT] Kite error for {sym}: {d.get('message','')}")
+            return []
         bars = []
-        for i,ts in enumerate(ts_list):
-            o = (q.get("open")   or [None]*len(ts_list))[i]
-            h = (q.get("high")   or [None]*len(ts_list))[i]
-            l = (q.get("low")    or [None]*len(ts_list))[i]
-            c = (q.get("close")  or [None]*len(ts_list))[i]
-            v = (q.get("volume") or [0]   *len(ts_list))[i]
-            if not all([o,h,l,c]): continue
-            bars.append({"ts":ts,"o":round(o,2),"h":round(h,2),"l":round(l,2),"c":round(c,2),"v":int(v or 0)})
+        for c in d.get("data", {}).get("candles", []):
+            # Format: [datetime_str, open, high, low, close, volume, OI]
+            ts_str = c[0]
+            try:
+                if "+" in ts_str or "Z" in ts_str:
+                    dt = datetime.fromisoformat(ts_str.replace("Z","+00:00"))
+                else:
+                    dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S")
+                    dt = dt.replace(tzinfo=IST)
+            except:
+                continue
+            bars.append({
+                "ts": int(dt.timestamp()),
+                "o": round(float(c[1]),2), "h": round(float(c[2]),2),
+                "l": round(float(c[3]),2), "c": round(float(c[4]),2),
+                "v": int(c[5]) if len(c)>5 else 0
+            })
+        print(f"[BT] {sym}: {len(bars)} {interval} bars via Kite ✅")
         return bars
     except Exception as e:
-        print(f"[BT] Candle fetch failed {ticker}: {e}")
+        print(f"[BT] Kite historical failed {sym}: {e}")
         return []
 
 def _bt_fetch_nse_oi(date_obj):
@@ -2551,26 +2633,37 @@ def _bt_run_job(job_id, params):
         signals_all = []
         nse_oi_cache = {}  # date → {sym → oi}
 
-        _bt_jobs[job_id].update({"message":"Fetching market data…","progress":2})
+        _bt_jobs[job_id].update({"message":"Fetching candles from Zerodha…","progress":2})
 
-        # Fetch all candles in parallel (max 8 threads)
+        # Read Zerodha credentials from cache (set when Kite is connected in app)
+        kite_key   = CACHE.get_val("_kite_key")   or ""
+        kite_token = CACHE.get_val("_kite_token") or ""
+        if not kite_key or not kite_token:
+            raise Exception("Zerodha not connected — open Settings and connect Kite first")
+
+        # Fetch all candles via Zerodha Kite historical API
+        # Kite gives accurate NSE data, proper market hours, no rate limiting issues
         candle_data = {}
-        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
         def _fetch_sym(sym):
-            ticker = INSTRUMENTS.get(sym,{}).get("yahoo","")
-            if not ticker: return sym, [], []
-            bars5m  = _bt_fetch_candles(ticker,"5m",days+3)
-            bars1d  = _bt_fetch_candles(ticker,"1d",days+35)
+            bars5m = _bt_kite_candles(sym, kite_key, kite_token, days, "5minute")
+            bars1d = _bt_kite_candles(sym, kite_key, kite_token, days+30, "day")
             return sym, bars5m, bars1d
 
         done=0
-        with ThreadPoolExecutor(max_workers=6) as ex:
+        with ThreadPoolExecutor(max_workers=5) as ex:
             futs = {ex.submit(_fetch_sym, sym): sym for sym in test_syms}
-            for fut in _as_completed(futs, timeout=180):
-                sym, b5, b1d = fut.result()
+            for fut in _as_completed(futs, timeout=300):
+                try:
+                    sym, b5, b1d = fut.result()
+                except Exception as fe:
+                    sym = futs[fut]; b5=[]; b1d=[]
+                    print(f"[BT] Fetch error {sym}: {fe}")
                 candle_data[sym] = {"5m":b5,"1d":b1d}
                 done+=1
-                _bt_jobs[job_id].update({"progress":round(5+done/total*40),"message":f"Loaded {done}/{total} symbols…"})
+                loaded = sum(1 for v in candle_data.values() if v.get("5m"))
+                _bt_jobs[job_id].update({"progress":round(5+done/total*40),
+                    "message":f"Loaded {done}/{total} symbols ({loaded} with data)…"})
 
         _bt_jobs[job_id].update({"message":"Running signal engine…","progress":50})
 
@@ -2588,12 +2681,16 @@ def _bt_run_job(job_id, params):
                 dt = datetime.fromtimestamp(b["ts"], tz=IST).date()
                 by_date[dt].append(b)
 
-            # Daily lookup for PDH/PDL/trend15
+            # Build daily bar lookup (Kite 'day' interval data)
             daily_by_date = {}
             for b in bars1d:
-                dt = datetime.fromtimestamp(b["ts"], tz=IST).date()
-                daily_by_date[dt] = b
+                dt_key = datetime.fromtimestamp(b["ts"], tz=IST).date()
+                daily_by_date[dt_key] = b
             sorted_daily = sorted(daily_by_date.keys())
+
+            if not daily_by_date:
+                print(f"[BT] {sym}: no daily data, skipping")
+                continue
 
             last_signal_bias = None
             last_signal_date = None
@@ -2780,7 +2877,19 @@ def backtest_status(job_id):
     """Poll backtest job status."""
     job = _bt_jobs.get(job_id)
     if not job: return jsonify({"ok":False,"error":"Job not found"}),404
-    return jsonify({"ok":True,**job})
+    # Include trace in error state for frontend debugging
+    resp = {"ok":True, "status":job.get("status"), "progress":job.get("progress",0),
+            "message":job.get("message",""), "result":job.get("result")}
+    if job.get("status")=="error": resp["trace"] = job.get("trace","")
+    return jsonify(resp)
+
+@app.route("/backtest_jobs")
+def backtest_jobs():
+    """List all backtest jobs — for debugging."""
+    return jsonify({"ok":True,"jobs":{jid:{"status":j.get("status"),"progress":j.get("progress"),
+        "message":j.get("message"),"has_result":j.get("result") is not None,
+        "error":j.get("trace","")[:300] if j.get("status")=="error" else ""}
+        for jid,j in _bt_jobs.items()}})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=False)
