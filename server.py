@@ -14,7 +14,7 @@ Author: PRO Trader
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests, time, threading
+import requests, time, threading, re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
@@ -2498,15 +2498,20 @@ def _bt_kite_candles(sym, key, api_token, days=60, interval="5minute"):
             return []
         bars = []
         for c in d.get("data", {}).get("candles", []):
-            # Format: [datetime_str, open, high, low, close, volume, OI]
+            # Kite format: ["2026-05-01 09:15:00", open, high, low, close, volume]
+            # Sometimes: "2026-05-01T09:15:00+0530" — handle both
             ts_str = c[0]
             try:
-                if "+" in ts_str or "Z" in ts_str:
-                    dt = datetime.fromisoformat(ts_str.replace("Z","+00:00"))
+                # Normalise: replace space with T, handle +0530 → +05:30
+                ts_norm = ts_str.replace(" ", "T")
+                ts_norm = re.sub(r'\+(\d{2})(\d{2})$', r'+\1:\2', ts_norm)
+                if "+" in ts_norm or "Z" in ts_norm:
+                    dt = datetime.fromisoformat(ts_norm.replace("Z","+00:00"))
                 else:
-                    dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S")
+                    # No timezone info — Kite returns IST implicitly
+                    dt = datetime.strptime(ts_norm, "%Y-%m-%dT%H:%M:%S")
                     dt = dt.replace(tzinfo=IST)
-            except:
+            except Exception as pe:
                 continue
             bars.append({
                 "ts": int(dt.timestamp()),
@@ -2515,6 +2520,10 @@ def _bt_kite_candles(sym, key, api_token, days=60, interval="5minute"):
                 "v": int(c[5]) if len(c)>5 else 0
             })
         print(f"[BT] {sym}: {len(bars)} {interval} bars via Kite ✅")
+        if not bars and d.get("data", {}).get("candles"):
+            raw_count = len(d["data"]["candles"])
+            sample = d["data"]["candles"][0][0] if raw_count else "none"
+            print(f"[BT] ⚠ {sym}: {raw_count} raw candles but 0 parsed — sample ts: {sample}")
         return bars
     except Exception as e:
         print(f"[BT] Kite historical failed {sym}: {e}")
