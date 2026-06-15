@@ -2407,7 +2407,8 @@ print(f"[StockOI] Background thread started for {len(OI_STOCKS)} liquid F&O stoc
 
 # ═══════════════════════════════════════════════════════════════════
 # BACKTEST ENGINE
-# Uses Yahoo Finance historical candles + NSE OI archives
+# Technical layers only: SMA, RSI, VWAP, ORB, CPR, PDH/PDL, 15D Trend
+# OI excluded — requires intraday data (use snapshot-based backtest for OI validation)
 # ═══════════════════════════════════════════════════════════════════
 import uuid as _uuid
 _bt_jobs = {}   # job_id → {status, progress, message, result}
@@ -2529,38 +2530,9 @@ def _bt_kite_candles(sym, key, api_token, days=60, interval="5minute"):
         print(f"[BT] Kite historical failed {sym}: {e}")
         return []
 
-def _bt_fetch_nse_oi(date_obj):
-    """Fetch NSE F&O daily bhavcopy. Returns {SYMBOL: {pcr, ce_oi, pe_oi}}."""
-    cache_key = f"bt_nse_oi_{date_obj}"
-    cached = CACHE.get_val(cache_key)
-    if cached: return cached
-    try:
-        date_str = date_obj.strftime("%d%b%Y").upper()
-        url = f"https://archives.nseindia.com/content/fo/fo{date_str}bhav.csv.zip"
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=15)
-        import zipfile, io as _io, csv as _csv
-        zf = zipfile.ZipFile(_io.BytesIO(r.content))
-        data = zf.read(zf.namelist()[0]).decode("utf-8")
-        by_sym = {}
-        for row in _csv.DictReader(_io.StringIO(data)):
-            sym = (row.get("SYMBOL") or row.get(" SYMBOL") or "").strip()
-            opt = (row.get("OPTION_TYP") or row.get(" OPTION_TYP") or "").strip()
-            oi  = float((row.get("OPEN_INT") or row.get(" OPEN_INT") or "0").strip() or 0)
-            if sym not in by_sym: by_sym[sym] = {"CE":0.0,"PE":0.0}
-            if opt=="CE": by_sym[sym]["CE"] += oi
-            if opt=="PE": by_sym[sym]["PE"] += oi
-        result = {}
-        for sym,oi in by_sym.items():
-            ce,pe = oi["CE"],oi["PE"]
-            result[sym] = {"pcr":round(pe/ce,2) if ce>0 else 0,"ce_oi":ce,"pe_oi":pe}
-        CACHE.set(cache_key, result)
-        return result
-    except Exception as e:
-        print(f"[BT] NSE OI failed {date_obj}: {e}")
-        return {}
 
 def _bt_score(px, sma20, sma50, rsi, vwap, pdh, pdl, cpr_tc, cpr_bc, cpr_narrow,
-              orb_h, orb_l, mins, trend15, pcr):
+              orb_h, orb_l, mins, trend15):
     """Replicate signal scoring engine for one bar. Returns (bull, bear)."""
     bull=0; bear=0
     aboveVwap = px>vwap if vwap else px>sma20
@@ -2596,11 +2568,8 @@ def _bt_score(px, sma20, sma50, rsi, vwap, pdh, pdl, cpr_tc, cpr_bc, cpr_narrow,
     # Counter-trend penalty
     if trend15 in ["STRONG_BULL","BULL"] and bear>bull: bear=max(0,bear-2)
     if trend15 in ["STRONG_BEAR","BEAR"] and bull>bear: bull=max(0,bull-2)
-    # OI (daily PCR)
-    if pcr>1.1: bull+=1
-    if pcr>1.6: bull+=1
-    if pcr<0.9: bear+=1
-    if pcr<0.6: bear+=1
+    # OI excluded — intraday OI not available for historical dates
+    # Use snapshot-based backtest once 30 days of snapshots are captured
     return bull, bear
 
 def _bt_simulate(bias, entry, sl, t1, t2, future_bars):
@@ -2640,7 +2609,6 @@ def _bt_run_job(job_id, params):
 
         total  = len(test_syms)
         signals_all = []
-        nse_oi_cache = {}  # date → {sym → oi}
 
         _bt_jobs[job_id].update({"message":"Fetching candles from Zerodha…","progress":2})
 
@@ -2734,13 +2702,8 @@ def _bt_run_job(job_id, params):
                         elif s5<s10 and lh and ll: trend15="STRONG_BEAR"
                         elif s5<s10:               trend15="BEAR"
 
-                # NSE OI for this date
-                if dt not in nse_oi_cache:
-                    nse_oi_cache[dt] = _bt_fetch_nse_oi(dt)
-                day_oi = nse_oi_cache.get(dt,{})
-                # Map symbol to NSE symbol name
-                nse_sym = sym.replace("-","").replace("&","")
-                pcr = day_oi.get(sym,{}).get("pcr") or day_oi.get(nse_sym,{}).get("pcr") or 0
+                # OI not used in technical-only backtest
+                pcr = 0
 
                 # ── ORB (9:15–9:30 AM IST) — must use IST datetime, not ts%86400 ──
                 # Bug was: ts%86400 gives UTC seconds → 9:15 IST = 3:45 UTC → never matched
@@ -2782,7 +2745,7 @@ def _bt_run_job(job_id, params):
                     px = bar["c"]
                     bull, bear = _bt_score(px,sma20,sma50,rsi,vwap,pdh,pdl,
                                            cpr_tc,cpr_bc,cpr_narrow,orb_h,orb_l,
-                                           mins,trend15,pcr)
+                                           mins,trend15)
 
                     # Hard trend blocks
                     if trend15=="STRONG_BULL" and bear>bull: continue
