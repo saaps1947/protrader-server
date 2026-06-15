@@ -2742,34 +2742,36 @@ def _bt_run_job(job_id, params):
                 nse_sym = sym.replace("-","").replace("&","")
                 pcr = day_oi.get(sym,{}).get("pcr") or day_oi.get(nse_sym,{}).get("pcr") or 0
 
-                # ORB (9:15–9:30 AM bars)
-                orb_bars = [b for b in day_bars if
-                            9*3600+15*60 <= b["ts"]%86400 < 9*3600+30*60]
+                # ── ORB (9:15–9:30 AM IST) — must use IST datetime, not ts%86400 ──
+                # Bug was: ts%86400 gives UTC seconds → 9:15 IST = 3:45 UTC → never matched
+                orb_bars = []
+                for b in day_bars:
+                    b_ist = datetime.fromtimestamp(b["ts"], tz=IST)
+                    b_mins = b_ist.hour*60 + b_ist.minute
+                    if 9*60+15 <= b_mins < 9*60+30:
+                        orb_bars.append(b)
                 orb_h = max(b["h"] for b in orb_bars) if orb_bars else 0
                 orb_l = min(b["l"] for b in orb_bars) if orb_bars else 0
 
                 # VWAP accumulation
                 cum_tv=0; cum_v=0
                 close_buf=[]
-                avg_vol_buf=[]
 
                 for bi, bar in enumerate(day_bars):
                     bar_time = datetime.fromtimestamp(bar["ts"], tz=IST)
                     mins = bar_time.hour*60 + bar_time.minute
-                    if mins < 9*60+30: continue   # before 9:30 AM
+                    if mins < 9*60+30: continue
                     if mins > 15*60+30: break
 
                     tp = (bar["h"]+bar["l"]+bar["c"])/3
                     cum_tv += tp*bar["v"]; cum_v += bar["v"]
                     vwap = cum_tv/cum_v if cum_v else bar["c"]
                     close_buf.append(bar["c"])
-                    avg_vol_buf.append(bar["v"])
 
                     if len(close_buf) < 5: continue
 
                     sma20 = sum(close_buf[-20:])/min(20,len(close_buf))
                     sma50 = sum(close_buf[-50:])/min(50,len(close_buf))
-                    # RSI 14
                     if len(close_buf)>=15:
                         diffs=[close_buf[i]-close_buf[i-1] for i in range(max(1,len(close_buf)-14),len(close_buf))]
                         g=[d for d in diffs if d>0]; lo=[abs(d) for d in diffs if d<0]
@@ -2782,35 +2784,30 @@ def _bt_run_job(job_id, params):
                                            cpr_tc,cpr_bc,cpr_narrow,orb_h,orb_l,
                                            mins,trend15,pcr)
 
-                    # Hard blocks
+                    # Hard trend blocks
                     if trend15=="STRONG_BULL" and bear>bull: continue
                     if trend15=="STRONG_BEAR" and bull>bear: continue
 
-                    # Minimum score
                     if bull<2 and bear<2: continue
                     bias = "BULLISH" if bull>bear else "BEARISH" if bear>bull else None
                     if not bias: continue
 
-                    # Confidence
+                    # Confidence — do NOT cap for missing OI in backtest
+                    # (pcr=0 means NSE archive unavailable, not that OI is bearish)
                     w=bull if bias=="BULLISH" else bear
                     lo2=bear if bias=="BULLISH" else bull
                     conf = min(94,max(62,68+w*3-lo2*2))
-                    if pcr==0: conf=min(conf,79)
 
-                    # Morning thresholds
+                    # Morning thresholds — relax ORB requirement since ORB
+                    # is now correctly calculated from Kite 5-min data
                     early=(9*60+30<=mins<9*60+45); late=(9*60+45<=mins<10*60)
-                    if early:
-                        if not(orb_h and orb_l): continue  # ORB not confirmed
-                        if conf<92: continue
-                    elif late:
-                        if conf<89: continue
-                    elif conf<min_conf: continue
+                    if early and conf<92: continue
+                    elif late and conf<89: continue
+                    elif not early and not late and conf<min_conf: continue
 
-                    # Avoid same-day same-direction repeat
                     if last_signal_bias==bias and last_signal_date==dt: continue
                     last_signal_bias=bias; last_signal_date=dt
 
-                    # SL / Targets
                     sl_d = px*0.005
                     if bias=="BULLISH": sl=px-sl_d; t1=px+sl_d*1.5; t2=px+sl_d*2.5
                     else:               sl=px+sl_d; t1=px-sl_d*1.5; t2=px-sl_d*2.5
