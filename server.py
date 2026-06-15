@@ -2636,7 +2636,7 @@ def _bt_run_job(job_id, params):
         # Which symbols to test
         if sym_filter=="idx":   test_syms = list(OI_INDICES)
         elif sym_filter=="stk": test_syms = [s for s in INSTRUMENTS if not INSTRUMENTS[s].get("mcx") and s not in OI_INDICES]
-        else:                   test_syms = [s for s in INSTRUMENTS if not INSTRUMENTS[s].get("mcx")]
+        else:                   test_syms = [s for s in INSTRUMENTS if not INSTRUMENTS[s].get("mcx")]  # all = indices + stocks
 
         total  = len(test_syms)
         signals_all = []
