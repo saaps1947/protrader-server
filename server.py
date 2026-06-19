@@ -442,7 +442,14 @@ def calc_orb(candles):
     the breakout is invalidated. A second breakout requires volume confirmation.
     """
     if not candles: return None
-    today = datetime.now(IST).date()
+    # Derive "today" from the LATEST candle's date (in IST), not the server clock.
+    # This is robust to server timezone drift and to the candle set ending
+    # on a prior session (e.g. fetched after hours).
+    last_ts = candles[-1].get("t", 0)
+    if not last_ts: return None
+    last_dt = datetime.fromtimestamp(last_ts, tz=IST)
+    today = last_dt.date()
+    # ORB window = 9:15-9:30 IST of the latest candle's date, expressed in UTC epoch
     orb_start = int(datetime(today.year, today.month, today.day, 3, 45, tzinfo=timezone.utc).timestamp())
     orb_end   = int(datetime(today.year, today.month, today.day, 4,  0, tzinfo=timezone.utc).timestamp())
     orb_c = [c for c in candles if orb_start <= c.get("t",0) < orb_end]
@@ -1687,8 +1694,11 @@ def get_smc_cpr(sym, oi_data=None):
 
     # ── 5min candles (intraday intelligence) ──
     d5 = fetch_yahoo_candles(ticker,"5m","2d")
-    # Use cached candles if available (avoids duplicate Yahoo fetch)
-    candles5 = CACHE.get_val(f"candles5_{sym}") or (d5.get("candles",[]) if d5 else [])
+    # Prefer FRESH candles from this fetch — the shared candles5 cache (set by
+    # get_technicals) can be stale or miss today's opening 9:15-9:30 bars, which
+    # breaks ORB calculation (calc_orb finds no candles in the ORB window → None).
+    # Only fall back to cache if the fresh fetch failed entirely.
+    candles5 = (d5.get("candles",[]) if d5 else []) or CACHE.get_val(f"candles5_{sym}") or []
 
     # SMC from 5min
     if candles5:
