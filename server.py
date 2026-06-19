@@ -277,24 +277,34 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
                 prev_day_high = round(dh[-2], 2) if len(dh)>=2 else 0
                 prev_day_low  = round(dl[-2], 2) if len(dl)>=2 else 0
             if len(dc) >= 10:
-                d_s5  = sum(dc[-5:])/5
-                d_s10 = sum(dc[-10:])/10
-                # Exclude today's partial session — dc[-1] is intraday price during trading hours,
-                # not a completed close. Use dc[:-1] to get only completed sessions.
-                completed = dc[:-1] if len(dc) > 1 else dc
+                # Exclude today's partial session from ALL trend calculations.
+                # dc[-1] is the live intraday price during market hours, not a
+                # completed close. Using it would poison both the up/down count
+                # AND the SMA5-vs-SMA10 direction AND the HH/HL structure check.
+                # FIX: previously d_s5/d_s10/hh_hl used raw dc (with today) while
+                # the up-day count used completed[] — mixed windows in one decision.
+                completed   = dc[:-1] if len(dc) > 1 else dc
+                completed_h = dh[:-1] if len(dh) > 1 else dh
+                completed_l = dl[:-1] if len(dl) > 1 else dl
+
+                # SMA direction from completed closes only
+                d_s5  = sum(completed[-5:])/min(5,len(completed))  if completed else 0
+                d_s10 = sum(completed[-10:])/min(10,len(completed)) if completed else 0
+
                 days = completed[-15:] if len(completed)>=15 else completed
                 n_comp = len(days)-1  # number of completed session comparisons
                 up_days = sum(1 for i in range(1,len(days)) if days[i]>days[i-1])
                 dn_days = n_comp - up_days
-                # Store as % of up-days (not net balance) — clearer for display
+                # % of up-days (not net balance) — clearer for display
                 # 8 up of 14 = 57%  |  7 up of 14 = 50%  |  14 up of 14 = 100%
                 trend_strength = round(up_days/n_comp*100) if n_comp>0 else 0
                 trend_up_count = up_days
                 trend_dn_count = dn_days
                 trend_sessions = n_comp
-                if len(dh)>=5 and len(dl)>=5:
-                    hh_hl = dh[-1]>dh[-3] and dl[-1]>dl[-3]
-                    lh_ll = dh[-1]<dh[-3] and dl[-1]<dl[-3]
+                # HH/HL structure from completed highs/lows (today excluded)
+                if len(completed_h)>=3 and len(completed_l)>=3:
+                    hh_hl = completed_h[-1]>completed_h[-3] and completed_l[-1]>completed_l[-3]
+                    lh_ll = completed_h[-1]<completed_h[-3] and completed_l[-1]<completed_l[-3]
                 if d_s5 > d_s10 and hh_hl: trend15="STRONG_BULL"
                 elif d_s5 > d_s10:          trend15="BULL"
                 elif d_s5 < d_s10 and lh_ll: trend15="STRONG_BEAR"
