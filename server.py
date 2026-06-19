@@ -262,7 +262,7 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
 
         # ── 15-DAY TREND + PREVIOUS DAY HIGH/LOW ──
         trend15 = "UNKNOWN"; trend_strength = 0; hh_hl = False; lh_ll = False
-        trend_up_count = 0; trend_sessions = 0
+        trend_up_count = 0; trend_sessions = 0; avg_range_pct = 0
         prev_day_high = 0; prev_day_low = 0  # PDH / PDL
         try:
             url_d = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1mo&includePrePost=false"
@@ -310,6 +310,20 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
                 elif d_s5 < d_s10 and lh_ll: trend15="STRONG_BEAR"
                 elif d_s5 < d_s10:           trend15="BEAR"
                 else:                         trend15="NEUTRAL"
+
+                # ── 15-DAY AVERAGE DAILY RANGE % — for ATR setup filter ──
+                # Measures a symbol's typical intraday range. Used to filter out
+                # low-volatility symbols (PSUs, defensives) that rarely move enough
+                # to reach targets. A stock that averages <1.2% daily range can't
+                # reliably hit a 0.75% T1 + give room for SL.
+                rng_window = min(15, len(completed_h), len(completed_l))
+                if rng_window >= 5:
+                    ranges = [(completed_h[-i]-completed_l[-i])/completed_l[-i]*100
+                              for i in range(1, rng_window+1)
+                              if completed_l[-i] > 0]
+                    avg_range_pct = round(sum(ranges)/len(ranges), 2) if ranges else 0
+                else:
+                    avg_range_pct = 0
         except Exception as te:
             pass
 
@@ -326,6 +340,7 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
             "trend":"BULLISH" if (s20 and s50 and s20>s50) else "BEARISH" if (s20 and s50 and s20<s50) else "NEUTRAL",
             "trend15":trend15, "trend_strength":trend_strength,
             "trend_up_count":trend_up_count, "trend_sessions":trend_sessions,
+            "avg_range_pct":avg_range_pct,
             "hh_hl":hh_hl, "lh_ll":lh_ll,
             "prev_day_high":prev_day_high,   # PDH — previous session high
             "prev_day_low":prev_day_low,     # PDL — previous session low
@@ -937,6 +952,7 @@ def get_technicals(sym):
             "trend_strength":  d.get("trend_strength",0),
             "trend_up_count":  d.get("trend_up_count",0),
             "trend_sessions":  d.get("trend_sessions",0),
+            "avg_range_pct":   d.get("avg_range_pct",0),
             "hh_hl":           d.get("hh_hl",False),
             "lh_ll":           d.get("lh_ll",False),
         }
@@ -1953,6 +1969,7 @@ def market():
                 d["trend_strength"]  = tech.get("trend_strength",0)
                 d["trend_up_count"]  = tech.get("trend_up_count",0)
                 d["trend_sessions"]  = tech.get("trend_sessions",0)
+                d["avg_range_pct"]   = tech.get("avg_range_pct",0)
                 d["hh_hl"]           = tech.get("hh_hl",False)
                 d["lh_ll"]           = tech.get("lh_ll",False)
                 d["prev_day_high"]   = tech.get("prev_day_high",0)
