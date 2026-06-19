@@ -262,6 +262,7 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
 
         # ── 15-DAY TREND + PREVIOUS DAY HIGH/LOW ──
         trend15 = "UNKNOWN"; trend_strength = 0; hh_hl = False; lh_ll = False
+        trend_up_count = 0; trend_sessions = 0
         prev_day_high = 0; prev_day_low = 0  # PDH / PDL
         try:
             url_d = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1mo&includePrePost=false"
@@ -276,12 +277,21 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
                 prev_day_high = round(dh[-2], 2) if len(dh)>=2 else 0
                 prev_day_low  = round(dl[-2], 2) if len(dl)>=2 else 0
             if len(dc) >= 10:
-                d_s5 = sum(dc[-5:])/5
+                d_s5  = sum(dc[-5:])/5
                 d_s10 = sum(dc[-10:])/10
-                days = dc[-15:] if len(dc)>=15 else dc
+                # Exclude today's partial session — dc[-1] is intraday price during trading hours,
+                # not a completed close. Use dc[:-1] to get only completed sessions.
+                completed = dc[:-1] if len(dc) > 1 else dc
+                days = completed[-15:] if len(completed)>=15 else completed
+                n_comp = len(days)-1  # number of completed session comparisons
                 up_days = sum(1 for i in range(1,len(days)) if days[i]>days[i-1])
-                dn_days = len(days)-1-up_days
-                trend_strength = round((up_days-dn_days)/(len(days)-1)*100) if len(days)>1 else 0
+                dn_days = n_comp - up_days
+                # Store as % of up-days (not net balance) — clearer for display
+                # 8 up of 14 = 57%  |  7 up of 14 = 50%  |  14 up of 14 = 100%
+                trend_strength = round(up_days/n_comp*100) if n_comp>0 else 0
+                trend_up_count = up_days
+                trend_dn_count = dn_days
+                trend_sessions = n_comp
                 if len(dh)>=5 and len(dl)>=5:
                     hh_hl = dh[-1]>dh[-3] and dl[-1]>dl[-3]
                     lh_ll = dh[-1]<dh[-3] and dl[-1]<dl[-3]
@@ -305,6 +315,7 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
             "crossover":cross,
             "trend":"BULLISH" if (s20 and s50 and s20>s50) else "BEARISH" if (s20 and s50 and s20<s50) else "NEUTRAL",
             "trend15":trend15, "trend_strength":trend_strength,
+            "trend_up_count":trend_up_count, "trend_sessions":trend_sessions,
             "hh_hl":hh_hl, "lh_ll":lh_ll,
             "prev_day_high":prev_day_high,   # PDH — previous session high
             "prev_day_low":prev_day_low,     # PDL — previous session low
@@ -914,6 +925,8 @@ def get_technicals(sym):
             "prev_day_low":    d.get("prev_day_low",0),
             "trend15":         d.get("trend15","UNKNOWN"),
             "trend_strength":  d.get("trend_strength",0),
+            "trend_up_count":  d.get("trend_up_count",0),
+            "trend_sessions":  d.get("trend_sessions",0),
             "hh_hl":           d.get("hh_hl",False),
             "lh_ll":           d.get("lh_ll",False),
         }
@@ -1928,6 +1941,8 @@ def market():
                 # ── 15D trend + PDH/PDL + CPR + VWAP — NSE/BSE only ──
                 d["trend15"]         = tech.get("trend15","UNKNOWN")
                 d["trend_strength"]  = tech.get("trend_strength",0)
+                d["trend_up_count"]  = tech.get("trend_up_count",0)
+                d["trend_sessions"]  = tech.get("trend_sessions",0)
                 d["hh_hl"]           = tech.get("hh_hl",False)
                 d["lh_ll"]           = tech.get("lh_ll",False)
                 d["prev_day_high"]   = tech.get("prev_day_high",0)
