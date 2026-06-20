@@ -2624,6 +2624,76 @@ def _bt_score(px, sma20, sma50, rsi, vwap, pdh, pdl, cpr_tc, cpr_bc, cpr_narrow,
     # Use snapshot-based backtest once 30 days of snapshots are captured
     return bull, bear
 
+def _bt_derive_regime(px, sma20, sma50, vwap, trend15, rsi, pct):
+    """
+    Mirrors the LIVE engine's client-side deriveRegime() exactly — same
+    thresholds, same category names. This is the technical-only fallback
+    regime detector the live app already uses when full OI-based regime
+    data isn't available, so this is genuine parity, not an approximation
+    invented for the backtest.
+
+    Categories: TRENDING_UP, TRENDING_DOWN, CHOPPY, DEVELOPING.
+    NOTE: the live engine's SERVER-side regime classifier (detect_market_regime
+    in server.py) has additional categories — BREAKOUT_DAY, EXPIRY_PINNING,
+    MEAN_REVERT — that require OI/IV data and can't be replicated here for
+    the same reason setup_key excludes "OI": no reliable intraday OI in
+    historical backtests. Once the snapshot-based backtest exists, swap this
+    for the full classifier.
+    """
+    if not px or not sma20:
+        return "DEVELOPING"
+    aboveVwap = px>vwap if vwap else px>sma20
+    smaUp     = sma20>sma50
+    strongBull = trend15=="STRONG_BULL"
+    bull15     = trend15 in ("BULL","STRONG_BULL")
+    bear15     = trend15 in ("BEAR","STRONG_BEAR")
+    strongBear = trend15=="STRONG_BEAR"
+
+    if strongBull and aboveVwap and smaUp:   return "TRENDING_UP"
+    if strongBear and not aboveVwap and not smaUp: return "TRENDING_DOWN"
+    if bull15 and aboveVwap and smaUp:       return "TRENDING_UP"
+    if bear15 and not aboveVwap and not smaUp: return "TRENDING_DOWN"
+    if abs(pct)<0.25 and 42<rsi<58 and (smaUp!=aboveVwap): return "CHOPPY"
+    return "DEVELOPING"
+
+def _bt_setup_key(px, sma20, sma50, rsi, vwap, pdh, pdl, cpr_tc, cpr_bc, cpr_narrow,
+                   orb_h, orb_l, trend15, bias):
+    """
+    Tags a backtest signal with the setup components that fired — mirrors the
+    live engine's setup_key taxonomy (e.g. "OI+Price+Momentum+Structure+Regime")
+    as closely as possible using only backtest-available data.
+
+    Two intentional differences from the live engine's setup_key:
+      1. "OI" is NEVER included — the backtest has no reliable intraday OI
+         (NSE end-of-day archives would be look-ahead bias). This is the ONE
+         layer this taxonomy is waiting on. Once the snapshot-based backtest
+         has 30+ days of real intraday OI, "OI" can be added as a 5th category
+         here without changing the aggregation/leaderboard code at all.
+      2. "ORB" replaces the live engine's "Structure"/"CHoCH" tag — backtest
+         has no SMC order-block/CHoCH/BOS data. Opening Range Breakout is the
+         closest available proxy for "price cleared a meaningful structural
+         level," but it is NOT the same signal as live's SMC structure tag.
+         Treat "ORB" here and "Structure"/"CHoCH" in live signals as related
+         but distinct categories — don't merge them when comparing data later.
+    """
+    parts = []
+    if bias == "BULLISH":
+        price_fired  = bool((pdh and px > pdh*1.001) or (cpr_narrow and cpr_tc and px > cpr_tc))
+        mom_fired    = bool((rsi < 32 and px > sma20) or (35 <= rsi <= 55 and px > sma20) or (sma20 > sma50))
+        orb_fired    = bool(orb_h and orb_l and px > orb_h*1.001)
+        regime_fired = (trend15 == "STRONG_BULL")
+    else:
+        price_fired  = bool((pdl and px < pdl*0.999) or (cpr_narrow and cpr_bc and px < cpr_bc))
+        mom_fired    = bool((rsi > 68 and px < sma20) or (45 <= rsi <= 65 and px < sma20) or (sma20 < sma50))
+        orb_fired    = bool(orb_h and orb_l and px < orb_l*0.999)
+        regime_fired = (trend15 == "STRONG_BEAR")
+
+    if price_fired:  parts.append("Price")
+    if mom_fired:    parts.append("Momentum")
+    if orb_fired:    parts.append("ORB")
+    if regime_fired: parts.append("Regime")
+    return "+".join(parts) if parts else "Unconfirmed"
+
 def _bt_simulate(bias, entry, sl, t1, t2, future_bars):
     """Simulate trade outcome. Returns status + pnl_pct."""
     effective_sl = sl; t1_hit = False
@@ -2829,6 +2899,14 @@ def _bt_run_job(job_id, params):
 
                     outcome = _bt_simulate(bias,px,sl,t1,t2,day_bars[bi+1:])
 
+                    setup_key = _bt_setup_key(px,sma20,sma50,rsi,vwap,pdh,pdl,
+                                               cpr_tc,cpr_bc,cpr_narrow,
+                                               orb_h,orb_l,trend15,bias)
+
+                    # % move vs prev close — same definition as live engine's s.pct
+                    pct_move = round((px-pdc)/pdc*100, 2) if pdc else 0
+                    regime = _bt_derive_regime(px,sma20,sma50,vwap,trend15,rsi,pct_move)
+
                     session = ("morning" if mins<10*60 else
                                "midday"  if mins<14*60 else "afternoon")
                     signals_all.append({
@@ -2838,7 +2916,7 @@ def _bt_run_job(job_id, params):
                         "pcr":round(pcr,2),"rsi":round(rsi,1),
                         "vwap":round(vwap,2),"entry":round(px,2),
                         "sl":round(sl,2),"t1":round(t1,2),"t2":round(t2,2),
-                        "session":session,
+                        "session":session,"setup_key":setup_key,"regime":regime,
                         **outcome
                     })
 
@@ -2858,7 +2936,10 @@ def _bt_run_job(job_id, params):
                 l=sum(1 for s in g if s["pnl_pct"]<0)
                 wr=round(w/(w+l)*100) if w+l else 0
                 avg=round(sum(s["pnl_pct"] for s in g)/len(g),2)
-                out.append({"k":str(k),"w":w,"l":l,"wr":wr,"avg":avg,"n":len(g)})
+                # n>=30 is the threshold we use everywhere else (suppression
+                # rule discussed for the future live feedback loop) — flagging
+                # it here too so small samples aren't mistaken for signal.
+                out.append({"k":str(k),"w":w,"l":l,"wr":wr,"avg":avg,"n":len(g),"reliable":len(g)>=30})
             return sorted(out,key=lambda x:-x["wr"])
 
         aw=round(sum(s["pnl_pct"] for s in wins)/len(wins),2) if wins else 0
@@ -2875,6 +2956,13 @@ def _bt_run_job(job_id, params):
             "by_conf":    breakdown(lambda s:"94%" if s["conf"]>=94 else "88-93%" if s["conf"]>=88 else "82-87%" if s["conf"]>=82 else "<82%"),
             "by_cpr":     breakdown(lambda s:"NARROW" if s["cpr_narrow"] else "WIDE"),
             "by_sym":     breakdown(lambda s:s["sym"]),
+            "by_setup":   breakdown(lambda s:s["setup_key"]),
+            "by_regime":  breakdown(lambda s:s["regime"]),
+            # Setup × Regime cross-tab — the actual leaderboard insight: a setup
+            # can win in one regime and lose in another, which neither breakdown
+            # alone reveals. Mirrors the reviewer's "OI+Momentum+CHoCH in
+            # TRENDING_UP = 68% vs CHOPPY = 31%" example exactly.
+            "by_setup_regime": breakdown(lambda s:s["setup_key"]+" / "+s["regime"]),
             "signals":    sorted(signals_all,key=lambda s:s["date"]+s["time"])[-300:],
         }
         _bt_jobs[job_id].update({"status":"done","progress":100,"message":"Complete","result":result})
