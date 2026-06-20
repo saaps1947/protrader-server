@@ -269,14 +269,28 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
             r_d = requests.get(url_d, headers={"User-Agent":"Mozilla/5.0"}, timeout=8).json()
             res_d = r_d["chart"]["result"][0]
             q_d = res_d["indicators"]["quote"][0]
-            dc = [q_d["close"][i] for i in range(len(res_d.get("timestamp",[]))) if q_d["close"][i]]
-            dh = [q_d["high"][i]  for i in range(len(res_d.get("timestamp",[]))) if q_d["high"][i]]
-            dl = [q_d["low"][i]   for i in range(len(res_d.get("timestamp",[]))) if q_d["low"][i]]
+            # FIX: build dc/dh/dl from ONE aligned loop, bounded by the SHORTEST
+            # of the three arrays. The old code used range(len(timestamp)) as the
+            # bound for all three independently — but Yahoo can return close/high/low
+            # arrays of DIFFERENT lengths (data gaps, partial sessions). Indexing
+            # past a shorter array's end threw an uncaught IndexError, which the
+            # outer except swallowed — silently wiping out prev_day_high/low too,
+            # even though those were already computed correctly moments earlier.
+            # This also fixes a subtler correctness bug: the old independent
+            # comprehensions could drop a day from dh but not dc, so dh[-2] and
+            # dc[-2] no longer referred to the same calendar day.
+            qc, qh, ql = q_d.get("close",[]), q_d.get("high",[]), q_d.get("low",[])
+            n_bound = min(len(res_d.get("timestamp",[])), len(qc), len(qh), len(ql))
+            dc=[]; dh=[]; dl=[]
+            for i in range(n_bound):
+                if qc[i] and qh[i] and ql[i]:
+                    dc.append(qc[i]); dh.append(qh[i]); dl.append(ql[i])
             if len(dc) >= 2:
                 # Previous day high/low (index -2 = yesterday's completed session)
                 prev_day_high = round(dh[-2], 2) if len(dh)>=2 else 0
                 prev_day_low  = round(dl[-2], 2) if len(dl)>=2 else 0
             if len(dc) >= 10:
+              try:
                 # Exclude today's partial session from ALL trend calculations.
                 # dc[-1] is the live intraday price during market hours, not a
                 # completed close. Using it would poison both the up/down count
@@ -324,6 +338,12 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
                     avg_range_pct = round(sum(ranges)/len(ranges), 2) if ranges else 0
                 else:
                     avg_range_pct = 0
+              except Exception:
+                # DEFENSE IN DEPTH: if anything in trend15/avg_range_pct calc
+                # fails unexpectedly, fail ONLY this sub-block. prev_day_high/
+                # prev_day_low were already computed above and must survive —
+                # CPR depends on them and has nothing to do with this section.
+                pass
         except Exception as te:
             pass
 
