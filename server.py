@@ -1260,11 +1260,12 @@ def get_oi(sym, key, token, spot=0):
         lines = csv.strip().split("\n")
         step  = INSTRUMENTS.get(sym,{}).get("step",50)
         atm   = int(round(spot/step)*step)
-        # ATM ±30 strikes — captures meaningful PCR and walls.
-        # Old ±10 (21 strikes) missed: far-OTM puts at 22k-23.5k (large hedging OI →
-        # understated PCR) and far-OTM call walls at 25k-26k (common resistance levels).
-        # ±30 = 61 strikes × 2 = 122 instruments — well within Zerodha's 500-instrument limit.
-        target_strikes = set(range(atm - step*30, atm + step*31, step))
+        # NO strike range filter — fetch ALL active strikes for this expiry.
+        # ATM ±30 still only captures ~52% of full-chain OI (far OTM calls at
+        # 25,500-28,000 hold 10+ Cr CE OI, making PCR look too high vs Sensibull).
+        # Removing the filter and using POST (no URL length limit) gives full-chain
+        # PCR matching Sensibull. The NFO CSV only lists ~80-150 active strikes for
+        # a given NIFTY weekly expiry, so the quote call stays within Zerodha limits.
 
         # Find nearest expiry — scan ALL lines with early symbol filter
         # NFO/BFO CSVs are 150k+ rows. Filter by tradingsymbol prefix.
@@ -1306,17 +1307,34 @@ def get_oi(sym, key, token, spot=0):
             if cols[9] not in ["CE","PE"] or cols[5]!=best_exp: continue
             try:
                 sk=float(cols[6])
-                if sk in target_strikes:
-                    instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":int(sk),"type":cols[9]})
+                # No strike range filter — collect ALL active strikes for this expiry
+                instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":int(sk),"type":cols[9]})
             except: continue
 
         if not instruments: return best_effort_cache("no option instruments found")
 
-        # Step 3 — ONE bulk quote call for all ATM ±30 strikes (122 instruments, well within Zerodha limit)
-        params2 = [("i", i["sym"]) for i in instruments]
-        r2 = requests.get("https://api.kite.trade/quote", params=params2, headers=hdrs, timeout=20)
-        if r2.status_code in [401,403]: return best_effort_cache("option chain auth failed 401/403")
-        qdata = r2.json().get("data",{})
+        # Step 3 — Bulk quote for ALL instruments (full option chain)
+        # Use POST to avoid HTTP URL length limits (GET breaks at ~200 instruments).
+        # Zerodha's /quote endpoint accepts POST with 'i' as repeated form fields.
+        # Full chain gives PCR/walls matching Sensibull instead of a partial subset.
+        syms = [i["sym"] for i in instruments]
+        r2 = requests.post(
+            "https://api.kite.trade/quote",
+            data=[("i", s) for s in syms],
+            headers=hdrs, timeout=20
+        )
+        if r2.status_code in [400,401,403]:
+            # POST not supported — fallback to GET with batching
+            qdata = {}
+            for batch_start in range(0, len(syms), 100):
+                batch = syms[batch_start:batch_start+100]
+                rb = requests.get("https://api.kite.trade/quote",
+                    params=[("i",s) for s in batch], headers=hdrs, timeout=15)
+                if rb.status_code == 200:
+                    qdata.update(rb.json().get("data",{}))
+        else:
+            qdata = r2.json().get("data",{})
+        print(f"[OI] {sym}: {len(instruments)} instruments fetched (full chain, {len(qdata)} quoted)")
 
         # Step 4 — Aggregate OI
         ce_oi=0;pe_oi=0;ce_chg=0;pe_chg=0
