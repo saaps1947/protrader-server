@@ -157,9 +157,9 @@ class Cache:
             self._store[key] = {"val": val, "ts": time.time()}
 
     def fresh(self, key, ttl):
-        """Returns True if key exists and is within TTL seconds."""
+        """Returns True if key exists, is not None, and is within TTL seconds."""
         val, age = self.get(key)
-        return val is not None and age < ttl
+        return val is not None and age is not None and age < ttl
 
     def get_val(self, key):
         val, _ = self.get(key)
@@ -168,6 +168,15 @@ class Cache:
     def age(self, key):
         _, age = self.get(key)
         return age
+
+    def set_error(self, key):
+        """Mark a key as errored WITHOUT overwriting a valid stale value.
+        Prevents a temporary API failure from evicting good cached data."""
+        with self._lock:
+            entry = self._store.get(key)
+            # Only set error sentinel if there is no value (or existing is also None)
+            if not entry or entry.get("val") is None:
+                self._store[key] = {"val": None, "ts": time.time()}
 
 CACHE = Cache()
 
@@ -1377,7 +1386,7 @@ def get_oi(sym, key, token, spot=0):
         print(f"[OI ERROR] {sym}: {e}\n{traceback.format_exc()[-300:]}")
         disk = load_disk()
         if disk: return disk
-        CACHE.set(cache_key, None)
+        CACHE.set_error(cache_key)  # don't evict stale good data with None
         return None
 
 
@@ -2390,7 +2399,7 @@ def _bg_stock_oi():
     Background thread: refresh OI for 18 liquid F&O stocks + MCX every 5 min.
     These have the most active option chains — need frequent updates.
     """
-    time.sleep(30)  # wait for server boot
+    time.sleep(30)  # wait for server boot and first client /market call with credentials
     print(f"[StockOI] Started — {len(OI_STOCKS)} liquid stocks + {len(OI_MCX)} MCX (5-min cycle)")
     while True:
         try:
@@ -2400,20 +2409,31 @@ def _bg_stock_oi():
                 print("[StockOI] No credentials yet — waiting...")
                 time.sleep(60); continue
             prices = CACHE.get_val("all_prices") or {}
-            fetched = 0
+            fetched = 0; auth_failed = 0
             for sym in sorted(OI_STOCKS | OI_MCX):
                 try:
                     result = get_oi(sym, key, token, prices.get(sym,{}).get("px",0))
-                    if result:
+                    if result and result.get("source") == "zerodha_kite":
                         fetched += 1
                         print(f"[StockOI ✅] {sym} PCR:{result.get('pcr','?')} MP:{result.get('max_pain','?')}")
+                    elif result:
+                        print(f"[StockOI 📋] {sym} from cache/disk")
+                        fetched += 1
+                    else:
+                        auth_failed += 1
                     time.sleep(3)
                 except Exception as e:
                     print(f"[StockOI ❌] {sym}: {e}")
                     time.sleep(3)
             total = len(OI_STOCKS | OI_MCX)
-            print(f"[StockOI] Cycle done — {fetched}/{total}. Sleeping 5min.")
-            time.sleep(300)
+            print(f"[StockOI] Cycle done — {fetched}/{total} ok, {auth_failed} failed. Sleeping 5min.")
+            # If ALL fetches failed, token is likely expired — back off longer
+            # to avoid hammering Zerodha with 401s every 5 minutes
+            if auth_failed == total:
+                print("[StockOI] All fetches failed — token likely expired. Backing off 10min.")
+                time.sleep(600)
+            else:
+                time.sleep(300)
         except Exception as e:
             print(f"[StockOI] Error: {e}")
             time.sleep(60)
