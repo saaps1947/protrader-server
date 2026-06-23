@@ -1267,18 +1267,22 @@ def get_oi(sym, key, token, spot=0):
         # PCR matching Sensibull. The NFO CSV only lists ~80-150 active strikes for
         # a given NIFTY weekly expiry, so the quote call stays within Zerodha limits.
 
-        # Find nearest expiry — scan ALL lines with early symbol filter
-        # NFO/BFO CSVs are 150k+ rows. Filter by tradingsymbol prefix.
-        # SENSEX options in BFO are prefixed "SENSEX"
-        # For stocks: "HDFCBANK24JUN..." etc.
-        sym_prefix = sym  # default matches tradingsymbol start
+        # Find nearest expiry.
+        # FIX: require digit immediately after sym prefix — "NIFTY" matches
+        # "NIFTY25JUN..." (next char is '2') but NOT "NIFTYNXT50..." or "NIFTYIT..."
+        # NIFTYNXT50 and MIDCPNIFTY options were contaminating NIFTY OI totals.
+        sym_len = len(sym)
+        def sym_match_fn(ts):
+            return (ts.startswith(sym) and len(ts) > sym_len and
+                    (ts[sym_len].isdigit() or sym in ("SENSEX","CRUDEOIL","GOLD")))
+
         today_n = datetime.now(IST).replace(tzinfo=None)
         best_exp=None; best_days=999
         for line in lines[1:]:
             cols=line.split(",")
             if len(cols)<10: continue
             ts = cols[2] if len(cols)>2 else ""
-            if not ts.startswith(sym_prefix): continue
+            if not sym_match_fn(ts): continue
             if cols[9] not in ["CE","PE"]: continue
             try:
                 exp=datetime.strptime(cols[5],"%Y-%m-%d")
@@ -1291,31 +1295,38 @@ def get_oi(sym, key, token, spot=0):
 
         # Collect instruments for ATM ±10
         # Each exchange uses its own prefix for Kite quote API
+        # ATM ±20 strikes = ±1000pts for NIFTY (step=50), ±2000pts for BANKNIFTY (step=100)
+        # This matches Sensibull's visible range. Full chain inflated both CE and PE ~10%
+        # because far-OTM strikes (22000PE, 26500CE etc.) are included but Sensibull cuts them.
+        # Since both sides inflate equally PCR stays right, but absolute values and walls are wrong.
+        atm = int(round(spot/step)*step)
+        strike_range = step * 20  # ±20 strikes regardless of step size
+        lo_strike = atm - strike_range
+        hi_strike = atm + strike_range
+
         if sym == "SENSEX":
             exchange_prefix = "BFO"
         elif sym in OI_MCX:
             exchange_prefix = "MCX"
         else:
             exchange_prefix = "NFO"
+
         instruments=[]
         for line in lines[1:]:
             cols=line.split(",")
             if len(cols)<10: continue
-            name = cols[13].strip() if len(cols)>13 else ""
-            sym_match = (name==sym) or cols[2].startswith(sym)
-            if not sym_match: continue
+            ts = cols[2] if len(cols)>2 else ""
+            if not sym_match_fn(ts): continue
             if cols[9] not in ["CE","PE"] or cols[5]!=best_exp: continue
             try:
-                sk=float(cols[6])
-                # No strike range filter — collect ALL active strikes for this expiry
-                instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":int(sk),"type":cols[9]})
+                sk=int(float(cols[6]))
+                if sk < lo_strike or sk > hi_strike: continue  # ATM ±20 strikes only
+                instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":sk,"type":cols[9]})
             except: continue
 
         if not instruments: return best_effort_cache("no option instruments found")
 
-        # Step 3 — Batched GET for full option chain
-        # Zerodha /quote is GET-only (POST returns 405). With 150+ instruments
-        # a single GET URL exceeds limits, so batch at 100 per call.
+        # Step 3 — Batched GET (Zerodha /quote is GET-only, POST returns 405)
         syms = [i["sym"] for i in instruments]
         qdata = {}
         for batch_start in range(0, len(syms), 100):
@@ -1329,26 +1340,40 @@ def get_oi(sym, key, token, spot=0):
                     qdata.update(rb.json().get("data",{}))
             except Exception as be:
                 print(f"[OI] batch GET error: {be}")
-        print(f"[OI] {sym}: {len(instruments)} instruments, {len(qdata)} quoted")
+        print(f"[OI] {sym}: expiry={best_exp} ATM={atm} range={lo_strike}-{hi_strike} instruments={len(instruments)} quoted={len(qdata)}")
 
-        # Step 4 — Aggregate OI
+        # Step 4 — Aggregate OI with correct change calculation
+        # FIX: oi_day_low is the MINIMUM OI seen today (a level, not a delta).
+        # Using (current_oi - oi_day_low) gives a meaningless number — e.g. if OI
+        # dropped from 200k → 100k → 150k, day_low=100k but actual change is +50k.
+        # Correct approach: compare to previous fetch (~2-5 min ago).
+        prev_snap_key = f"oi_snap_{sym}_{best_exp}"
+        prev_snap = CACHE.get_val(prev_snap_key) or {}  # {strike_type: oi}
+
         ce_oi=0;pe_oi=0;ce_chg=0;pe_chg=0
         strikes_data={}
+        new_snap = {}
         for inst in instruments:
             q=qdata.get(inst["sym"],{})
             if not q: continue
-            oi  = q.get("oi",0) or 0
-            low = q.get("oi_day_low",0) or 0
-            chg = oi-low if low else 0
-            s   = inst["strike"]
+            oi = q.get("oi",0) or 0
+            s  = inst["strike"]
+            snap_key = f"{s}_{inst['type']}"
+            prev_oi  = prev_snap.get(snap_key, oi)  # first call: delta=0
+            chg = oi - prev_oi
+            new_snap[snap_key] = oi
             if s not in strikes_data:
                 strikes_data[s]={"ce":0,"pe":0,"ce_chg":0,"pe_chg":0}
             if inst["type"]=="CE":
-                ce_oi+=oi;ce_chg+=chg
-                strikes_data[s]["ce"]=oi;strikes_data[s]["ce_chg"]=chg
+                ce_oi+=oi; ce_chg+=chg
+                strikes_data[s]["ce"]=oi; strikes_data[s]["ce_chg"]=chg
             else:
-                pe_oi+=oi;pe_chg+=chg
-                strikes_data[s]["pe"]=oi;strikes_data[s]["pe_chg"]=chg
+                pe_oi+=oi; pe_chg+=chg
+                strikes_data[s]["pe"]=oi; strikes_data[s]["pe_chg"]=chg
+
+        # Persist snapshot for next OI fetch (used to compute accurate delta)
+        if new_snap:
+            CACHE.set(prev_snap_key, new_snap)
 
         if not ce_oi and not pe_oi:
             return best_effort_cache("option chain response error")
