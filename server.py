@@ -1307,7 +1307,11 @@ def get_oi(sym, key, token, spot=0):
         # because far-OTM strikes (22000PE, 26500CE etc.) are included but Sensibull cuts them.
         # Since both sides inflate equally PCR stays right, but absolute values and walls are wrong.
         atm = int(round(spot/step)*step)
-        strike_range = step * 30  # ±30 strikes: ±1500pts NIFTY, ±3000pts BANKNIFTY
+        # Strike range: ATM ±10 (original calibration).
+        # 21 strikes × 2 = 42 instruments. PCR thresholds are set for this range.
+        # Changing range without changing thresholds breaks signal scoring — they
+        # must stay in sync. If you need a wider range, recalibrate thresholds too.
+        strike_range = step * 10
         lo_strike = atm - strike_range
         hi_strike = atm + strike_range
 
@@ -1327,7 +1331,7 @@ def get_oi(sym, key, token, spot=0):
             if cols[9] not in ["CE","PE"] or cols[5]!=best_exp: continue
             try:
                 sk=int(float(cols[6]))
-                if sk < lo_strike or sk > hi_strike: continue  # ATM ±20 strikes only
+                if sk < lo_strike or sk > hi_strike: continue  # ATM ±10 strikes
                 instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":sk,"type":cols[9]})
             except: continue
 
@@ -1398,7 +1402,8 @@ def get_oi(sym, key, token, spot=0):
         # Walls — use only nearby strikes (ATM ±1000 pts) so the wall reflects
         # practical resistance/support a trader would act on, not a far-OTM strike
         # with legacy positions. Full strikes_data is kept for max pain (correct).
-        nearby = {s:v for s,v in strikes_data.items() if abs(s-atm) <= 1000}
+        # Wall: use all collected strikes (already limited to ATM ±10 = ±500pts for NIFTY)
+        nearby = strikes_data
         ce_wall=max(nearby,key=lambda x:nearby[x]["ce"],default=0)
         pe_wall=max(nearby,key=lambda x:nearby[x]["pe"],default=0)
 
@@ -1410,8 +1415,10 @@ def get_oi(sym, key, token, spot=0):
 
         # PCR thresholds calibrated for ATM ±30 range — full-range PCR runs higher
         # than ATM-only due to far-OTM hedging puts. Sensibull-aligned thresholds.
-        pcr_interp=("EXTREME_BULL" if pcr>1.5 else "BULLISH" if pcr>1.2
-                    else "NEUTRAL" if pcr>0.8 else "BEARISH" if pcr>0.6 else "EXTREME_BEAR")
+        # PCR thresholds calibrated for ATM ±10 strikes (original baseline).
+        # These must stay in sync with pcrBull/pcrBear thresholds in index.html.
+        pcr_interp=("EXTREME_BULL" if pcr>1.4 else "BULLISH" if pcr>1.1
+                    else "NEUTRAL" if pcr>0.9 else "BEARISH" if pcr>0.7 else "EXTREME_BEAR")
 
         # Step 5b — Estimate IV from ATM option premiums
         # Use ATM straddle price as proxy: IV ≈ (CE_premium + PE_premium) / spot * sqrt(365/DTE) * 100
