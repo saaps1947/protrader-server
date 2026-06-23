@@ -1307,7 +1307,7 @@ def get_oi(sym, key, token, spot=0):
         # because far-OTM strikes (22000PE, 26500CE etc.) are included but Sensibull cuts them.
         # Since both sides inflate equally PCR stays right, but absolute values and walls are wrong.
         atm = int(round(spot/step)*step)
-        strike_range = step * 20  # ±20 strikes regardless of step size
+        strike_range = step * 30  # ±30 strikes: ±1500pts NIFTY, ±3000pts BANKNIFTY
         lo_strike = atm - strike_range
         hi_strike = atm + strike_range
 
@@ -1347,7 +1347,8 @@ def get_oi(sym, key, token, spot=0):
                     qdata.update(rb.json().get("data",{}))
             except Exception as be:
                 print(f"[OI] batch GET error: {be}")
-        print(f"[OI] {sym}: expiry={best_exp} ATM={atm} range={lo_strike}-{hi_strike} instruments={len(instruments)} quoted={len(qdata)}")
+        strikes_used = [i['strike'] for i in instruments]
+        print(f"[OI] {sym}: expiry={best_exp} ATM={atm} range={min(strikes_used) if strikes_used else 0}-{max(strikes_used) if strikes_used else 0} count={len(strikes_used)} quoted={len(qdata)}")
 
         # Step 4 — Aggregate OI with correct change calculation
         # FIX: oi_day_low is the MINIMUM OI seen today (a level, not a delta).
