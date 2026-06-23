@@ -1313,28 +1313,23 @@ def get_oi(sym, key, token, spot=0):
 
         if not instruments: return best_effort_cache("no option instruments found")
 
-        # Step 3 — Bulk quote for ALL instruments (full option chain)
-        # Use POST to avoid HTTP URL length limits (GET breaks at ~200 instruments).
-        # Zerodha's /quote endpoint accepts POST with 'i' as repeated form fields.
-        # Full chain gives PCR/walls matching Sensibull instead of a partial subset.
+        # Step 3 — Batched GET for full option chain
+        # Zerodha /quote is GET-only (POST returns 405). With 150+ instruments
+        # a single GET URL exceeds limits, so batch at 100 per call.
         syms = [i["sym"] for i in instruments]
-        r2 = requests.post(
-            "https://api.kite.trade/quote",
-            data=[("i", s) for s in syms],
-            headers=hdrs, timeout=20
-        )
-        if r2.status_code in [400,401,403]:
-            # POST not supported — fallback to GET with batching
-            qdata = {}
-            for batch_start in range(0, len(syms), 100):
-                batch = syms[batch_start:batch_start+100]
+        qdata = {}
+        for batch_start in range(0, len(syms), 100):
+            batch = syms[batch_start:batch_start+100]
+            try:
                 rb = requests.get("https://api.kite.trade/quote",
                     params=[("i",s) for s in batch], headers=hdrs, timeout=15)
+                if rb.status_code in [401,403]:
+                    return best_effort_cache("auth failed 401/403 on batch quote")
                 if rb.status_code == 200:
                     qdata.update(rb.json().get("data",{}))
-        else:
-            qdata = r2.json().get("data",{})
-        print(f"[OI] {sym}: {len(instruments)} instruments fetched (full chain, {len(qdata)} quoted)")
+            except Exception as be:
+                print(f"[OI] batch GET error: {be}")
+        print(f"[OI] {sym}: {len(instruments)} instruments, {len(qdata)} quoted")
 
         # Step 4 — Aggregate OI
         ce_oi=0;pe_oi=0;ce_chg=0;pe_chg=0
