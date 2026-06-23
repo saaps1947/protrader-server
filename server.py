@@ -705,17 +705,24 @@ def detect_market_regime(candles, oi_data, vwap, orb, vol_analysis):
     pinned         = mp_dist_pct < 0.3
 
     # Expiry check — is today expiry?
+    # NSE changed NIFTY weekly expiry from Thursday → Tuesday (effective Sep 2024).
+    # BANKNIFTY = Wednesday, FINNIFTY = Tuesday, MIDCPNIFTY = Monday, SENSEX = Friday.
     from datetime import datetime, timezone, timedelta
     ist = timezone(timedelta(hours=5, minutes=30))
     now = datetime.now(ist)
-    is_thursday = now.weekday() == 3
+    weekday = now.weekday()  # 0=Mon,1=Tue,2=Wed,3=Thu,4=Fri
+    is_tuesday   = weekday == 1   # NIFTY, FINNIFTY
+    is_wednesday = weekday == 2   # BANKNIFTY
+    is_thursday  = weekday == 3   # legacy fallback / stocks
+    is_friday    = weekday == 4   # SENSEX
+    is_expiry_day = is_tuesday or is_wednesday or is_thursday or is_friday
     is_expiry_time = now.hour >= 13  # afternoon on expiry
 
     # ── REGIME CLASSIFICATION ──
     # Priority order matters — more specific wins
 
     # 1. EXPIRY PINNING — expiry day + price near max pain + tight walls
-    if is_thursday and pinned and wall_width_pct < 2.0:
+    if is_expiry_day and pinned and wall_width_pct < 2.0:
         return {
             "regime": "EXPIRY_PINNING",
             "label": "Expiry Pinning — Max Pain ₹{} dominant".format(int(mp)),
@@ -1387,8 +1394,12 @@ def get_oi(sym, key, token, spot=0):
                      for x in strikes_data)
             if pain<mpv: mpv=pain;mp=s
 
-        ce_wall=max(strikes_data,key=lambda x:strikes_data[x]["ce"],default=0)
-        pe_wall=max(strikes_data,key=lambda x:strikes_data[x]["pe"],default=0)
+        # Walls — use only nearby strikes (ATM ±1000 pts) so the wall reflects
+        # practical resistance/support a trader would act on, not a far-OTM strike
+        # with legacy positions. Full strikes_data is kept for max pain (correct).
+        nearby = {s:v for s,v in strikes_data.items() if abs(s-atm) <= 1000}
+        ce_wall=max(nearby,key=lambda x:nearby[x]["ce"],default=0)
+        pe_wall=max(nearby,key=lambda x:nearby[x]["pe"],default=0)
 
         buildup="UNKNOWN"
         if ce_chg>0 and pe_chg>0: buildup="LONG_BUILDUP" if pe_chg>ce_chg else "SHORT_BUILDUP"
