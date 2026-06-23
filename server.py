@@ -1260,8 +1260,11 @@ def get_oi(sym, key, token, spot=0):
         lines = csv.strip().split("\n")
         step  = INSTRUMENTS.get(sym,{}).get("step",50)
         atm   = int(round(spot/step)*step)
-        # Smart ATM ±10 strikes only
-        target_strikes = set(range(atm - step*10, atm + step*11, step))
+        # ATM ±30 strikes — captures meaningful PCR and walls.
+        # Old ±10 (21 strikes) missed: far-OTM puts at 22k-23.5k (large hedging OI →
+        # understated PCR) and far-OTM call walls at 25k-26k (common resistance levels).
+        # ±30 = 61 strikes × 2 = 122 instruments — well within Zerodha's 500-instrument limit.
+        target_strikes = set(range(atm - step*30, atm + step*31, step))
 
         # Find nearest expiry — scan ALL lines with early symbol filter
         # NFO/BFO CSVs are 150k+ rows. Filter by tradingsymbol prefix.
@@ -1355,8 +1358,10 @@ def get_oi(sym, key, token, spot=0):
         elif ce_chg>0: buildup="SHORT_BUILDUP"
         elif pe_chg>0: buildup="LONG_BUILDUP"
 
-        pcr_interp=("EXTREME_BULL" if pcr>1.4 else "BULLISH" if pcr>1.1
-                    else "NEUTRAL" if pcr>0.9 else "BEARISH" if pcr>0.7 else "EXTREME_BEAR")
+        # PCR thresholds calibrated for ATM ±30 range — full-range PCR runs higher
+        # than ATM-only due to far-OTM hedging puts. Sensibull-aligned thresholds.
+        pcr_interp=("EXTREME_BULL" if pcr>1.5 else "BULLISH" if pcr>1.2
+                    else "NEUTRAL" if pcr>0.8 else "BEARISH" if pcr>0.6 else "EXTREME_BEAR")
 
         # Step 5b — Estimate IV from ATM option premiums
         # Use ATM straddle price as proxy: IV ≈ (CE_premium + PE_premium) / spot * sqrt(365/DTE) * 100
