@@ -1169,6 +1169,22 @@ def get_oi(sym, key, token, spot=0):
                 return d
         except: return None
 
+    def best_effort_cache(reason=""):
+        """Try disk first, then stale in-memory cache. Never return None if we have ANY data.
+        This prevents OI freezing when Zerodha is temporarily unreachable (Render wake-up,
+        network hiccup, token issue). Stale data is better than no data — signals still
+        score correctly and the user sees something rather than a frozen strip."""
+        disk = load_disk()
+        if disk:
+            return disk
+        stale = CACHE.get_val(cache_key)
+        if stale:
+            age_min = int((CACHE.age(cache_key) or 0) / 60)
+            print(f"[OI] {sym}: serving stale in-memory cache ({age_min}min old). Reason: {reason}")
+            d = dict(stale); d["cached"]=True; d["cache_age_min"]=age_min; d["stale"]=True
+            return d
+        return None
+
     def save_disk(data):
         try:
             with open(disk_file,"w") as f:
@@ -1176,7 +1192,7 @@ def get_oi(sym, key, token, spot=0):
         except: pass
 
     if not key or not token:
-        return load_disk()
+        return best_effort_cache("no credentials")
 
     try:
         hdrs = _kite_headers(key, token)
@@ -1220,7 +1236,7 @@ def get_oi(sym, key, token, spot=0):
                     params={"i": kite_sym}, headers=hdrs, timeout=10)
                 if r.status_code in [401,403]:
                     print(f"[OI] Auth failed for {sym} — token expired?")
-                    return load_disk()
+                    return best_effort_cache("token expired/invalid (401/403)")
                 if r.status_code == 200:
                     for v in (r.json().get("data") or {}).values():
                         spot = v.get("last_price",0); break
@@ -1229,7 +1245,7 @@ def get_oi(sym, key, token, spot=0):
             else:
                 print(f"[OI] No kite_sym found for {sym}")
 
-        if not spot: return load_disk()
+        if not spot: return best_effort_cache("spot fetch failed")
 
         # Step 2 — instruments CSV (cached 4h)
         # Route to correct exchange instruments file
@@ -1239,7 +1255,7 @@ def get_oi(sym, key, token, spot=0):
             csv = fetch_kite_instruments_mcx(key, token)   # MCX commodities
         else:
             csv = fetch_kite_instruments_nfo(key, token)   # NSE/NFO (default)
-        if not csv: return load_disk()
+        if not csv: return best_effort_cache("instruments CSV unavailable")
 
         lines = csv.strip().split("\n")
         step  = INSTRUMENTS.get(sym,{}).get("step",50)
@@ -1266,7 +1282,7 @@ def get_oi(sym, key, token, spot=0):
                 if 0<=d2<best_days: best_days=d2; best_exp=cols[5]
             except: continue
 
-        if not best_exp: return load_disk()
+        if not best_exp: return best_effort_cache("no valid expiry found")
         best_days = best_days  # days to expiry — used for IV calculation
 
         # Collect instruments for ATM ±10
@@ -1291,12 +1307,12 @@ def get_oi(sym, key, token, spot=0):
                     instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":int(sk),"type":cols[9]})
             except: continue
 
-        if not instruments: return load_disk()
+        if not instruments: return best_effort_cache("no option instruments found")
 
         # Step 3 — ONE bulk quote call for all ATM ±10 strikes (use params= for encoding)
         params2 = [("i", i["sym"]) for i in instruments]
         r2 = requests.get("https://api.kite.trade/quote", params=params2, headers=hdrs, timeout=20)
-        if r2.status_code in [401,403]: return load_disk()
+        if r2.status_code in [401,403]: return best_effort_cache("option chain auth failed 401/403")
         qdata = r2.json().get("data",{})
 
         # Step 4 — Aggregate OI
@@ -1319,7 +1335,7 @@ def get_oi(sym, key, token, spot=0):
                 strikes_data[s]["pe"]=oi;strikes_data[s]["pe_chg"]=chg
 
         if not ce_oi and not pe_oi:
-            return load_disk()
+            return best_effort_cache("option chain response error")
 
         # Step 5 — Compute metrics
         pcr = round(pe_oi/ce_oi,2) if ce_oi else 0
@@ -1384,10 +1400,10 @@ def get_oi(sym, key, token, spot=0):
     except Exception as e:
         import traceback
         print(f"[OI ERROR] {sym}: {e}\n{traceback.format_exc()[-300:]}")
-        disk = load_disk()
-        if disk: return disk
-        CACHE.set_error(cache_key)  # don't evict stale good data with None
-        return None
+        result = best_effort_cache("exception in OI fetch")
+        if not result:
+            CACHE.set_error(cache_key)
+        return result
 
 
 # ═══════════════════════════════════════════════════════════════
