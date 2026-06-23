@@ -1312,7 +1312,7 @@ def get_oi(sym, key, token, spot=0):
 
         if not instruments: return best_effort_cache("no option instruments found")
 
-        # Step 3 — ONE bulk quote call for all ATM ±10 strikes (use params= for encoding)
+        # Step 3 — ONE bulk quote call for all ATM ±30 strikes (122 instruments, well within Zerodha limit)
         params2 = [("i", i["sym"]) for i in instruments]
         r2 = requests.get("https://api.kite.trade/quote", params=params2, headers=hdrs, timeout=20)
         if r2.status_code in [401,403]: return best_effort_cache("option chain auth failed 401/403")
