@@ -381,6 +381,288 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
     except Exception as e:
         return None
 
+# ── Shared Kite instrument token cache (live + backtest) ─────────────────────
+_kite_token_cache = {}   # sym → instrument_token  (in-memory, survives restarts poorly — CACHE handles persistence)
+
+_KITE_STATIC_TOKENS = {
+    "NIFTY":     256265,
+    "BANKNIFTY": 260105,
+    "FINNIFTY":  257801,
+    "SENSEX":    265,
+    "MIDCPNIFTY":288009,
+}
+
+def _get_kite_instr_token(sym, key, token):
+    """
+    Resolve a symbol to its Kite instrument_token.
+    Priority: in-memory cache → static index tokens → NSE instruments CSV.
+    Returns int token or None.
+    """
+    if sym in _kite_token_cache:
+        return _kite_token_cache[sym]
+    if sym in _KITE_STATIC_TOKENS:
+        _kite_token_cache[sym] = _KITE_STATIC_TOKENS[sym]
+        return _KITE_STATIC_TOKENS[sym]
+    # Try persistent cache first
+    cache_key = f"kite_tok_{sym}"
+    cached = CACHE.get_val(cache_key)
+    if cached:
+        _kite_token_cache[sym] = cached
+        return cached
+    # Fetch NSE instruments CSV
+    csv_key = "instruments_nse_eq"
+    csv_text = CACHE.get_val(csv_key)
+    if not csv_text:
+        try:
+            r = requests.get("https://api.kite.trade/instruments/NSE",
+                headers=_kite_headers(key, token), timeout=20)
+            if r.status_code == 200:
+                csv_text = r.text
+                CACHE.set(csv_key, csv_text)
+            else:
+                print(f"[KiteToken] NSE instruments HTTP {r.status_code}")
+                return None
+        except Exception as e:
+            print(f"[KiteToken] NSE instruments fetch failed: {e}")
+            return None
+    import csv as _csv, io as _io
+    for row in _csv.DictReader(_io.StringIO(csv_text)):
+        ts  = (row.get("tradingsymbol") or "").strip()
+        seg = (row.get("segment") or "").strip()
+        tok = (row.get("instrument_token") or "").strip()
+        if ts == sym and seg in ("NSE", "NSE-EQ") and tok:
+            int_tok = int(tok)
+            _kite_token_cache[sym] = int_tok
+            CACHE.set(cache_key, int_tok)
+            return int_tok
+    print(f"[KiteToken] Token not found for {sym}")
+    return None
+
+
+# Yahoo → Kite interval mapping
+_KITE_INTERVAL = {
+    "5m":  "5minute",
+    "15m": "15minute",
+    "1h":  "60minute",
+    "1d":  "day",
+}
+
+def fetch_kite_live_candles(sym, key, token, interval="5m", days=2):
+    """
+    Fetch intraday/daily candles from Zerodha Kite historical API.
+    Returns list of {t, o, h, l, c, v} — same format as fetch_yahoo_candles candles.
+    Falls back to Yahoo if token missing or Kite fails.
+
+    interval: "5m" | "15m" | "1h" | "1d"
+    days: how many calendar days of history to request
+    """
+    inst = INSTRUMENTS.get(sym, {})
+
+    # MCX commodities — Kite historical not supported, always use Yahoo
+    if inst.get("mcx"):
+        ticker = inst.get("yahoo", "")
+        if not ticker: return []
+        d = fetch_yahoo_candles(ticker, interval, f"{days}d")
+        return d.get("candles", []) if d else []
+
+    if not key or not token:
+        # No Kite credentials — fall back to Yahoo
+        ticker = inst.get("yahoo", "")
+        if not ticker: return []
+        d = fetch_yahoo_candles(ticker, interval, f"{days}d")
+        return d.get("candles", []) if d else []
+
+    instr_token = _get_kite_instr_token(sym, key, token)
+    if not instr_token:
+        ticker = inst.get("yahoo", "")
+        if not ticker: return []
+        print(f"[KiteLive] No token for {sym} — Yahoo fallback ({interval})")
+        d = fetch_yahoo_candles(ticker, interval, f"{days}d")
+        return d.get("candles", []) if d else []
+
+    kite_interval = _KITE_INTERVAL.get(interval, "5minute")
+    from_dt = (datetime.now(IST) - timedelta(days=days + 1)).strftime("%Y-%m-%d")
+    to_dt   =  datetime.now(IST).strftime("%Y-%m-%d")
+    url = (f"https://api.kite.trade/instruments/historical/"
+           f"{instr_token}/{kite_interval}"
+           f"?from={from_dt}&to={to_dt}")
+
+    try:
+        r = requests.get(url, headers=_kite_headers(key, token), timeout=15)
+        if r.status_code in [401, 403]:
+            print(f"[KiteLive] Auth failed for {sym} — Yahoo fallback")
+            ticker = inst.get("yahoo", "")
+            if not ticker: return []
+            d = fetch_yahoo_candles(ticker, interval, f"{days}d")
+            return d.get("candles", []) if d else []
+        if r.status_code != 200:
+            print(f"[KiteLive] HTTP {r.status_code} for {sym} {interval}")
+            return []
+        d = r.json()
+        if d.get("status") != "success":
+            print(f"[KiteLive] {sym} {interval}: {d.get('message','')}")
+            return []
+        bars = []
+        for c in d.get("data", {}).get("candles", []):
+            ts_str = c[0]
+            try:
+                ts_norm = ts_str.replace(" ", "T")
+                ts_norm = re.sub(r'\+(\d{2})(\d{2})$', r'+\1:\2', ts_norm)
+                if "+" in ts_norm or "Z" in ts_norm:
+                    dt = datetime.fromisoformat(ts_norm.replace("Z", "+00:00"))
+                else:
+                    dt = datetime.strptime(ts_norm, "%Y-%m-%dT%H:%M:%S")
+                    dt = dt.replace(tzinfo=IST)
+            except Exception:
+                continue
+            bars.append({
+                "t": int(dt.timestamp()),
+                "o": round(float(c[1]), 2),
+                "h": round(float(c[2]), 2),
+                "l": round(float(c[3]), 2),
+                "c": round(float(c[4]), 2),
+                "v": int(c[5]) if len(c) > 5 else 0,
+            })
+        print(f"[KiteLive] {sym} {interval}: {len(bars)} bars ✅")
+        return bars
+    except Exception as e:
+        print(f"[KiteLive] {sym} {interval} failed: {e}")
+        ticker = inst.get("yahoo", "")
+        if not ticker: return []
+        d = fetch_yahoo_candles(ticker, interval, f"{days}d")
+        return d.get("candles", []) if d else []
+
+
+def fetch_kite_live_candles_computed(sym, key, token, interval="5m", days=2):
+    """
+    Like fetch_kite_live_candles but also computes SMA/RSI/trend/PDH/PDL/trend15
+    from the returned bars — matching the output shape of fetch_yahoo_candles().
+    Used by get_technicals() to replace Yahoo entirely for NSE symbols.
+    Returns a dict matching fetch_yahoo_candles output, or None on failure.
+    """
+    # 5min candles
+    candles5 = fetch_kite_live_candles(sym, key, token, "5m", 2)
+    if not candles5:
+        return None
+
+    closes  = [c["c"] for c in candles5]
+    highs   = [c["h"] for c in candles5]
+    lows    = [c["l"] for c in candles5]
+    volumes = [c["v"] for c in candles5]
+
+    def sma(n):
+        return round(sum(closes[-n:]) / n, 2) if len(closes) >= n else None
+
+    def rsi14():
+        if len(closes) < 15: return None
+        g = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
+        l = [max(closes[i-1] - closes[i], 0) for i in range(1, len(closes))]
+        ag = sum(g[-14:]) / 14; al = sum(l[-14:]) / 14
+        return round(100 - 100 / (1 + ag / al), 1) if al else 100.0
+
+    s20 = sma(20); s50 = sma(50); s200 = sma(200)
+
+    # Use Kite /quote for live price (already fetched in get_all_prices)
+    # Fallback: last close from candles
+    px = closes[-1] if closes else 0
+
+    # Prices from Kite quote (get_all_prices caches these)
+    prices_cache = CACHE.get_val("all_prices") or {}
+    sym_price = prices_cache.get(sym, {})
+    if sym_price.get("px"):
+        px       = sym_price["px"]
+        pc       = sym_price.get("prev_close", px)
+        day_high = sym_price.get("high", max(highs) if highs else 0)
+        day_low  = sym_price.get("low",  min(lows)  if lows  else 0)
+        day_open = sym_price.get("open", 0)
+        chg      = sym_price.get("chg", 0)
+        pct      = sym_price.get("pct", 0)
+        volume   = sym_price.get("volume", volumes[-1] if volumes else 0)
+    else:
+        pc       = closes[-2] if len(closes) > 1 else px
+        day_high = max(highs) if highs else 0
+        day_low  = min(lows)  if lows  else 0
+        day_open = candles5[0]["o"] if candles5 else 0
+        chg      = round(px - pc, 2)
+        pct      = round((px - pc) / pc * 100, 2) if pc else 0
+        volume   = volumes[-1] if volumes else 0
+
+    cross = "NONE"
+    if len(closes) >= 22 and s20 and s50:
+        ps20 = sum(closes[-21:-1]) / 20
+        if ps20 < s50 and s20 > s50: cross = "GOLDEN_CROSS"
+        elif ps20 > s50 and s20 < s50: cross = "DEATH_CROSS"
+
+    avg_vol = int(sum(volumes[-20:]) / 20) if len(volumes) >= 20 else 0
+    cur_vol = volumes[-1] if volumes else 0
+    vol_ratio = round(cur_vol / avg_vol, 2) if avg_vol else 0
+
+    # Daily candles for trend15, PDH/PDL, avg_range_pct
+    trend15 = "UNKNOWN"; trend_strength = 0; trend_up_count = 0
+    trend_sessions = 0; avg_range_pct = 0
+    hh_hl = False; lh_ll = False
+    prev_day_high = 0; prev_day_low = 0
+
+    candles_daily = fetch_kite_live_candles(sym, key, token, "1d", 35)
+    if candles_daily and len(candles_daily) >= 2:
+        dc = [c["c"] for c in candles_daily]
+        dh = [c["h"] for c in candles_daily]
+        dl = [c["l"] for c in candles_daily]
+        if len(dc) >= 2:
+            prev_day_high = round(dh[-2], 2)
+            prev_day_low  = round(dl[-2], 2)
+        if len(dc) >= 10:
+            try:
+                completed   = dc[:-1]
+                completed_h = dh[:-1]
+                completed_l = dl[:-1]
+                d_s5  = sum(completed[-5:])  / min(5,  len(completed))
+                d_s10 = sum(completed[-10:]) / min(10, len(completed))
+                days_w = completed[-15:] if len(completed) >= 15 else completed
+                n_comp = len(days_w) - 1
+                up_days = sum(1 for i in range(1, len(days_w)) if days_w[i] > days_w[i-1])
+                dn_days = n_comp - up_days
+                trend_strength = round(up_days / n_comp * 100) if n_comp > 0 else 0
+                trend_up_count = up_days; trend_sessions = n_comp
+                if len(completed_h) >= 3 and len(completed_l) >= 3:
+                    hh_hl = completed_h[-1] > completed_h[-3] and completed_l[-1] > completed_l[-3]
+                    lh_ll = completed_h[-1] < completed_h[-3] and completed_l[-1] < completed_l[-3]
+                if d_s5 > d_s10 and hh_hl:   trend15 = "STRONG_BULL"
+                elif d_s5 > d_s10:            trend15 = "BULL"
+                elif d_s5 < d_s10 and lh_ll:  trend15 = "STRONG_BEAR"
+                elif d_s5 < d_s10:            trend15 = "BEAR"
+                else:                          trend15 = "NEUTRAL"
+                rng_window = min(15, len(completed_h), len(completed_l))
+                if rng_window >= 5:
+                    ranges = [(completed_h[-i] - completed_l[-i]) / completed_l[-i] * 100
+                              for i in range(1, rng_window + 1) if completed_l[-i] > 0]
+                    avg_range_pct = round(sum(ranges) / len(ranges), 2) if ranges else 0
+            except Exception:
+                pass
+
+    return {
+        "px": px, "chg": chg, "pct": pct,
+        "high": day_high, "low": day_low, "open": day_open, "prev_close": pc,
+        "sma20": s20, "sma50": s50, "sma200": s200,
+        "rsi": rsi14(),
+        "crossover": cross,
+        "trend": ("BULLISH" if (s20 and s50 and s20 > s50)
+                  else "BEARISH" if (s20 and s50 and s20 < s50) else "NEUTRAL"),
+        "trend15": trend15, "trend_strength": trend_strength,
+        "trend_up_count": trend_up_count, "trend_sessions": trend_sessions,
+        "avg_range_pct": avg_range_pct,
+        "hh_hl": hh_hl, "lh_ll": lh_ll,
+        "prev_day_high": prev_day_high,
+        "prev_day_low":  prev_day_low,
+        "breakout":  bool(highs and px >= max(highs) * 0.998),
+        "breakdown": bool(lows  and px <= min(lows)  * 1.002),
+        "volume": cur_vol, "avg_volume": avg_vol, "vol_ratio": vol_ratio,
+        "candles": candles5[-78:],
+        "candles_daily": candles_daily,   # passed through so get_smc_cpr can reuse
+        "_source": "kite",
+    }
+
+
 def fetch_kite_instruments_nfo(key, token):
     """Fetch NFO instruments CSV from Zerodha. Cached 4 hours."""
     cache_key = "instruments_nfo"
@@ -946,17 +1228,32 @@ def get_usdinr():
     return CACHE.get_val("usdinr") or 84.0
 
 def get_technicals(sym):
-    """SMA/RSI/crossover from Yahoo candles. Cached 5 min. Always returns stale on failure."""
+    """
+    SMA/RSI/crossover from candle data. Cached 5 min.
+    Source priority: Zerodha Kite historical (accurate, real-time) -> Yahoo Finance (MCX/fallback).
+    Always returns stale cache on failure rather than empty dict.
+    """
     cache_key = f"tech_{sym}"
     if CACHE.fresh(cache_key, TTL["technicals"]):
         return CACHE.get_val(cache_key)
 
     inst = INSTRUMENTS.get(sym, {})
-    ticker = inst.get("yahoo","")
-    if not ticker:
-        return CACHE.get_val(cache_key) or {}
 
-    d = fetch_yahoo_candles(ticker, "5m", "2d")
+    kite_key   = CACHE.get_val("_kite_key")   or ""
+    kite_token = CACHE.get_val("_kite_token") or ""
+
+    d = None
+
+    if kite_key and kite_token and not inst.get("mcx"):
+        d = fetch_kite_live_candles_computed(sym, kite_key, kite_token)
+        if d:
+            print(f"[Tech] {sym}: Kite candles OK")
+
+    if not d:
+        ticker = inst.get("yahoo","")
+        if not ticker:
+            return CACHE.get_val(cache_key) or {}
+        d = fetch_yahoo_candles(ticker, "5m", "2d")
     if d and d.get("sma20"):
         # MCX commodities: Yahoo returns USD prices (CL=F in $/barrel, GC=F in $/troy oz)
         # Convert to INR using live USD/INR rate
@@ -998,10 +1295,13 @@ def get_technicals(sym):
             "avg_range_pct":   d.get("avg_range_pct",0),
             "hh_hl":           d.get("hh_hl",False),
             "lh_ll":           d.get("lh_ll",False),
+            "_source":         d.get("_source","yahoo"),
         }
         CACHE.set(cache_key, tech)
         if d.get("candles"):
             CACHE.set(f"candles5_{sym}", d["candles"])
+        if d.get("candles_daily"):
+            CACHE.set(f"candles1d_{sym}", d["candles_daily"])
         return tech
     return CACHE.get_val(cache_key) or {}
 
@@ -1788,83 +2088,112 @@ def calc_smc(candles):
     }
 
 def get_smc_cpr(sym, oi_data=None):
-    """Get full market intelligence for a symbol. Cached 5 min."""
+    """Get full market intelligence for a symbol. Cached 5 min.
+    Source priority: Zerodha Kite historical -> Yahoo Finance fallback."""
     cache_key = f"smc_{sym}"
     if CACHE.fresh(cache_key, TTL["smc"]):
         return CACHE.get_val(cache_key)
 
     inst   = INSTRUMENTS.get(sym,{})
     ticker = inst.get("yahoo","")
-    if not ticker: return {}
+
+    kite_key   = CACHE.get_val("_kite_key")   or ""
+    kite_token = CACHE.get_val("_kite_token") or ""
+    use_kite   = bool(kite_key and kite_token and not inst.get("mcx"))
 
     result = {}
 
-    # ── 5min candles (intraday intelligence) ──
-    d5 = fetch_yahoo_candles(ticker,"5m","2d")
-    # Prefer FRESH candles from this fetch — the shared candles5 cache (set by
-    # get_technicals) can be stale or miss today's opening 9:15-9:30 bars, which
-    # breaks ORB calculation (calc_orb finds no candles in the ORB window → None).
-    # Only fall back to cache if the fresh fetch failed entirely.
-    candles5 = (d5.get("candles",[]) if d5 else []) or CACHE.get_val(f"candles5_{sym}") or []
+    # ── 5min candles ─────────────────────────────────────────────────────────
+    if use_kite:
+        candles5 = fetch_kite_live_candles(sym, kite_key, kite_token, "5m", 2)
+    else:
+        d5_yh = fetch_yahoo_candles(ticker, "5m", "2d") if ticker else None
+        candles5 = (d5_yh.get("candles",[]) if d5_yh else [])
 
-    # SMC from 5min
+    # Fallback to candles5 cache (set by get_technicals) if fresh fetch empty
+    if not candles5:
+        candles5 = CACHE.get_val(f"candles5_{sym}") or []
+
+    # SMC, VWAP, ORB, Volume — all from 5min candles
     if candles5:
         result["smc"] = calc_smc(candles5)
-
-    # VWAP
     vwap = calc_vwap(candles5)
     if vwap: result["vwap"] = vwap
-
-    # ORB
     orb = calc_orb(candles5)
     if orb: result["orb"] = orb
-
-    # Volume analysis
     vol = calc_volume_analysis(candles5)
     if vol: result["volume"] = vol
 
-    # ── Daily candles (CPR + MTF) ──
-    d1d = fetch_yahoo_candles(ticker,"1d","1mo")
-    if d1d and d1d.get("candles"):
-        cpr = calc_cpr(d1d["candles"])
+    # ── Daily candles (CPR) ──────────────────────────────────────────────────
+    # Reuse if get_technicals already fetched them this cycle
+    candles_daily = CACHE.get_val(f"candles1d_{sym}") or []
+    if not candles_daily:
+        if use_kite:
+            candles_daily = fetch_kite_live_candles(sym, kite_key, kite_token, "1d", 35)
+        elif ticker:
+            d1d_yh = fetch_yahoo_candles(ticker, "1d", "1mo")
+            candles_daily = d1d_yh.get("candles",[]) if d1d_yh else []
+        if candles_daily:
+            CACHE.set(f"candles1d_{sym}", candles_daily)
+
+    if candles_daily:
+        cpr = calc_cpr(candles_daily)
         if cpr: result["cpr"] = cpr
 
-    # ── MTF alignment ──
-    d15 = fetch_yahoo_candles(ticker,"15m","5d")
-    d1h = fetch_yahoo_candles(ticker,"1h","1mo")
-    tf5  = d5.get("trend","")  if d5  else ""
-    tf15 = d15.get("trend","") if d15 else ""
-    tf1h = d1h.get("trend","") if d1h else ""
-    trends=[tf5,tf15,tf1h]
-    bulls=trends.count("BULLISH"); bears=trends.count("BEARISH")
+    # ── MTF alignment (15min + 1hr) ──────────────────────────────────────────
+    def _trend_from_candles(bars):
+        """SMA20 vs SMA50 trend from a candle list."""
+        if not bars or len(bars) < 20: return ""
+        cl = [c["c"] for c in bars]
+        s20 = sum(cl[-20:]) / 20
+        s50 = sum(cl[-50:]) / 50 if len(cl) >= 50 else None
+        if not s50: return ""
+        return "BULLISH" if s20 > s50 else "BEARISH"
+
+    if use_kite:
+        candles15 = fetch_kite_live_candles(sym, kite_key, kite_token, "15m", 5)
+        candles1h = fetch_kite_live_candles(sym, kite_key, kite_token, "1h",  30)
+        tf5  = _trend_from_candles(candles5)
+        tf15 = _trend_from_candles(candles15)
+        tf1h = _trend_from_candles(candles1h)
+    else:
+        d15_yh = fetch_yahoo_candles(ticker, "15m", "5d") if ticker else None
+        d1h_yh = fetch_yahoo_candles(ticker, "1h", "1mo") if ticker else None
+        tf5  = d5_yh.get("trend","")  if not use_kite and d5_yh  else _trend_from_candles(candles5)
+        tf15 = d15_yh.get("trend","") if d15_yh else ""
+        tf1h = d1h_yh.get("trend","") if d1h_yh else ""
+
+    trends = [tf5, tf15, tf1h]
+    bulls = trends.count("BULLISH"); bears = trends.count("BEARISH")
     result["mtf"] = {
-        "tf5":tf5,"tf15":tf15,"tf1h":tf1h,
+        "tf5": tf5, "tf15": tf15, "tf1h": tf1h,
         "alignment": ("STRONG_BULL" if bulls==3 else "BULL" if bulls==2
                       else "STRONG_BEAR" if bears==3 else "BEAR" if bears==2 else "MIXED")
     }
 
-    # ── OI writer behavior ──
+    # ── OI writer behavior ────────────────────────────────────────────────────
     writer = calc_oi_writer_behavior(oi_data)
     if writer: result["writer"] = writer
 
-    # ── Market regime ──
+    # ── Market regime ─────────────────────────────────────────────────────────
     tech = get_technicals(sym)
     regime = detect_market_regime(candles5, oi_data, vwap, orb, vol)
     result["regime"] = regime
 
-    # ── Trend15, PDH, PDL — from daily candle fetch ──
-    # Include these for snapshot capture (not available in /market when Zerodha is connected)
-    if d5:
-        result["trend15"]         = d5.get("trend15","UNKNOWN")
-        result["trend_strength"]  = d5.get("trend_strength",0)
-        result["hh_hl"]           = d5.get("hh_hl",False)
-        result["lh_ll"]           = d5.get("lh_ll",False)
-        result["pdh"]             = d5.get("prev_day_high",0)
-        result["pdl"]             = d5.get("prev_day_low",0)
-        result["above_vwap"]      = (d5.get("px",0) > vwap) if vwap else None
+    # ── Trend15, PDH, PDL ─────────────────────────────────────────────────────
+    result["trend15"]        = tech.get("trend15","UNKNOWN")
+    result["trend_strength"] = tech.get("trend_strength",0)
+    result["hh_hl"]          = tech.get("hh_hl",False)
+    result["lh_ll"]          = tech.get("lh_ll",False)
+    result["pdh"]            = tech.get("prev_day_high",0)
+    result["pdl"]            = tech.get("prev_day_low",0)
 
-    # ── AI narrative ──
-    px = d5.get("px",0) if d5 else 0
+    # Live price for above_vwap check
+    prices_cache = CACHE.get_val("all_prices") or {}
+    px = prices_cache.get(sym,{}).get("px",0) or (candles5[-1]["c"] if candles5 else 0)
+    result["above_vwap"] = (px > vwap) if vwap else None
+
+    # ── AI narrative ──────────────────────────────────────────────────────────
     narrative = generate_narrative(
         sym, px, regime, vwap, orb, vol, oi_data, writer,
         result.get("smc",{}), tech
@@ -2594,45 +2923,9 @@ def _bt_fetch_candles(ticker, interval="5m", days=61):
             for c in d["candles"]]
 
 # ── Zerodha instrument token cache ───────────────────────────────────────────
-_kite_nse_tokens = {}   # sym → instrument_token
-
 def _bt_get_kite_token(sym, key, token):
-    """Look up NSE equity instrument token for a symbol. Cached per session."""
-    if sym in _kite_nse_tokens:
-        return _kite_nse_tokens[sym]
-    # Known indices — hardcoded tokens (stable, don't change)
-    _static = {
-        "NIFTY":256265, "BANKNIFTY":260105, "FINNIFTY":257801,
-        "SENSEX":265, "MIDCPNIFTY":288009,
-    }
-    if sym in _static:
-        _kite_nse_tokens[sym] = _static[sym]
-        return _static[sym]
-    # Fetch NSE equity instruments CSV and parse
-    cached_csv = CACHE.get_val("instruments_nse_eq")
-    if not cached_csv:
-        try:
-            r = requests.get("https://api.kite.trade/instruments/NSE",
-                headers=_kite_headers(key, token), timeout=20)
-            if r.status_code == 200:
-                cached_csv = r.text
-                CACHE.set("instruments_nse_eq", cached_csv)
-        except Exception as e:
-            print(f"[BT] NSE instruments fetch failed: {e}")
-            return None
-    if not cached_csv:
-        return None
-    # Parse CSV for our symbol
-    import csv as _csv, io as _io
-    for row in _csv.DictReader(_io.StringIO(cached_csv)):
-        ts = (row.get("tradingsymbol") or "").strip()
-        seg = (row.get("segment") or "").strip()
-        tok = (row.get("instrument_token") or "").strip()
-        if ts == sym and seg in ("NSE", "NSE-EQ") and tok:
-            _kite_nse_tokens[sym] = int(tok)
-            return int(tok)
-    print(f"[BT] Token not found for {sym}")
-    return None
+    """Thin backtest wrapper — delegates to shared _get_kite_instr_token."""
+    return _get_kite_instr_token(sym, key, token)
 
 def _bt_kite_candles(sym, key, api_token, days=60, interval="5minute"):
     """
