@@ -2239,7 +2239,12 @@ def home():
 
 @app.route("/ping")
 def ping():
-    return jsonify({"ok":True,"time":ist_str()})
+    """Keepalive endpoint — called every 10 min by frontend to prevent Render free-tier sleep."""
+    return jsonify({
+        "ok":    True,
+        "time":  ist_str(),
+        "cache_keys": len(CACHE._store) if hasattr(CACHE,'_store') else -1,
+    })
 
 @app.route("/usdinr")
 def usdinr():
@@ -3432,6 +3437,35 @@ def backtest_jobs():
         "message":j.get("message"),"has_result":j.get("result") is not None,
         "error":j.get("trace","")[:300] if j.get("status")=="error" else ""}
         for jid,j in _bt_jobs.items()}})
+
+def _warmup_token_cache():
+    """
+    Pre-warm the Kite instrument token cache for all 55 watchlist symbols.
+    Runs in background 90s after startup (gives Kite credentials time to arrive
+    via first /market call). Without warmup, Batch3 symbols hit cold CSV parse
+    during first scan → 14 symbols missing SMA until 10:13 AM.
+    """
+    import time as _time
+    _time.sleep(90)  # wait for first /market call to store credentials
+    key   = CACHE.get_val("_kite_key")   or ""
+    token = CACHE.get_val("_kite_token") or ""
+    if not key or not token:
+        print("[Warmup] No Kite credentials yet — skipping token warmup")
+        return
+    nsyms = [s for s,v in INSTRUMENTS.items() if not v.get("mcx")]
+    print(f"[Warmup] Pre-warming instrument tokens for {len(nsyms)} symbols...")
+    warmed = 0
+    for sym in nsyms:
+        try:
+            tok = _get_kite_instr_token(sym, key, token)
+            if tok: warmed += 1
+        except Exception as e:
+            print(f"[Warmup] {sym}: {e}")
+    print(f"[Warmup] Done — {warmed}/{len(nsyms)} tokens cached")
+
+import threading as _threading
+_warmup_thread = _threading.Thread(target=_warmup_token_cache, daemon=True)
+_warmup_thread.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=False)
