@@ -1689,6 +1689,19 @@ def get_oi(sym, key, token, spot=0):
 
         if not ce_oi and not pe_oi:
             return best_effort_cache("option chain response error")
+        # Sanity check: if total OI is suspiciously low (< 0.05 Cr per side),
+        # the BFO/NFO quote likely returned empty OI (market not yet open, or
+        # BFO OI arrives with a ~5 min delay at market open). Don't cache this
+        # near-zero result — fall back to last good value so the app shows
+        # valid walls/PCR rather than misleading 0.10 Cr readings.
+        min_oi_threshold = 500_000  # 5 lakh contracts minimum per side
+        if ce_oi < min_oi_threshold or pe_oi < min_oi_threshold:
+            stale = CACHE.get_val(cache_key)
+            if stale and stale.get("ce_oi",0) >= min_oi_threshold:
+                print(f"[OI] {sym}: suspiciously low OI ({ce_oi}/{pe_oi}) — using stale cache")
+                return stale
+            # No good stale either — return current (better than nothing)
+            print(f"[OI] {sym}: low OI warning ({ce_oi}/{pe_oi}) — no valid stale available")
 
         # Step 5 — Compute metrics
         pcr = round(pe_oi/ce_oi,2) if ce_oi else 0
@@ -1699,13 +1712,22 @@ def get_oi(sym, key, token, spot=0):
                      for x in strikes_data)
             if pain<mpv: mpv=pain;mp=s
 
-        # Walls — use only nearby strikes (ATM ±1000 pts) so the wall reflects
-        # practical resistance/support a trader would act on, not a far-OTM strike
-        # with legacy positions. Full strikes_data is kept for max pain (correct).
-        # Wall: use all collected strikes (already limited to ATM ±10 = ±500pts for NIFTY)
-        nearby = strikes_data
-        ce_wall=max(nearby,key=lambda x:nearby[x]["ce"],default=0)
-        pe_wall=max(nearby,key=lambda x:nearby[x]["pe"],default=0)
+        # Walls — exclude the 2 outermost strikes on each side of ATM.
+        # Edge strikes accumulate legacy/hedging OI from prior expiries that
+        # got rolled here. This caused SENSEX walls to show 76,500 (edge)
+        # instead of 76,900 (actual highest concentration near ATM).
+        # Trimming 2 strikes per side (step×2 pts) ensures wall = active
+        # resistance/support, not far-OTM legacy positions.
+        all_strikes = sorted(strikes_data.keys())
+        trim = 2  # exclude 2 outermost strikes on each side
+        wall_strikes = all_strikes[trim:-trim] if len(all_strikes) > trim*2 else all_strikes
+        wall_nearby  = {s: strikes_data[s] for s in wall_strikes}
+        # CE wall = strike with most call OI (resistance above current price)
+        # PE wall = strike with most put OI (support below current price)
+        ce_wall_strikes = {s:d for s,d in wall_nearby.items() if s > atm}
+        pe_wall_strikes = {s:d for s,d in wall_nearby.items() if s < atm}
+        ce_wall = max(ce_wall_strikes, key=lambda x:ce_wall_strikes[x]["ce"], default=0) or                   max(wall_nearby, key=lambda x:wall_nearby[x]["ce"], default=0)
+        pe_wall = max(pe_wall_strikes, key=lambda x:pe_wall_strikes[x]["pe"], default=0) or                   max(wall_nearby, key=lambda x:wall_nearby[x]["pe"], default=0)
 
         buildup="UNKNOWN"
         if ce_chg>0 and pe_chg>0: buildup="LONG_BUILDUP" if pe_chg>ce_chg else "SHORT_BUILDUP"
