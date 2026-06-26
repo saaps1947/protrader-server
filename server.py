@@ -3064,45 +3064,95 @@ def _bt_kite_candles(sym, key, api_token, days=60, interval="5minute"):
 
 
 def _bt_score(px, sma20, sma50, rsi, vwap, pdh, pdl, cpr_tc, cpr_bc, cpr_narrow,
-              orb_h, orb_l, mins, trend15):
-    """Replicate signal scoring engine for one bar. Returns (bull, bear)."""
+              orb_h, orb_l, mins, trend15, prev_sma20=None, prev_sma50=None, vol_ratio=1.0):
+    """
+    Replicate signal scoring engine for one bar. Returns (bull, bear, layer_map).
+    Mirrors live engine EXACTLY including all recent fixes:
+      - VWAP above: +1 (was +2, FIX 3)
+      - Golden/Death Cross: +2 (was +4, FIX 2)
+      - Layer map: dict of every component contribution for attribution analysis
+    """
     bull=0; bear=0
-    aboveVwap = px>vwap if vwap else px>sma20
-    # SMA layer
-    if px>sma20 and px>sma50: bull+=1
-    if px<sma20 and px<sma50: bear+=1
-    if sma20>sma50: bull+=1
-    elif sma20<sma50: bear+=1
-    # RSI layer
-    if rsi<32 and px>sma20: bull+=2
-    elif 35<=rsi<=55 and px>sma20: bull+=1
-    if rsi>68 and px<sma20: bear+=2
-    elif 45<=rsi<=65 and px<sma20: bear+=1
-    # VWAP layer
-    if aboveVwap: bull+=2
-    else: bear+=2
-    # PDH/PDL
-    if pdh and px>pdh*1.001: bull+=(2 if True else 1)
-    elif pdh and abs(px-pdh)/pdh<0.002: bear+=1
-    if pdl and px<pdl*0.999: bear+=2
-    elif pdl and abs(px-pdl)/pdl<0.002: bull+=1
-    # CPR
-    if cpr_narrow and cpr_tc and px>cpr_tc: bull+=2
-    if cpr_narrow and cpr_bc and px<cpr_bc: bear+=2
-    # ORB
+    aboveVwap = vwap>0 and px>vwap
+    belowVwap = vwap>0 and px<vwap
+    layer = {}  # layer attribution: key → signed contribution (+bull/-bear)
+
+    # ── SMA / crossover layer ─────────────────────────────────────────────
+    if px>sma20 and px>sma50:    bull+=1; layer["above_both_sma"]=+1
+    elif px<sma20 and px<sma50:  bear+=1; layer["above_both_sma"]=-1
+    else: layer["above_both_sma"]=0
+    if sma20>sma50:              bull+=1; layer["sma_trend"]=+1
+    elif sma20<sma50:            bear+=1; layer["sma_trend"]=-1
+    else: layer["sma_trend"]=0
+    # Golden/Death Cross +2 (FIX 2 — was +4, too much weight on lagging indicator)
+    golden = prev_sma20 and prev_sma50 and prev_sma20<prev_sma50 and sma20>sma50
+    death  = prev_sma20 and prev_sma50 and prev_sma20>prev_sma50 and sma20<sma50
+    if golden: bull+=2; layer["golden_cross"]=+2
+    elif death: bear+=2; layer["golden_cross"]=-2
+    else: layer["golden_cross"]=0
+
+    # ── RSI layer ─────────────────────────────────────────────────────────
+    if rsi<32 and px>sma20:          bull+=2; layer["rsi"]=+2
+    elif 35<=rsi<=55 and px>sma20:   bull+=1; layer["rsi"]=+1
+    elif rsi>68 and px<sma20:        bear+=2; layer["rsi"]=-2
+    elif 45<=rsi<=65 and px<sma20:   bear+=1; layer["rsi"]=-1
+    else: layer["rsi"]=0
+
+    # ── VWAP layer (FIX 3 — above/below +1 not +2; reclaim is the +2 event) ──
+    vwap_reclaim = aboveVwap and rsi>0 and rsi<55   # proxy: above VWAP + momentum not extended
+    vwap_reject  = belowVwap and rsi>45
+    if vwap_reclaim:        bull+=2; layer["vwap"]=+2
+    elif aboveVwap:         bull+=1; layer["vwap"]=+1
+    elif vwap_reject:       bear+=2; layer["vwap"]=-2
+    elif belowVwap:         bear+=1; layer["vwap"]=-1
+    else: layer["vwap"]=0
+
+    # ── PDH/PDL layer ─────────────────────────────────────────────────────
+    vol_ok = vol_ratio > 1.2
+    if pdh and px>pdh*1.001:       bull+=(2 if vol_ok else 1); layer["pdh"]=+(2 if vol_ok else 1)
+    elif pdh and abs(px-pdh)/pdh<0.002: bear+=1; layer["pdh"]=-1
+    else: layer["pdh"]=0
+    if pdl and px<pdl*0.999:       bear+=(2 if vol_ok else 1); layer["pdl"]=-(2 if vol_ok else 1)
+    elif pdl and abs(px-pdl)/pdl<0.002: bull+=1; layer["pdl"]=+1
+    else: layer["pdl"]=0
+
+    # ── CPR layer ─────────────────────────────────────────────────────────
+    if cpr_narrow and cpr_tc and px>cpr_tc: bull+=2; layer["cpr"]=+2
+    elif cpr_narrow and cpr_bc and px<cpr_bc: bear+=2; layer["cpr"]=-2
+    else: layer["cpr"]=0
+
+    # ── ORB layer (tiered by session) ─────────────────────────────────────
     if orb_h and orb_l:
         tier = 3 if mins<11*60 else 2 if mins<14*60 else 1
-        if px>orb_h*1.001: bull+=tier
-        elif px<orb_l*0.999: bear+=tier
-    # 15D trend
+        vol_mult = 1 if not vol_ok else 0  # +1 bonus with volume (max tier already covers it)
+        if px>orb_h*1.001:   bull+=tier; layer["orb"]=+tier
+        elif px<orb_l*0.999: bear+=tier;  layer["orb"]=-tier
+        else: layer["orb"]=0
+    else: layer["orb"]=0
+
+    # ── 15D trend layer ───────────────────────────────────────────────────
     tmap = {"STRONG_BULL":(3,0),"BULL":(2,0),"NEUTRAL":(0,0),"BEAR":(0,2),"STRONG_BEAR":(0,3)}
-    bt,be = tmap.get(trend15,(0,0)); bull+=bt; bear+=be
-    # Counter-trend penalty
-    if trend15 in ["STRONG_BULL","BULL"] and bear>bull: bear=max(0,bear-2)
-    if trend15 in ["STRONG_BEAR","BEAR"] and bull>bear: bull=max(0,bull-2)
-    # OI excluded — intraday OI not available for historical dates
-    # Use snapshot-based backtest once 30 days of snapshots are captured
-    return bull, bear
+    bt,be = tmap.get(trend15,(0,0))
+    bull+=bt; bear+=be
+    layer["trend15"] = +bt if bt else -be
+
+    # ── Volume layer ──────────────────────────────────────────────────────
+    if vol_ok and px>sma20:  bull+=1; layer["volume"]=+1
+    elif vol_ok and px<sma20: bear+=1; layer["volume"]=-1
+    else: layer["volume"]=0
+    # Contradiction: breakout/breakdown on drying volume
+    breakout_dry = (px>orb_h*1.001 if orb_h else False) and vol_ratio<0.5
+    if breakout_dry: bull=max(0,bull-3); layer["vol_penalty"]=-3
+    else: layer["vol_penalty"]=0
+
+    # ── Counter-trend penalty ─────────────────────────────────────────────
+    if trend15 in ["STRONG_BULL","BULL"] and bear>bull:
+        bear=max(0,bear-2); layer["counter_trend"]=-2
+    elif trend15 in ["STRONG_BEAR","BEAR"] and bull>bear:
+        bull=max(0,bull-2); layer["counter_trend"]=-2
+    else: layer["counter_trend"]=0
+
+    return bull, bear, layer
 
 def _bt_derive_regime(px, sma20, sma50, vwap, trend15, rsi, pct):
     """
@@ -3175,28 +3225,64 @@ def _bt_setup_key(px, sma20, sma50, rsi, vwap, pdh, pdl, cpr_tc, cpr_bc, cpr_nar
     return "+".join(parts) if parts else "Unconfirmed"
 
 def _bt_simulate(bias, entry, sl, t1, t2, future_bars):
-    """Simulate trade outcome. Returns status + pnl_pct."""
+    """
+    Simulate trade outcome. Returns status + pnl_pct + MFE + MAE + bars_to_t1.
+    MFE = Maximum Favorable Excursion (best price reached in our direction)
+    MAE = Maximum Adverse Excursion (worst price reached against us)
+    Both expressed as % from entry. Used to diagnose SL placement and target sizing.
+    """
     effective_sl = sl; t1_hit = False
-    for i,bar in enumerate(future_bars):
-        mins = (bar["ts"]//60)%1440 if isinstance(bar["ts"],int) else 0
+    mfe = 0.0   # best % move in our favour (always positive)
+    mae = 0.0   # worst % move against us (always positive, i.e. max drawdown)
+    bars_to_t1 = None
+
+    for i, bar in enumerate(future_bars):
+        b_ist = datetime.fromtimestamp(bar["ts"], tz=IST) if bar.get("ts") else None
+        mins  = (b_ist.hour*60 + b_ist.minute) if b_ist else 0
+
+        # Track MFE and MAE on every bar
+        if bias == "BULLISH":
+            bar_gain = (bar["h"] - entry) / entry * 100
+            bar_loss = (entry - bar["l"]) / entry * 100
+        else:
+            bar_gain = (entry - bar["l"]) / entry * 100
+            bar_loss = (bar["h"] - entry) / entry * 100
+        mfe = max(mfe, bar_gain)
+        mae = max(mae, bar_loss)
+
+        # EOD cut
         if mins >= 15*60+15:
             pct = (bar["c"]-entry)/entry*100 if bias=="BULLISH" else (entry-bar["c"])/entry*100
-            return {"status":"EOD","exit":round(bar["c"],2),"pnl_pct":round(pct,2),"bars":i+1}
-        if bias=="BULLISH":
-            if bar["l"]<=effective_sl:
-                pct=(effective_sl-entry)/entry*100
-                return {"status":"T1_BE_SL" if t1_hit else "SL_HIT","exit":round(effective_sl,2),"pnl_pct":round(pct,2),"bars":i+1}
-            if not t1_hit and bar["h"]>=t1: t1_hit=True; effective_sl=entry
-            if bar["h"]>=t2:
-                return {"status":"T2_HIT","exit":round(t2,2),"pnl_pct":round((t2-entry)/entry*100,2),"bars":i+1}
+            return {"status":"EOD","exit":round(bar["c"],2),"pnl_pct":round(pct,2),"bars":i+1,
+                    "mfe":round(mfe,3),"mae":round(mae,3),"bars_to_t1":bars_to_t1}
+
+        if bias == "BULLISH":
+            if bar["l"] <= effective_sl:
+                pct = (effective_sl-entry)/entry*100
+                return {"status":"T1_BE_SL" if t1_hit else "SL_HIT",
+                        "exit":round(effective_sl,2),"pnl_pct":round(pct,2),"bars":i+1,
+                        "mfe":round(mfe,3),"mae":round(mae,3),"bars_to_t1":bars_to_t1}
+            if not t1_hit and bar["h"] >= t1:
+                t1_hit = True; effective_sl = entry; bars_to_t1 = i+1
+            if bar["h"] >= t2:
+                return {"status":"T2_HIT","exit":round(t2,2),
+                        "pnl_pct":round((t2-entry)/entry*100,2),"bars":i+1,
+                        "mfe":round(mfe,3),"mae":round(mae,3),"bars_to_t1":bars_to_t1}
         else:
-            if bar["h"]>=effective_sl:
-                pct=(entry-effective_sl)/entry*100
-                return {"status":"T1_BE_SL" if t1_hit else "SL_HIT","exit":round(effective_sl,2),"pnl_pct":round(pct,2),"bars":i+1}
-            if not t1_hit and bar["l"]<=t1: t1_hit=True; effective_sl=entry
-            if bar["l"]<=t2:
-                return {"status":"T2_HIT","exit":round(t2,2),"pnl_pct":round((entry-t2)/entry*100,2),"bars":i+1}
-    return {"status":"OPEN","exit":0,"pnl_pct":0,"bars":len(future_bars)}
+            if bar["h"] >= effective_sl:
+                pct = (entry-effective_sl)/entry*100
+                return {"status":"T1_BE_SL" if t1_hit else "SL_HIT",
+                        "exit":round(effective_sl,2),"pnl_pct":round(pct,2),"bars":i+1,
+                        "mfe":round(mfe,3),"mae":round(mae,3),"bars_to_t1":bars_to_t1}
+            if not t1_hit and bar["l"] <= t1:
+                t1_hit = True; effective_sl = entry; bars_to_t1 = i+1
+            if bar["l"] <= t2:
+                return {"status":"T2_HIT","exit":round(t2,2),
+                        "pnl_pct":round((entry-t2)/entry*100,2),"bars":i+1,
+                        "mfe":round(mfe,3),"mae":round(mae,3),"bars_to_t1":bars_to_t1}
+
+    return {"status":"OPEN","exit":0,"pnl_pct":0,"bars":len(future_bars),
+            "mfe":round(mfe,3),"mae":round(mae,3),"bars_to_t1":None}
 
 def _bt_run_job(job_id, params):
     """Background backtest computation."""
@@ -3345,9 +3431,13 @@ def _bt_run_job(job_id, params):
                     else: rsi=50
 
                     px = bar["c"]
-                    bull, bear = _bt_score(px,sma20,sma50,rsi,vwap,pdh,pdl,
+                    vol_ratio = bar["v"] / (sum(b["v"] for b in day_bars[max(0,bi-20):bi])/min(20,bi) or 1) if bi>0 else 1.0
+                    prev_c   = close_buf[-2] if len(close_buf)>=2 else None
+                    prev_sma20 = sum(close_buf[-21:-1])/20 if len(close_buf)>=21 else None
+                    prev_sma50 = sum(close_buf[-51:-1])/50 if len(close_buf)>=51 else None
+                    bull, bear, layer_map = _bt_score(px,sma20,sma50,rsi,vwap,pdh,pdl,
                                            cpr_tc,cpr_bc,cpr_narrow,orb_h,orb_l,
-                                           mins,trend15)
+                                           mins,trend15,prev_sma20,prev_sma50,vol_ratio)
 
                     # Hard trend blocks
                     if trend15=="STRONG_BULL" and bear>bull: continue
@@ -3397,6 +3487,9 @@ def _bt_run_job(job_id, params):
                         "vwap":round(vwap,2),"entry":round(px,2),
                         "sl":round(sl,2),"t1":round(t1,2),"t2":round(t2,2),
                         "session":session,"setup_key":setup_key,"regime":regime,
+                        "layers": layer_map,   # per-layer contribution map
+                        "score":  max(bull, bear),  # winning side raw score
+                        "vol_ratio": round(vol_ratio, 2),
                         **outcome
                     })
 
@@ -3424,26 +3517,123 @@ def _bt_run_job(job_id, params):
 
         aw=round(sum(s["pnl_pct"] for s in wins)/len(wins),2) if wins else 0
         al=round(sum(s["pnl_pct"] for s in losses)/len(losses),2) if losses else 0
+
+        # ── MFE/MAE summary stats ────────────────────────────────────────────
+        mfe_wins   = [s["mfe"] for s in wins   if s.get("mfe") is not None]
+        mae_losses = [s["mae"] for s in losses  if s.get("mae") is not None]
+        mae_wins   = [s["mae"] for s in wins    if s.get("mae") is not None]
+        mfe_losses = [s["mfe"] for s in losses  if s.get("mfe") is not None]
+        avg_mfe_win  = round(sum(mfe_wins)/len(mfe_wins),3)   if mfe_wins   else 0
+        avg_mae_loss = round(sum(mae_losses)/len(mae_losses),3) if mae_losses else 0
+        avg_mae_win  = round(sum(mae_wins)/len(mae_wins),3)    if mae_wins   else 0
+        avg_mfe_loss = round(sum(mfe_losses)/len(mfe_losses),3) if mfe_losses else 0
+        # Distribution: % of losses that never went MFE > 0.3% (entered wrong)
+        losses_never_positive = sum(1 for s in losses if (s.get("mfe") or 0) < 0.3)
+        # Distribution: % of wins that reached T1 within 30min (6 bars)
+        wins_fast = sum(1 for s in wins if (s.get("bars_to_t1") or 999) <= 6)
+
+        # ── Layer attribution analysis ────────────────────────────────────────
+        # For each layer: compute win rate when layer fired vs when it didn't
+        # "Fired" = |contribution| > 0
+        layer_keys = ["above_both_sma","sma_trend","golden_cross","rsi","vwap",
+                      "pdh","pdl","cpr","orb","trend15","volume","vol_penalty","counter_trend"]
+        layer_stats = []
+        for lk in layer_keys:
+            with_layer    = [s for s in closed if abs(s.get("layers",{}).get(lk,0))>0]
+            without_layer = [s for s in closed if abs(s.get("layers",{}).get(lk,0))==0]
+            if not with_layer: continue
+            wr_with    = round(sum(1 for s in with_layer    if s["pnl_pct"]>0)/len(with_layer)*100)    if with_layer    else 0
+            wr_without = round(sum(1 for s in without_layer if s["pnl_pct"]>0)/len(without_layer)*100) if without_layer else 0
+            edge = wr_with - wr_without
+            avg_pnl = round(sum(s["pnl_pct"] for s in with_layer)/len(with_layer),2)
+            layer_stats.append({
+                "k": lk, "n": len(with_layer), "n_without": len(without_layer),
+                "wr_with": wr_with, "wr_without": wr_without,
+                "edge": edge, "avg_pnl": avg_pnl,
+                "reliable": len(with_layer) >= 30,
+                "verdict": ("KEEP" if edge >= 5 else "MONITOR" if edge >= 0 else "CONSIDER_REMOVING")
+            })
+        layer_stats.sort(key=lambda x: -x["edge"])
+
+        # ── Score bucket analysis ─────────────────────────────────────────────
+        def score_bucket(s):
+            sc = s.get("score", max(s["bull"],s["bear"]))
+            if sc <= 3:   return "3"
+            elif sc <= 4: return "4"
+            elif sc <= 5: return "5"
+            elif sc <= 6: return "6"
+            elif sc <= 7: return "7"
+            else:         return "8+"
+        by_score_raw = breakdown(score_bucket)
+        # Sort numerically
+        score_order = ["3","4","5","6","7","8+"]
+        by_score_sorted = sorted(by_score_raw, key=lambda x: score_order.index(x["k"]) if x["k"] in score_order else 99)
+
+        # ── Time-of-day bucket ─────────────────────────────────────────────────
+        def time_bucket(s):
+            t = s.get("time","")
+            try:
+                h,m = int(t.split(":")[0]),int(t.split(":")[1])
+                mins_t = h*60+m
+            except: return "Unknown"
+            if   mins_t < 9*60+45:  return "9:30–9:44 (early)"
+            elif mins_t < 10*60:    return "9:45–9:59 (late open)"
+            elif mins_t < 11*60:    return "10:00–10:59"
+            elif mins_t < 12*60:    return "11:00–11:59"
+            elif mins_t < 13*60:    return "12:00–12:59"
+            elif mins_t < 14*60:    return "13:00–13:59"
+            else:                   return "14:00–15:00 (close)"
+        by_time = sorted(breakdown(time_bucket), key=lambda x: x["k"])
+
+        # ── MFE bucket breakdown ───────────────────────────────────────────────
+        def mfe_bucket(s):
+            mfe = s.get("mfe", 0) or 0
+            if mfe < 0.2:   return "MFE <0.2% (never moved)"
+            elif mfe < 0.5: return "MFE 0.2–0.5%"
+            elif mfe < 0.8: return "MFE 0.5–0.8% (near T1)"
+            elif mfe < 1.2: return "MFE 0.8–1.2% (hit T1)"
+            else:           return "MFE >1.2% (hit T2 zone)"
+        by_mfe = breakdown(mfe_bucket)
+
+        # ── Interaction analysis (top 2-layer combos) ─────────────────────────
+        def combo_key(s):
+            layers = s.get("layers",{})
+            fired = sorted([k for k,v in layers.items() if abs(v)>0 and k not in ("vol_penalty","counter_trend")])[:3]
+            return "+".join(fired) if fired else "none"
+        by_combo = sorted([r for r in breakdown(combo_key) if r["n"]>=20], key=lambda x:-x["wr"])[:20]
+
         result = {
             "total":len(signals_all), "closed":len(closed),
             "wins":len(wins), "losses":len(losses),
             "win_rate":round(len(wins)/len(closed)*100) if closed else 0,
             "avg_win":aw, "avg_loss":al,
             "profit_factor":round(abs(aw/al),2) if al else 0,
+            # ── MFE/MAE stats ──
+            "mfe_stats": {
+                "avg_mfe_win":   avg_mfe_win,
+                "avg_mae_win":   avg_mae_win,
+                "avg_mfe_loss":  avg_mfe_loss,
+                "avg_mae_loss":  avg_mae_loss,
+                "losses_never_positive_pct": round(losses_never_positive/len(losses)*100) if losses else 0,
+                "wins_fast_pct": round(wins_fast/len(wins)*100) if wins else 0,
+            },
+            # ── Existing breakdowns ──
             "by_session": breakdown(lambda s:s["session"]),
             "by_trend":   breakdown(lambda s:s["trend15"]),
             "by_bias":    breakdown(lambda s:s["bias"]),
-            "by_conf":    breakdown(lambda s:"94%" if s["conf"]>=94 else "88-93%" if s["conf"]>=88 else "82-87%" if s["conf"]>=82 else "<82%"),
+            "by_conf":    breakdown(lambda s:"94%+" if s["conf"]>=94 else "88-93%" if s["conf"]>=88 else "82-87%" if s["conf"]>=82 else "<82%"),
             "by_cpr":     breakdown(lambda s:"NARROW" if s["cpr_narrow"] else "WIDE"),
             "by_sym":     breakdown(lambda s:s["sym"]),
             "by_setup":   breakdown(lambda s:s["setup_key"]),
             "by_regime":  breakdown(lambda s:s["regime"]),
-            # Setup × Regime cross-tab — the actual leaderboard insight: a setup
-            # can win in one regime and lose in another, which neither breakdown
-            # alone reveals. Mirrors the reviewer's "OI+Momentum+CHoCH in
-            # TRENDING_UP = 68% vs CHOPPY = 31%" example exactly.
             "by_setup_regime": breakdown(lambda s:s["setup_key"]+" / "+s["regime"]),
-            "signals":    sorted(signals_all,key=lambda s:s["date"]+s["time"])[-300:],
+            # ── New breakdowns (5 points) ──
+            "by_score":   by_score_sorted,    # Point 2: score bucket analysis
+            "by_layer":   layer_stats,         # Point 3: layer attribution (which are wasted)
+            "by_time":    by_time,             # Point 5: time-of-day win rate
+            "by_mfe":     by_mfe,              # Point 1: MFE distribution
+            "by_combo":   by_combo,            # Point 4: interaction analysis
+            "signals":    sorted(signals_all, key=lambda s:s["date"]+s["time"])[-300:],
         }
         _bt_jobs[job_id].update({"status":"done","progress":100,"message":"Complete","result":result})
     except Exception as e:
