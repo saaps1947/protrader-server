@@ -2246,6 +2246,48 @@ def ping():
         "cache_keys": len(CACHE._store) if hasattr(CACHE,'_store') else -1,
     })
 
+@app.route("/export_candles")
+def export_candles():
+    """
+    Export 5-min candles for all watchlist symbols as CSV.
+    One-time use — download this and upload to the Local Replay tab.
+    Format: timestamp,open,high,low,close,volume,symbol
+    """
+    import csv as _csv, io as _io
+    key   = CACHE.get_val("_kite_key")   or ""
+    token = CACHE.get_val("_kite_token") or ""
+
+    # All NSE symbols (no MCX — Yahoo only, not useful for replay)
+    syms = [s for s,v in INSTRUMENTS.items() if not v.get("mcx")]
+
+    output = _io.StringIO()
+    writer = _csv.writer(output)
+    writer.writerow(["timestamp","open","high","low","close","volume","symbol"])
+
+    fetched = 0
+    for sym in syms:
+        try:
+            bars = fetch_kite_live_candles(sym, key, token, "5m", 60)
+            if not bars:
+                print(f"[Export] {sym}: 0 bars — skipping")
+                continue
+            for b in bars:
+                writer.writerow([b["t"],b["o"],b["h"],b["l"],b["c"],b["v"],sym])
+            fetched += 1
+            print(f"[Export] {sym}: {len(bars)} bars ✅")
+        except Exception as e:
+            print(f"[Export] {sym}: ERROR {e}")
+
+    csv_data = output.getvalue()
+    print(f"[Export] Done — {fetched}/{len(syms)} symbols exported")
+    from flask import Response
+    return Response(
+        csv_data,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment;filename=protrader_candles_60d.csv"}
+    )
+
+
 @app.route("/usdinr")
 def usdinr():
     return jsonify({"ok":True,"rate":get_usdinr(),"time":ist_str()})
