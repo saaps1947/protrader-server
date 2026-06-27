@@ -2298,8 +2298,11 @@ def lot_sizes():
     key   = request.args.get("key","")
     token = request.args.get("token","")
 
-    # Fallback lot sizes (updated periodically by SEBI)
-    fallback = {"NIFTY":75,"BANKNIFTY":30,"FINNIFTY":40,"SENSEX":20,
+    # Fallback lot sizes — updated to current SEBI values (Nov 2024 revision)
+    # NIFTY: 75 → 65, BANKNIFTY: 30 → 35, FINNIFTY: 40 → 65, SENSEX: 20 → 20
+    # MIDCPNIFTY: 120 → 120 (unchanged)
+    # Source: NSE circular Nov 2024. Update this whenever SEBI revises.
+    fallback = {"NIFTY":65,"BANKNIFTY":35,"FINNIFTY":65,"SENSEX":20,
                 "MIDCPNIFTY":120,"CRUDEOIL":100,"GOLD":100}
 
     if not key or not token:
