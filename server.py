@@ -3595,12 +3595,28 @@ def _bt_run_job(job_id, params):
             else:           return "MFE >1.2% (hit T2 zone)"
         by_mfe = breakdown(mfe_bucket)
 
-        # ── Interaction analysis (top 2-layer combos) ─────────────────────────
+        # ── Interaction analysis — category grouped, not exact layer match ─────
+        # Exact layer matching creates 2^N combos (9 layers = 512 combinations).
+        # Group SMC sub-layers into one label, split VWAP state vs event.
         def combo_key(s):
             layers = s.get("layers",{})
-            fired = sorted([k for k,v in layers.items() if abs(v)>0 and k not in ("vol_penalty","counter_trend")])[:3]
-            return "+".join(fired) if fired else "none"
-        by_combo = sorted([r for r in breakdown(combo_key) if r["n"]>=20], key=lambda x:-x["wr"])[:20]
+            fires = []
+            has_choch = abs(layers.get("golden_cross",0)) > 0  # reused as structure proxy
+            has_ob    = False  # OB not tracked in server backtest (no SMC)
+            # Server backtest layers available: above_both_sma, sma_trend, golden_cross,
+            # rsi, vwap, pdh, pdl, cpr, orb, trend15, volume
+            if abs(layers.get("trend15",0)) > 0:     fires.append("TREND")
+            if abs(layers.get("orb",0)) > 0:          fires.append("ORB")
+            if abs(layers.get("cpr",0)) > 0:          fires.append("CPR")
+            if abs(layers.get("rsi",0)) > 0:          fires.append("RSI")
+            if abs(layers.get("vwap",0)) > 0:
+                # vwap layer: +2 = reclaim (event), +1 = state (above)
+                fires.append("VWAP✦" if abs(layers.get("vwap",0)) >= 2 else "VWAP")
+            if abs(layers.get("pdh",0)) > 0:          fires.append("PDH/PDL")
+            if abs(layers.get("golden_cross",0)) > 0: fires.append("SMAcross")
+            if abs(layers.get("volume",0)) > 0:       fires.append("VOL")
+            return "+".join(sorted(fires)) if fires else "none"
+        by_combo = sorted([r for r in breakdown(combo_key) if r["n"]>=20], key=lambda x:-x["wr"])[:25]
 
         result = {
             "total":len(signals_all), "closed":len(closed),
