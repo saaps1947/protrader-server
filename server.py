@@ -1899,6 +1899,19 @@ def calc_smc(candles):
     # Use swing trend as primary market structure
     structure = swg_trend if swg_trend != "NEUTRAL" else int_trend
 
+    # FIX: structure can show "UNKNOWN" even when a real CHoCH/BOS event just
+    # fired. This happens because swg_trend=NEUTRAL (ambiguous HH/HL pattern,
+    # which is NORMAL during a reversal) falls through to int_trend, and if
+    # internal pivots are also sparse, int_trend is "UNKNOWN" too — even though
+    # all_structure_events already contains a valid CHoCH/BOS break.
+    # Fix: if structure is NEUTRAL or UNKNOWN, derive it from the most recent
+    # (highest-index) structure event instead of the ambiguous trend label.
+    # A CHoCH/BOS event existing means the market just told us a direction —
+    # that's more reliable than a stale HH/HL/LH/LL trend classification.
+    if structure in ("NEUTRAL", "UNKNOWN") and all_structure_events:
+        most_recent = max(all_structure_events, key=lambda e: e["index"])
+        structure = most_recent["bias"]  # BULLISH or BEARISH from the latest break
+
     # ── Step 3: Strong vs Weak High/Low ───────────────────────────────────
     # Strong High = where the last bearish CHoCH/BOS formed (key resistance)
     # Weak High   = a pivot high in existing uptrend (just a pause)
