@@ -2259,6 +2259,48 @@ def ping():
         "cache_keys": len(CACHE._store) if hasattr(CACHE,'_store') else -1,
     })
 
+@app.route("/debug_orb/<sym>")
+def debug_orb(sym):
+    """Debug endpoint: shows raw 5m candles and ORB calculation for a symbol.
+    Call: /debug_orb/NIFTY?key=xxx&token=yyy
+    Shows exactly what timestamps Kite returns and whether ORB window is found.
+    """
+    sym = sym.upper()
+    key   = request.args.get("key","")   or CACHE.get_val("_kite_key")   or ""
+    token = request.args.get("token","") or CACHE.get_val("_kite_token") or ""
+    if key and token:
+        CACHE.set("_kite_key", key)
+        CACHE.set("_kite_token", token)
+
+    bars = fetch_kite_live_candles(sym, key, token, "5m", 2)
+    orb  = calc_orb(bars) if bars else None
+
+    # Find today's candles only
+    from datetime import datetime, timezone, timedelta
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(ist)
+    today = now_ist.date()
+    orb_start = int(datetime(today.year, today.month, today.day, 3, 45, tzinfo=timezone.utc).timestamp())
+    orb_end   = int(datetime(today.year, today.month, today.day, 4,  0, tzinfo=timezone.utc).timestamp())
+    orb_bars  = [b for b in bars if orb_start <= b["t"] < orb_end]
+    today_bars= [b for b in bars if b["t"] >= orb_start]
+
+    return jsonify({
+        "sym": sym,
+        "total_bars": len(bars),
+        "today_bars": len(today_bars),
+        "orb_window": {"start": orb_start, "end": orb_end,
+                       "start_ist": datetime.fromtimestamp(orb_start, tz=ist).strftime("%H:%M"),
+                       "end_ist":   datetime.fromtimestamp(orb_end,   tz=ist).strftime("%H:%M")},
+        "orb_bars_found": len(orb_bars),
+        "orb_bars": orb_bars,
+        "orb_result": orb,
+        "first_bar": bars[0]  if bars else None,
+        "last_bar":  bars[-1] if bars else None,
+        "kite_creds": "present" if (key and token) else "MISSING",
+    })
+
+
 @app.route("/export_candles")
 def export_candles():
     """
@@ -2457,9 +2499,10 @@ def market():
     key   = request.args.get("key","")
     token = request.args.get("token","")
 
-    # Cache credentials for background stock OI thread
+    # Cache credentials — stored for entire server lifetime (no TTL on CACHE.set)
+    # This ensures /smc calls after this point can use Kite candles
     if key and token:
-        CACHE.set("_kite_key", key)
+        CACHE.set("_kite_key",   key)
         CACHE.set("_kite_token", token)
 
     prices = get_all_prices(key, token)
@@ -2738,10 +2781,21 @@ def zerodha_oi():
 
 @app.route("/smc/<sym>")
 def smc_route(sym):
-    """Full market intelligence: SMC + CPR + MTF + VWAP + ORB + Volume + Regime + Narrative."""
+    """Full market intelligence: SMC + CPR + MTF + VWAP + ORB + Volume + Regime + Narrative.
+    Accepts optional ?key=&token= to prime Kite credentials without requiring /market first.
+    This ensures ORB/SMC/VWAP use live Kite candles even on cold-start Render instances.
+    """
     sym = sym.upper()
     if sym not in INSTRUMENTS:
         return jsonify({"ok":False,"error":"Unknown symbol"}),400
+    # Accept and cache Kite credentials if passed — allows /smc to use Kite
+    # without depending on /market having been called first this session.
+    key   = request.args.get("key","")
+    token = request.args.get("token","")
+    if key and token:
+        CACHE.set("_kite_key",   key)
+        CACHE.set("_kite_token", token)
+        print(f"[SMC] Kite credentials updated from /smc request for {sym}")
     # Pass OI data if available for writer behavior analysis
     oi_data = CACHE.get_val(f"oi_{sym}")
     data = get_smc_cpr(sym, oi_data)
