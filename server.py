@@ -1297,6 +1297,24 @@ def get_technicals(sym):
             "lh_ll":           d.get("lh_ll",False),
             "_source":         d.get("_source","yahoo"),
         }
+        # ORB computed here so it flows to /market for ALL symbols (not just /smc).
+        # This is the fix for ORB always being 0% in snapshots: previously ORB
+        # only came from /smc which runs for a few symbols; now every symbol in
+        # the market response carries ORB via the same reliable path as CPR.
+        if d.get("candles"):
+            orb_calc = calc_orb(d["candles"])
+            if orb_calc:
+                tech["orb"] = orb_calc
+            # SMC computed here too — same fix as ORB. calc_smc is heavier but
+            # get_technicals is cached 5 min per symbol, so it runs at most once
+            # per symbol per 5 min. This fixes SMC always being ~1% in snapshots
+            # (previously only came from /smc for a handful of viewed symbols).
+            try:
+                smc_calc = calc_smc(d["candles"])
+                if smc_calc:
+                    tech["smc"] = smc_calc
+            except Exception as e:
+                print(f"[Tech] {sym} SMC calc failed: {e}")
         CACHE.set(cache_key, tech)
         if d.get("candles"):
             CACHE.set(f"candles5_{sym}", d["candles"])
@@ -1583,8 +1601,19 @@ def get_oi(sym, key, token, spot=0):
             return (ts.startswith(sym) and len(ts) > sym_len and
                     (ts[sym_len].isdigit() or sym in ("SENSEX","CRUDEOIL","GOLD")))
 
-        today_n = datetime.now(IST).replace(tzinfo=None)
+        now_ist = datetime.now(IST)
+        today_n = now_ist.replace(tzinfo=None)
+        # EXPIRY DAY HANDLING:
+        # Keep showing the CURRENT (expiring) contract all day so intraday expiry
+        # moves — short covering, unwinding, pinning — remain visible and tradeable.
+        # Only roll to the NEXT expiry after 3 PM, when the expiring contract is
+        # effectively settled (last 30 min) and its OI is meaningless.
+        # min_days_allowed=0 normally; =1 after 3PM (skip today's dead contract).
+        after_3pm = now_ist.hour >= 15
+        min_days_allowed = 1 if after_3pm else 0
+
         best_exp=None; best_days=999
+        all_exps = set()
         for line in lines[1:]:
             cols=line.split(",")
             if len(cols)<10: continue
@@ -1594,10 +1623,12 @@ def get_oi(sym, key, token, spot=0):
             try:
                 exp=datetime.strptime(cols[5],"%Y-%m-%d")
                 d2=(exp-today_n).days
-                if 0<=d2<best_days: best_days=d2; best_exp=cols[5]
+                all_exps.add(cols[5])
+                if min_days_allowed<=d2<best_days: best_days=d2; best_exp=cols[5]
             except: continue
 
         if not best_exp: return best_effort_cache("no valid expiry found")
+        is_expiry_today = (best_days == 0)  # current contract expires today
         best_days = best_days  # days to expiry — used for IV calculation
 
         # Collect instruments for ATM ±10
@@ -1694,7 +1725,10 @@ def get_oi(sym, key, token, spot=0):
         # BFO OI arrives with a ~5 min delay at market open). Don't cache this
         # near-zero result — fall back to last good value so the app shows
         # valid walls/PCR rather than misleading 0.10 Cr readings.
-        min_oi_threshold = 500_000  # 5 lakh contracts minimum per side
+        # On expiry day, OI legitimately declines all day as the contract settles.
+        # Lower the threshold so real declining OI isn't mistaken for bad data and
+        # frozen to stale cache — otherwise expiry-day OI shows wrong (stale) values.
+        min_oi_threshold = 100_000 if is_expiry_today else 500_000
         if ce_oi < min_oi_threshold or pe_oi < min_oi_threshold:
             stale = CACHE.get_val(cache_key)
             if stale and stale.get("ce_oi",0) >= min_oi_threshold:
@@ -1758,9 +1792,16 @@ def get_oi(sym, key, token, spot=0):
                 ce_ltp = atm_ce_q.get("last_price",0) or 0
                 pe_ltp = atm_pe_q.get("last_price",0) or 0
                 straddle = ce_ltp + pe_ltp
-                dte = max(best_days, 1)
-                # Simplified IV proxy: straddle/(spot * sqrt(dte/365)) * 100
+                # On expiry day, DTE→0 makes the sqrt(dte/365) term collapse and
+                # IV explode to meaningless values. Floor DTE at 1 day, and on
+                # expiry day itself use a fractional day (remaining hours/24) so
+                # the IV proxy stays in a sane range rather than spiking.
                 import math
+                if is_expiry_today:
+                    hrs_left = max(0.5, 15.5 - now_ist.hour - now_ist.minute/60)
+                    dte = hrs_left / 24  # fraction of a day remaining
+                else:
+                    dte = max(best_days, 1)
                 iv_est = round(straddle / (spot * math.sqrt(dte/365)) * 100, 1)
                 iv_est = min(iv_est, 80)  # cap at realistic max
         except Exception as iv_err:
@@ -1774,6 +1815,8 @@ def get_oi(sym, key, token, spot=0):
             "mp_dist":round(spot-mp,0) if mp else 0,
             "source":"zerodha_kite","expiry":best_exp,
             "strikes_count":len(strikes_data),
+            "is_expiry_day":is_expiry_today,   # today = expiry for this contract
+            "days_to_expiry":best_days,
             "atm":atm
         }
         CACHE.set(cache_key, result)
@@ -2570,6 +2613,16 @@ def market():
                     op  = d.get("open",0) or px
                     d["vwap"] = round((op+hi+lo+px)/4, 2)
                     d["above_vwap"] = px > d["vwap"]
+                # ORB from technicals (computed in get_technicals for all symbols)
+                if tech.get("orb"):
+                    d["orb"] = tech["orb"]
+                # SMC from technicals (same all-symbols fix as ORB).
+                # Trim redundant aliases (orderBlocks/fvgZones duplicate ob/fvg)
+                # to keep the 55-symbol market payload lean.
+                if tech.get("smc"):
+                    _smc = tech["smc"]
+                    d["smc"] = {k:v for k,v in _smc.items()
+                                if k not in ("orderBlocks","fvgZones")}
             # Merge cached stock OI — liquid stocks (5-min) AND extended stocks (15-min)
             if sym in OI_STOCKS or sym in OI_STOCKS_EXT:
                 oi_data = CACHE.get_val(f"oi_{sym}")
