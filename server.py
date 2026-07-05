@@ -356,6 +356,18 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
         except Exception as te:
             pass
 
+        # MTF intraday trend override (same as Kite path). Yahoo provides less
+        # 5m history so the 1h leg may be weak, but 5m/15m still work and the
+        # function degrades gracefully when a timeframe lacks bars.
+        try:
+            _mtf = compute_mtf_trend(candles)
+            if _mtf["trend15"] != "UNKNOWN":
+                trend15 = _mtf["trend15"]
+                hh_hl = _mtf["hh_hl"]; lh_ll = _mtf["lh_ll"]
+                trend_strength = abs(_mtf["mtf_score"]) * 16
+        except Exception:
+            pass
+
         return {
             "px":px, "chg":round(px-pc,2),
             "pct":round((px-pc)/pc*100,2) if pc else 0,
@@ -540,8 +552,9 @@ def fetch_kite_live_candles_computed(sym, key, token, interval="5m", days=2):
     Used by get_technicals() to replace Yahoo entirely for NSE symbols.
     Returns a dict matching fetch_yahoo_candles output, or None on failure.
     """
-    # 5min candles
-    candles5 = fetch_kite_live_candles(sym, key, token, "5m", 2)
+    # 5min candles — fetch 10 days so the MTF trend can build a valid 1-hour
+    # timeframe (needs ~20 hourly candles = ~5 sessions of 5m bars).
+    candles5 = fetch_kite_live_candles(sym, key, token, "5m", 10)
     if not candles5:
         return None
 
@@ -627,10 +640,15 @@ def fetch_kite_live_candles_computed(sym, key, token, interval="5m", days=2):
                 if len(completed_h) >= 3 and len(completed_l) >= 3:
                     hh_hl = completed_h[-1] > completed_h[-3] and completed_l[-1] > completed_l[-3]
                     lh_ll = completed_h[-1] < completed_h[-3] and completed_l[-1] < completed_l[-3]
+                # NOTE: daily-based trend15 kept below but OVERRIDDEN by the MTF
+                # intraday trend after this block (daily trend proved to have
+                # negative predictive value on indices; intraday 5m/15m/1h works).
+                # We still compute trend_strength / hh_hl / lh_ll from daily for
+                # any downstream consumers, then replace trend15 itself.
                 if d_s5 > d_s10 and hh_hl:   trend15 = "STRONG_BULL"
                 elif d_s5 > d_s10:            trend15 = "BULL"
                 elif d_s5 < d_s10 and lh_ll:  trend15 = "STRONG_BEAR"
-                elif d_s5 < d_s10:            trend15 = "BEAR"
+                elif d_s5 < d_s10:           trend15 = "BEAR"
                 else:                          trend15 = "NEUTRAL"
                 rng_window = min(15, len(completed_h), len(completed_l))
                 if rng_window >= 5:
@@ -639,6 +657,16 @@ def fetch_kite_live_candles_computed(sym, key, token, interval="5m", days=2):
                     avg_range_pct = round(sum(ranges) / len(ranges), 2) if ranges else 0
             except Exception:
                 pass
+
+    # ── MTF INTRADAY TREND — replaces daily-15d trend15 ──────────────────────
+    # Data (60-day index study) showed daily-15d trend15 was -0.228R (harmful),
+    # while a 5m-primary intraday trend was the best single directional signal.
+    # We keep 15m and 1h as lighter confirming inputs (5m x3, 15m x2, 1h x1).
+    _mtf = compute_mtf_trend(candles5)
+    if _mtf["trend15"] != "UNKNOWN":
+        trend15 = _mtf["trend15"]
+        hh_hl = _mtf["hh_hl"]; lh_ll = _mtf["lh_ll"]
+        trend_strength = abs(_mtf["mtf_score"]) * 16  # 0..96 rough scale
 
     return {
         "px": px, "chg": chg, "pct": pct,
@@ -649,6 +677,8 @@ def fetch_kite_live_candles_computed(sym, key, token, interval="5m", days=2):
         "trend": ("BULLISH" if (s20 and s50 and s20 > s50)
                   else "BEARISH" if (s20 and s50 and s20 < s50) else "NEUTRAL"),
         "trend15": trend15, "trend_strength": trend_strength,
+        "mtf_score": _mtf["mtf_score"], "trend_5m": _mtf["t5"],
+        "trend_15m": _mtf["t15"], "trend_1h": _mtf["t60"],
         "trend_up_count": trend_up_count, "trend_sessions": trend_sessions,
         "avg_range_pct": avg_range_pct,
         "hh_hl": hh_hl, "lh_ll": lh_ll,
@@ -745,6 +775,81 @@ def calc_vwap(candles):
     cum_v  = sum(c.get("v",0) for c in today_c)
     if not cum_v: return None
     return round(cum_pv / cum_v, 2)
+
+def _ema(vals, n):
+    """Exponential moving average of the last values. Returns None if insufficient."""
+    if len(vals) < n: return None
+    k = 2/(n+1); e = sum(vals[:n])/n
+    for v in vals[n:]: e = v*k + e*(1-k)
+    return e
+
+def _resample(bars, span):
+    """Aggregate 5-min bars into higher timeframe. span = number of 5m bars per new bar."""
+    if span <= 1: return bars
+    out=[]; bucket=[]
+    for b in bars:
+        bucket.append(b)
+        if len(bucket)==span:
+            out.append({"h":max(x["h"] for x in bucket),"l":min(x["l"] for x in bucket),
+                        "c":bucket[-1]["c"]})
+            bucket=[]
+    if bucket:
+        out.append({"h":max(x["h"] for x in bucket),"l":min(x["l"] for x in bucket),
+                    "c":bucket[-1]["c"]})
+    return out
+
+def _tf_trend(bars, need=20):
+    """
+    Trend on one timeframe using EMA alignment + EMA slope + market structure (HH/HL).
+    Returns +1 (bull), -1 (bear), 0 (neutral). Majority vote of the three methods.
+    """
+    if not bars or len(bars) < need: return 0
+    c = [b["c"] for b in bars]
+    e9, e20 = _ema(c,9), _ema(c,20)
+    align = 1 if (e9 and e20 and e9>e20) else -1 if (e9 and e20 and e9<e20) else 0
+    e9now, e9prev = _ema(c,9), _ema(c[:-3],9)
+    slope = 1 if (e9now and e9prev and e9now>e9prev) else -1 if (e9now and e9prev and e9now<e9prev) else 0
+    w = bars[-12:] if len(bars)>=12 else bars; mid=len(w)//2
+    struct=0
+    if mid>=2:
+        h1=max(b["h"] for b in w[:mid]); h2=max(b["h"] for b in w[mid:])
+        l1=min(b["l"] for b in w[:mid]); l2=min(b["l"] for b in w[mid:])
+        struct = 1 if (h2>h1 and l2>l1) else -1 if (h2<h1 and l2<l1) else 0
+    s = align + slope + struct
+    return 1 if s>0 else -1 if s<0 else 0
+
+def compute_mtf_trend(candles5):
+    """
+    Multi-timeframe intraday trend replacing the old daily-15d trend15.
+    Analyzes 5-minute, 15-minute, and 1-hour trends together, weighting the
+    SMALLER timeframes more heavily (data shows 5m carries the most intraday edge
+    on indices; 1h is kept as a lighter confirming input).
+
+    Weights: 5m x3, 15m x2, 1h x1. Score in [-6,+6].
+    Maps to the same labels the rest of the engine expects so nothing downstream
+    breaks: STRONG_BULL / BULL / NEUTRAL / BEAR / STRONG_BEAR.
+
+    Returns dict: {trend15, mtf_score, t5, t15, t60, hh_hl, lh_ll}.
+    """
+    if not candles5 or len(candles5) < 30:
+        return {"trend15":"UNKNOWN","mtf_score":0,"t5":0,"t15":0,"t60":0,
+                "hh_hl":False,"lh_ll":False}
+    t5  = _tf_trend(candles5[-30:], need=20)          # ~last 30 five-min bars
+    t15 = _tf_trend(_resample(candles5[-300:], 3)[-20:], need=15)   # 15-min bars
+    t60 = _tf_trend(_resample(candles5[-800:], 12)[-20:], need=10)  # 1-hour bars
+    # Weighted: smaller timeframe dominates (5m x3, 15m x2, 1h x1)
+    score = t5*3 + t15*2 + t60*1
+    # Map score -> label. STRONG when smaller TFs strongly align.
+    if score >= 5:   trend15 = "STRONG_BULL"
+    elif score >= 2: trend15 = "BULL"
+    elif score <= -5: trend15 = "STRONG_BEAR"
+    elif score <= -2: trend15 = "BEAR"
+    else:             trend15 = "NEUTRAL"
+    # hh_hl / lh_ll derived from 5m structure for downstream consumers
+    hh_hl = (t5==1 and t15==1)
+    lh_ll = (t5==-1 and t15==-1)
+    return {"trend15":trend15,"mtf_score":score,"t5":t5,"t15":t15,"t60":t60,
+            "hh_hl":hh_hl,"lh_ll":lh_ll}
 
 def calc_orb(candles):
     """
