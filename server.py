@@ -39,6 +39,8 @@ INSTRUMENTS = {
     # ── Commodities (MCX — Yahoo only) ──
     "CRUDEOIL":  {"kite":None, "yahoo":"CL=F",  "step":50,  "sector":"COMMODITY", "mcx":True},
     "GOLD":      {"kite":None, "yahoo":"GC=F",  "step":100, "sector":"COMMODITY", "mcx":True},
+    "SILVER":    {"kite":None, "yahoo":"SI=F",  "step":100, "sector":"COMMODITY", "mcx":True},
+    "NATURALGAS":{"kite":None, "yahoo":"NG=F",  "step":5,   "sector":"COMMODITY", "mcx":True},
     # ── Banking & Finance ──
     "HDFCBANK":  {"kite":"NSE:HDFCBANK",  "yahoo":"HDFCBANK.NS",  "step":50,  "sector":"BANK"},
     "ICICIBANK": {"kite":"NSE:ICICIBANK", "yahoo":"ICICIBANK.NS", "step":50,  "sector":"BANK"},
@@ -101,7 +103,7 @@ INSTRUMENTS = {
 }
 
 OI_INDICES = {"NIFTY","BANKNIFTY","FINNIFTY","SENSEX"}  # Index option chains
-OI_MCX     = {"CRUDEOIL","GOLD"}                        # MCX commodity options
+OI_MCX     = set()  # MCX commodity option OI excluded — back-tested 48% direction-match (coin flip), thin chains. Price/technicals drive MCX signals instead.
 
 # 18 most liquid F&O stocks — meaningful OI, real CE/PE walls
 # Verified by ADV (average daily volume) in NSE F&O segment
@@ -1302,9 +1304,27 @@ def generate_narrative(sym, px, regime, vwap, orb, vol, oi_data, writer, smc, te
     return " ".join(p for p in parts if p)[:500]  # max 500 chars
 
 def get_vix():
-    """India VIX from Yahoo. Cached 1 min."""
+    """India VIX — primary source Zerodha Kite (NSE:INDIA VIX). Cached 1 min.
+    Yahoo kept only as a last-resort fallback if Kite credentials are unavailable
+    or the Kite call fails, so VIX (used by risk gates) never goes blank."""
     if CACHE.fresh("vix", TTL["vix"]):
         return CACHE.get_val("vix")
+    # 1) Kite — the authoritative source now that we standardize on Zerodha.
+    key   = CACHE.get_val("_kite_key")
+    token = CACHE.get_val("_kite_token")
+    if key and token:
+        try:
+            data = fetch_kite_quotes(key, token, ["NSE:INDIA VIX"])
+            if data and not data.get("_token_expired"):
+                q = data.get("NSE:INDIA VIX", {})
+                px = q.get("last_price", 0)
+                if px:
+                    val = round(px, 2)
+                    CACHE.set("vix", val)
+                    return val
+        except Exception as e:
+            print(f"[VIX] Kite fetch failed, falling back: {e}")
+    # 2) Yahoo fallback — only if Kite unavailable/failed.
     try:
         r = requests.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/%5EINDIAVIX?interval=1d&range=1d",
@@ -1371,6 +1391,10 @@ def get_technicals(sym):
                 mcx_scale = usdinr          # $/barrel → ₹/barrel
             elif sym == "GOLD":
                 mcx_scale = usdinr * 10 / 31.1035  # $/troy_oz → ₹/10g
+            elif sym == "SILVER":
+                mcx_scale = usdinr * 1000 / 31.1035  # $/troy_oz → ₹/kg (MCX quotes per kg)
+            elif sym == "NATURALGAS":
+                mcx_scale = usdinr          # $/mmBtu → ₹/mmBtu (MCX quotes per mmBtu directly)
             if mcx_scale > 1:
                 for field in ["sma20","sma50","high","low","open","prev_close",
                               "prev_day_high","prev_day_low"]:
@@ -1484,7 +1508,7 @@ def get_all_prices(key, token):
             return stale
 
     # MCX commodities — fetch from Zerodha using front-month futures
-    for sym in ["CRUDEOIL","GOLD"]:
+    for sym in ["CRUDEOIL","GOLD","SILVER","NATURALGAS"]:
         try:
             # Fetch MCX instruments to find front-month contract
             mcx_cache_key = f"mcx_sym_{sym}"
@@ -1505,6 +1529,12 @@ def get_all_prices(key, token):
                         mcx_kite_sym = contracts[0][1]
                         CACHE.set(mcx_cache_key, mcx_kite_sym)
                         print(f"[MCX] {sym} front-month: {mcx_kite_sym}")
+                    else:
+                        # No contracts matched this exact name — likely a naming
+                        # mismatch vs Zerodha's MCX instrument master (e.g. if
+                        # NATURALGAS is listed as "NATGASMINI" or similar). Log
+                        # clearly so this doesn't fail silently.
+                        print(f"[MCX] WARNING: no FUT contracts found for name='{sym}' — check exact Zerodha MCX instrument name")
 
             if mcx_kite_sym:
                 r_q = requests.get("https://api.kite.trade/quote",
@@ -1534,6 +1564,8 @@ def get_all_prices(key, token):
                 px = d["px"]
                 if sym=="CRUDEOIL" and px<500: px=round(px*usd_inr,2); chg=round(d["chg"]*usd_inr,2)
                 elif sym=="GOLD" and px<5000: f=usd_inr/31.1*10; px=round(d["px"]*f,2); chg=round(d["chg"]*f,2)
+                elif sym=="SILVER" and px<500: f=usd_inr*1000/31.1035; px=round(d["px"]*f,2); chg=round(d["chg"]*f,2)
+                elif sym=="NATURALGAS" and px<50: px=round(px*usd_inr,2); chg=round(d["chg"]*usd_inr,2)
                 else: chg=d["chg"]
                 result[sym]={"px":px,"chg":chg,"pct":d.get("pct",0),
                              "h":d.get("high",0),"l":d.get("low",0),
@@ -2506,7 +2538,7 @@ def lot_sizes():
     # MIDCPNIFTY: 120 → 120 (unchanged)
     # Source: NSE circular Nov 2024. Update this whenever SEBI revises.
     fallback = {"NIFTY":65,"BANKNIFTY":35,"FINNIFTY":65,"SENSEX":20,
-                "MIDCPNIFTY":120,"CRUDEOIL":100,"GOLD":100}
+                "MIDCPNIFTY":120,"CRUDEOIL":100,"GOLD":100,"SILVER":30,"NATURALGAS":1250}
 
     if not key or not token:
         return jsonify({"ok":True,"data":fallback,"source":"fallback"})
@@ -2836,8 +2868,8 @@ def place_order():
             return jsonify({"ok":False,"error":f"Tradingsymbol not found for {sym} {strike} {opt} exp:{best_exp}"})
 
         # Step 2: Default lot size if not provided
-        default_lots = {"NIFTY":75,"BANKNIFTY":15,"FINNIFTY":40,"SENSEX":10,
-                        "CRUDEOIL":100,"GOLD":100}
+        default_lots = {"NIFTY":65,"BANKNIFTY":35,"FINNIFTY":65,"SENSEX":20,
+                        "CRUDEOIL":100,"GOLD":100,"SILVER":30,"NATURALGAS":1250}
         if not qty:
             qty = default_lots.get(sym, 50)
 
