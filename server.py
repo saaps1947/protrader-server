@@ -689,7 +689,17 @@ def fetch_kite_live_candles_computed(sym, key, token, interval="5m", days=2):
         "breakout":  bool(highs and px >= max(highs) * 0.998),
         "breakdown": bool(lows  and px <= min(lows)  * 1.002),
         "volume": cur_vol, "avg_volume": avg_vol, "vol_ratio": vol_ratio,
-        "candles": candles5[-78:],
+        # WIDENED from last 78 bars (~1 day) to last 300 bars (~4 days).
+        # calc_smc's swing-structure detection (find_pivots with a 20-bar
+        # lookback) needs enough history for a SECOND swing pivot to form
+        # near the first one (equal highs/lows -> liquidity sweep signal).
+        # With only 78 bars there was room for ~1 swing pivot, so EQH/EQL/
+        # sweep almost never had a pair to compare — that's why "sweeps"
+        # was stuck at ~1% while ORB/CHoCH/OB/FVG (which only need recent
+        # bars) worked fine. candles5 is already fetched with 10 days of
+        # history (for the MTF trend fix), so this reuses data already in
+        # memory — no extra network calls, no slowdown.
+        "candles": candles5[-300:],
         "candles_daily": candles_daily,   # passed through so get_smc_cpr can reuse
         "_source": "kite",
     }
