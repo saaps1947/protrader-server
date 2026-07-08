@@ -1789,7 +1789,18 @@ def get_oi(sym, key, token, spot=0):
         # 21 strikes × 2 = 42 instruments. PCR thresholds are set for this range.
         # Changing range without changing thresholds breaks signal scoring — they
         # must stay in sync. If you need a wider range, recalibrate thresholds too.
-        strike_range = step * 10
+        #
+        # EXPIRY-DAY WIDENING: on expiry day OI genuinely concentrates further
+        # from ATM than a normal day — heavy far-strike writing as premium
+        # collapses, last-minute pinning/unwinding. A fixed ±10-strike window
+        # was missing this, producing a PCR that disagreed with Kite's full-
+        # chain view (e.g. app showed 0.89 "bearish" while Kite's full chain
+        # showed 1.41 "bullish" — both arithmetically correct, just summing
+        # different slices of the chain). Widen to ±20 strikes on expiry day
+        # ONLY, so every other day keeps the exact calibration the PCR
+        # thresholds below were tuned for.
+        # NOTE: this fix was found missing during a later audit — restored here.
+        strike_range = step * (20 if is_expiry_today else 10)
         lo_strike = atm - strike_range
         hi_strike = atm + strike_range
 
