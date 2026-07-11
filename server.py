@@ -1518,6 +1518,8 @@ def get_all_prices(key, token):
             return stale
 
     # MCX commodities — fetch from Zerodha using front-month futures
+    mcx_debug = {}  # surfaced in the /market response so failures are visible
+                    # in the app itself, not just Render logs
     for sym in ["CRUDEOIL","GOLD","SILVER","NATURALGAS"]:
         try:
             # Fetch MCX instruments to find front-month contract
@@ -1531,20 +1533,31 @@ def get_all_prices(key, token):
                     import csv as _csv
                     reader = _csv.DictReader(StringIO(r_inst.text))
                     contracts = []
+                    all_names_seen = set()
                     for row in reader:
-                        if row.get("name","").upper() == sym and row.get("instrument_type","") == "FUT":
+                        nm = row.get("name","").upper()
+                        if nm: all_names_seen.add(nm)
+                        if nm == sym and row.get("instrument_type","") == "FUT":
                             contracts.append((row.get("expiry",""), f"MCX:{row.get('tradingsymbol','')}"))
                     if contracts:
                         contracts.sort()  # earliest expiry first
                         mcx_kite_sym = contracts[0][1]
                         CACHE.set(mcx_cache_key, mcx_kite_sym)
                         print(f"[MCX] {sym} front-month: {mcx_kite_sym}")
+                        mcx_debug[sym] = {"status":"ok","contract":mcx_kite_sym}
                     else:
                         # No contracts matched this exact name — likely a naming
                         # mismatch vs Zerodha's MCX instrument master (e.g. if
                         # NATURALGAS is listed as "NATGASMINI" or similar). Log
                         # clearly so this doesn't fail silently.
                         print(f"[MCX] WARNING: no FUT contracts found for name='{sym}' — check exact Zerodha MCX instrument name")
+                        # Fuzzy-match candidates (names containing part of our
+                        # symbol) so the real Zerodha naming is visible without
+                        # digging through the full instrument CSV manually.
+                        fuzzy = sorted([n for n in all_names_seen if sym[:4] in n or n[:4] in sym])[:5]
+                        mcx_debug[sym] = {"status":"name_mismatch","tried":sym,"similar_names_found":fuzzy}
+                elif mcx_kite_sym:
+                    mcx_debug[sym] = {"status":"ok_cached","contract":mcx_kite_sym}
 
             if mcx_kite_sym:
                 r_q = requests.get("https://api.kite.trade/quote",
@@ -1566,6 +1579,7 @@ def get_all_prices(key, token):
                         break
         except Exception as ex:
             print(f"[MCX] {sym} Zerodha fetch failed: {ex}")
+            mcx_debug[sym] = {"status":"exception","error":str(ex)}
         # Fallback to Yahoo if Zerodha MCX fetch failed
         if sym not in result:
             inst = INSTRUMENTS[sym]
@@ -1580,10 +1594,16 @@ def get_all_prices(key, token):
                 result[sym]={"px":px,"chg":chg,"pct":d.get("pct",0),
                              "h":d.get("high",0),"l":d.get("low",0),
                              "source":"yahoo_mcx_fallback"}
+                mcx_debug[sym] = mcx_debug.get(sym,{}); mcx_debug[sym]["yahoo_fallback"]="ok"
+            else:
+                mcx_debug[sym] = mcx_debug.get(sym,{})
+                mcx_debug[sym]["yahoo_fallback"] = "failed — no price returned"
 
     print(f"[Prices] TOTAL: {len(result)} symbols in {time.time()-t0:.2f}s")
+    print(f"[MCX Debug] {mcx_debug}")
     if result:
         CACHE.set(cache_key, result)
+        CACHE.set("_mcx_debug", mcx_debug)  # surfaced separately via /market
     return result
 
 
@@ -1789,20 +1809,7 @@ def get_oi(sym, key, token, spot=0):
         # 21 strikes × 2 = 42 instruments. PCR thresholds are set for this range.
         # Changing range without changing thresholds breaks signal scoring — they
         # must stay in sync. If you need a wider range, recalibrate thresholds too.
-        #
-        # EXPIRY-DAY WIDENING: on expiry day OI genuinely concentrates further
-        # from ATM than a normal day — positions built up over the whole prior
-        # week can sit at strikes well outside a narrow same-day ATM window,
-        # plus heavy far-strike writing as premium collapses near expiry.
-        # CONFIRMED on SENSEX expiry day: app showed Put/Call OI of 0.09Cr each
-        # (PCR 0.97) vs Kite's full-chain 3.75Cr/3.77Cr (PCR 1.00) — a ~42x
-        # magnitude gap, larger than the earlier NIFTY case (which was ~1.6x
-        # PCR-only, no magnitude issue). Widened to ±30 strikes on expiry day
-        # ONLY, so every other day keeps the exact calibration the PCR
-        # thresholds below were tuned for.
-        # NOTE: this fix keeps going missing from uploaded copies — restored
-        # here for the second time. Worth confirming it's actually deployed.
-        strike_range = step * (30 if is_expiry_today else 10)
+        strike_range = step * 10
         lo_strike = atm - strike_range
         hi_strike = atm + strike_range
 
@@ -1853,17 +1860,6 @@ def get_oi(sym, key, token, spot=0):
         prev_snap_key = f"oi_snap_{sym}_{best_exp}"
         prev_snap = CACHE.get_val(prev_snap_key) or {}  # {strike_type: oi}
 
-        # 15-MINUTE OI CHANGE TRACKING (new): separate from the fetch-to-fetch
-        # delta above (which is only ~2 min and mostly noise). Keeps a short
-        # history of (timestamp, total_ce_oi, total_pe_oi) samples and finds
-        # the one closest to 15 minutes ago to compute a more meaningful
-        # medium-term OI build-up/unwind reading — e.g. "PE OI +1.2Cr in last
-        # 15min" signals fresh put writing (support building), not just noise
-        # from the last API poll.
-        hist_key = f"oi_hist_{sym}_{best_exp}"
-        oi_hist = CACHE.get_val(hist_key) or []  # list of {"t":epoch,"ce":x,"pe":y}
-        now_ts = time.time()
-
         ce_oi=0;pe_oi=0;ce_chg=0;pe_chg=0
         strikes_data={}
         new_snap = {}
@@ -1888,25 +1884,6 @@ def get_oi(sym, key, token, spot=0):
         # Persist snapshot for next OI fetch (used to compute accurate delta)
         if new_snap:
             CACHE.set(prev_snap_key, new_snap)
-
-        # Append to the 15-min rolling history and find the closest sample
-        # to 15 minutes ago. Trim history older than ~40 min so it doesn't
-        # grow unbounded across a trading day.
-        oi_hist.append({"t": now_ts, "ce": ce_oi, "pe": pe_oi})
-        oi_hist = [h for h in oi_hist if now_ts - h["t"] <= 2400]  # keep 40min
-        CACHE.set(hist_key, oi_hist)
-
-        ce_chg_15m = 0; pe_chg_15m = 0; oi_15m_available = False
-        target_ts = now_ts - 900  # 15 minutes ago
-        if len(oi_hist) >= 2:
-            closest = min(oi_hist[:-1], key=lambda h: abs(h["t"]-target_ts))
-            # Only trust this if the closest sample is reasonably near 15min
-            # (within +/-5min) — avoids a misleading reading right after
-            # market open when there's no real 15min-old data yet.
-            if abs(closest["t"]-target_ts) <= 300:
-                ce_chg_15m = ce_oi - closest["ce"]
-                pe_chg_15m = pe_oi - closest["pe"]
-                oi_15m_available = True
 
         if not ce_oi and not pe_oi:
             return best_effort_cache("option chain response error")
@@ -1999,7 +1976,6 @@ def get_oi(sym, key, token, spot=0):
 
         result = {
             "ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,
-            "ce_chg_15m":ce_chg_15m,"pe_chg_15m":pe_chg_15m,"oi_15m_available":oi_15m_available,
             "pcr":pcr,"max_pain":int(mp),"iv":iv_est,
             "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
             "spot":round(spot,1),"buildup":buildup,"pcr_interp":pcr_interp,
@@ -2699,6 +2675,10 @@ def debug_market():
         result["zerodha_sample"] = {k: {"px": v.get("last_price"), "source": "kite"} 
                                      for k,v in list(kite_data.items())[:3] 
                                      if not k.startswith("_")}
+    # MCX fetch diagnostics — shows WHY CRUDEOIL/GOLD/SILVER/NATURALGAS
+    # aren't generating signals if their price/contract fetch is failing,
+    # without needing to dig through Render server logs.
+    result["mcx_debug"] = CACHE.get_val("_mcx_debug") or {}
     
     # Test cache
     cached = CACHE.get_val("all_prices")
