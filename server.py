@@ -1860,6 +1860,16 @@ def get_oi(sym, key, token, spot=0):
         prev_snap_key = f"oi_snap_{sym}_{best_exp}"
         prev_snap = CACHE.get_val(prev_snap_key) or {}  # {strike_type: oi}
 
+        # 15-MINUTE OI CHANGE TRACKING: separate from the fetch-to-fetch
+        # delta above (~2 min, mostly noise). Keeps a rolling history of
+        # (timestamp, total_ce_oi, total_pe_oi) samples and finds the one
+        # closest to 15 minutes ago for a meaningful medium-term OI
+        # build-up/unwind reading (e.g. "PE OI +1.2Cr in last 15min" =
+        # fresh put writing / support building).
+        hist_key = f"oi_hist_{sym}_{best_exp}"
+        oi_hist = CACHE.get_val(hist_key) or []  # list of {"t":epoch,"ce":x,"pe":y}
+        now_ts = time.time()
+
         ce_oi=0;pe_oi=0;ce_chg=0;pe_chg=0
         strikes_data={}
         new_snap = {}
@@ -1884,6 +1894,21 @@ def get_oi(sym, key, token, spot=0):
         # Persist snapshot for next OI fetch (used to compute accurate delta)
         if new_snap:
             CACHE.set(prev_snap_key, new_snap)
+
+        # Append to the 15-min rolling history and find the closest sample
+        # to 15 minutes ago. Trim entries older than ~40 min.
+        oi_hist.append({"t": now_ts, "ce": ce_oi, "pe": pe_oi})
+        oi_hist = [h for h in oi_hist if now_ts - h["t"] <= 2400]
+        CACHE.set(hist_key, oi_hist)
+
+        ce_chg_15m = 0; pe_chg_15m = 0; oi_15m_available = False
+        target_ts = now_ts - 900
+        if len(oi_hist) >= 2:
+            closest = min(oi_hist[:-1], key=lambda h: abs(h["t"]-target_ts))
+            if abs(closest["t"]-target_ts) <= 300:
+                ce_chg_15m = ce_oi - closest["ce"]
+                pe_chg_15m = pe_oi - closest["pe"]
+                oi_15m_available = True
 
         if not ce_oi and not pe_oi:
             return best_effort_cache("option chain response error")
@@ -1976,6 +2001,7 @@ def get_oi(sym, key, token, spot=0):
 
         result = {
             "ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,
+            "ce_chg_15m":ce_chg_15m,"pe_chg_15m":pe_chg_15m,"oi_15m_available":oi_15m_available,
             "pcr":pcr,"max_pain":int(mp),"iv":iv_est,
             "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
             "spot":round(spot,1),"buildup":buildup,"pcr_interp":pcr_interp,
