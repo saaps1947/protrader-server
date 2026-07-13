@@ -1518,8 +1518,6 @@ def get_all_prices(key, token):
             return stale
 
     # MCX commodities — fetch from Zerodha using front-month futures
-    mcx_debug = {}  # surfaced in the /market response so failures are visible
-                    # in the app itself, not just Render logs
     for sym in ["CRUDEOIL","GOLD","SILVER","NATURALGAS"]:
         try:
             # Fetch MCX instruments to find front-month contract
@@ -1533,31 +1531,20 @@ def get_all_prices(key, token):
                     import csv as _csv
                     reader = _csv.DictReader(StringIO(r_inst.text))
                     contracts = []
-                    all_names_seen = set()
                     for row in reader:
-                        nm = row.get("name","").upper()
-                        if nm: all_names_seen.add(nm)
-                        if nm == sym and row.get("instrument_type","") == "FUT":
+                        if row.get("name","").upper() == sym and row.get("instrument_type","") == "FUT":
                             contracts.append((row.get("expiry",""), f"MCX:{row.get('tradingsymbol','')}"))
                     if contracts:
                         contracts.sort()  # earliest expiry first
                         mcx_kite_sym = contracts[0][1]
                         CACHE.set(mcx_cache_key, mcx_kite_sym)
                         print(f"[MCX] {sym} front-month: {mcx_kite_sym}")
-                        mcx_debug[sym] = {"status":"ok","contract":mcx_kite_sym}
                     else:
                         # No contracts matched this exact name — likely a naming
                         # mismatch vs Zerodha's MCX instrument master (e.g. if
                         # NATURALGAS is listed as "NATGASMINI" or similar). Log
                         # clearly so this doesn't fail silently.
                         print(f"[MCX] WARNING: no FUT contracts found for name='{sym}' — check exact Zerodha MCX instrument name")
-                        # Fuzzy-match candidates (names containing part of our
-                        # symbol) so the real Zerodha naming is visible without
-                        # digging through the full instrument CSV manually.
-                        fuzzy = sorted([n for n in all_names_seen if sym[:4] in n or n[:4] in sym])[:5]
-                        mcx_debug[sym] = {"status":"name_mismatch","tried":sym,"similar_names_found":fuzzy}
-                elif mcx_kite_sym:
-                    mcx_debug[sym] = {"status":"ok_cached","contract":mcx_kite_sym}
 
             if mcx_kite_sym:
                 r_q = requests.get("https://api.kite.trade/quote",
@@ -1579,7 +1566,6 @@ def get_all_prices(key, token):
                         break
         except Exception as ex:
             print(f"[MCX] {sym} Zerodha fetch failed: {ex}")
-            mcx_debug[sym] = {"status":"exception","error":str(ex)}
         # Fallback to Yahoo if Zerodha MCX fetch failed
         if sym not in result:
             inst = INSTRUMENTS[sym]
@@ -1594,16 +1580,10 @@ def get_all_prices(key, token):
                 result[sym]={"px":px,"chg":chg,"pct":d.get("pct",0),
                              "h":d.get("high",0),"l":d.get("low",0),
                              "source":"yahoo_mcx_fallback"}
-                mcx_debug[sym] = mcx_debug.get(sym,{}); mcx_debug[sym]["yahoo_fallback"]="ok"
-            else:
-                mcx_debug[sym] = mcx_debug.get(sym,{})
-                mcx_debug[sym]["yahoo_fallback"] = "failed — no price returned"
 
     print(f"[Prices] TOTAL: {len(result)} symbols in {time.time()-t0:.2f}s")
-    print(f"[MCX Debug] {mcx_debug}")
     if result:
         CACHE.set(cache_key, result)
-        CACHE.set("_mcx_debug", mcx_debug)  # surfaced separately via /market
     return result
 
 
@@ -1755,9 +1735,11 @@ def get_oi(sym, key, token, spot=0):
         # NO strike range filter — fetch ALL active strikes for this expiry.
         # ATM ±30 still only captures ~52% of full-chain OI (far OTM calls at
         # 25,500-28,000 hold 10+ Cr CE OI, making PCR look too high vs Sensibull).
-        # Removing the filter and using POST (no URL length limit) gives full-chain
-        # PCR matching Sensibull. The NFO CSV only lists ~80-150 active strikes for
-        # a given NIFTY weekly expiry, so the quote call stays within Zerodha limits.
+        # Removing the filter gives full-chain PCR matching Sensibull. The
+        # actual instrument fetch happens further below via batched GET calls
+        # (100 instruments per request — Zerodha's /quote is GET-only, POST
+        # returns 405), which already handles however many strikes the NFO
+        # CSV lists for a given expiry (~80-150 for a NIFTY weekly) safely.
 
         # Find nearest expiry.
         # FIX: require digit immediately after sym prefix — "NIFTY" matches
@@ -1805,13 +1787,19 @@ def get_oi(sym, key, token, spot=0):
         # because far-OTM strikes (22000PE, 26500CE etc.) are included but Sensibull cuts them.
         # Since both sides inflate equally PCR stays right, but absolute values and walls are wrong.
         atm = int(round(spot/step)*step)
-        # Strike range: ATM ±10 (original calibration).
-        # 21 strikes × 2 = 42 instruments. PCR thresholds are set for this range.
-        # Changing range without changing thresholds breaks signal scoring — they
-        # must stay in sync. If you need a wider range, recalibrate thresholds too.
-        strike_range = step * 10
-        lo_strike = atm - strike_range
-        hi_strike = atm + strike_range
+        # BUG FIX: a strike-range filter (ATM ±10) was still active here despite
+        # a comment above claiming it had been removed for full-chain matching.
+        # That mismatch between comment and code meant we were summing only
+        # ~7% of the real open interest — confirmed against a live screenshot
+        # comparison: our app showed Put/Call OI of 1.59/1.63 Cr (PCR 0.98)
+        # while Kite/Sensibull's full-chain total was 12.54/9.87 Cr (PCR 1.62)
+        # at the exact same moment — a single strike in the real chain often
+        # holds more OI than our entire reported total. Removing the filter
+        # for real this time: fetch EVERY active strike for this expiry, no
+        # range restriction. The NFO CSV only lists ~80-150 active strikes
+        # for a given NIFTY weekly expiry, and the batched-GET fetch below
+        # already loops in groups of 100, so this is safe without hitting
+        # Zerodha's request limits.
 
         if sym == "SENSEX":
             exchange_prefix = "BFO"
@@ -1829,7 +1817,6 @@ def get_oi(sym, key, token, spot=0):
             if cols[9] not in ["CE","PE"] or cols[5]!=best_exp: continue
             try:
                 sk=int(float(cols[6]))
-                if sk < lo_strike or sk > hi_strike: continue  # ATM ±10 strikes
                 instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":sk,"type":cols[9]})
             except: continue
 
@@ -1860,16 +1847,6 @@ def get_oi(sym, key, token, spot=0):
         prev_snap_key = f"oi_snap_{sym}_{best_exp}"
         prev_snap = CACHE.get_val(prev_snap_key) or {}  # {strike_type: oi}
 
-        # 15-MINUTE OI CHANGE TRACKING: separate from the fetch-to-fetch
-        # delta above (~2 min, mostly noise). Keeps a rolling history of
-        # (timestamp, total_ce_oi, total_pe_oi) samples and finds the one
-        # closest to 15 minutes ago for a meaningful medium-term OI
-        # build-up/unwind reading (e.g. "PE OI +1.2Cr in last 15min" =
-        # fresh put writing / support building).
-        hist_key = f"oi_hist_{sym}_{best_exp}"
-        oi_hist = CACHE.get_val(hist_key) or []  # list of {"t":epoch,"ce":x,"pe":y}
-        now_ts = time.time()
-
         ce_oi=0;pe_oi=0;ce_chg=0;pe_chg=0
         strikes_data={}
         new_snap = {}
@@ -1895,8 +1872,15 @@ def get_oi(sym, key, token, spot=0):
         if new_snap:
             CACHE.set(prev_snap_key, new_snap)
 
-        # Append to the 15-min rolling history and find the closest sample
-        # to 15 minutes ago. Trim entries older than ~40 min.
+        # 15-MINUTE OI CHANGE TRACKING: separate from the fetch-to-fetch
+        # delta above (~2 min, mostly noise). Keeps a rolling history of
+        # (timestamp, total_ce_oi, total_pe_oi) samples and finds the one
+        # closest to 15 minutes ago for a meaningful medium-term OI
+        # build-up/unwind reading (e.g. "PE OI +1.2Cr in last 15min" =
+        # fresh put writing / support building).
+        hist_key = f"oi_hist_{sym}_{best_exp}"
+        oi_hist = CACHE.get_val(hist_key) or []
+        now_ts = time.time()
         oi_hist.append({"t": now_ts, "ce": ce_oi, "pe": pe_oi})
         oi_hist = [h for h in oi_hist if now_ts - h["t"] <= 2400]
         CACHE.set(hist_key, oi_hist)
@@ -1942,12 +1926,19 @@ def get_oi(sym, key, token, spot=0):
         # Edge strikes accumulate legacy/hedging OI from prior expiries that
         # got rolled here. This caused SENSEX walls to show 76,500 (edge)
         # instead of 76,900 (actual highest concentration near ATM).
-        # Trimming 2 strikes per side (step×2 pts) ensures wall = active
-        # resistance/support, not far-OTM legacy positions.
+        # UPDATED after removing the strike-range filter entirely (full-chain
+        # OI/PCR now matches Sensibull) — trimming just 2 outermost strikes
+        # is no longer enough, since the chain can now span 80-150+ strikes.
+        # Walls should represent NEARBY, tradeable resistance/support, not
+        # whatever far-OTM strike happens to have legacy OI. Restrict wall
+        # selection to within 15 strikes of ATM (a reasonable "active zone"),
+        # while ce_oi/pe_oi/pcr below still sum the FULL chain for accurate
+        # totals matching Kite/Sensibull.
+        near_atm_lo = atm - step*15
+        near_atm_hi = atm + step*15
         all_strikes = sorted(strikes_data.keys())
-        trim = 2  # exclude 2 outermost strikes on each side
-        wall_strikes = all_strikes[trim:-trim] if len(all_strikes) > trim*2 else all_strikes
-        wall_nearby  = {s: strikes_data[s] for s in wall_strikes}
+        wall_strikes_range = [s for s in all_strikes if near_atm_lo <= s <= near_atm_hi]
+        wall_nearby  = {s: strikes_data[s] for s in wall_strikes_range} if wall_strikes_range else strikes_data
         # CE wall = strike with most call OI (resistance above current price)
         # PE wall = strike with most put OI (support below current price)
         ce_wall_strikes = {s:d for s,d in wall_nearby.items() if s > atm}
@@ -2701,10 +2692,6 @@ def debug_market():
         result["zerodha_sample"] = {k: {"px": v.get("last_price"), "source": "kite"} 
                                      for k,v in list(kite_data.items())[:3] 
                                      if not k.startswith("_")}
-    # MCX fetch diagnostics — shows WHY CRUDEOIL/GOLD/SILVER/NATURALGAS
-    # aren't generating signals if their price/contract fetch is failing,
-    # without needing to dig through Render server logs.
-    result["mcx_debug"] = CACHE.get_val("_mcx_debug") or {}
     
     # Test cache
     cached = CACHE.get_val("all_prices")
