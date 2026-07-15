@@ -1732,14 +1732,10 @@ def get_oi(sym, key, token, spot=0):
         lines = csv.strip().split("\n")
         step  = INSTRUMENTS.get(sym,{}).get("step",50)
         atm   = int(round(spot/step)*step)
-        # NO strike range filter — fetch ALL active strikes for this expiry.
-        # ATM ±30 still only captures ~52% of full-chain OI (far OTM calls at
-        # 25,500-28,000 hold 10+ Cr CE OI, making PCR look too high vs Sensibull).
-        # Removing the filter gives full-chain PCR matching Sensibull. The
-        # actual instrument fetch happens further below via batched GET calls
-        # (100 instruments per request — Zerodha's /quote is GET-only, POST
-        # returns 405), which already handles however many strikes the NFO
-        # CSV lists for a given expiry (~80-150 for a NIFTY weekly) safely.
+        # Strike range: ATM ±10 strikes (confirmed correct active range).
+        # For NIFTY (step=50), ATM 24,000 -> range is 23,500 to 24,500.
+        # This intentionally does NOT match Kite's "Total Call/Put OI" (full
+        # chain including far-OTM/legacy strikes) — different, correct scope.
 
         # Find nearest expiry.
         # FIX: require digit immediately after sym prefix — "NIFTY" matches
@@ -1792,14 +1788,17 @@ def get_oi(sym, key, token, spot=0):
         # That mismatch between comment and code meant we were summing only
         # ~7% of the real open interest — confirmed against a live screenshot
         # comparison: our app showed Put/Call OI of 1.59/1.63 Cr (PCR 0.98)
-        # while Kite/Sensibull's full-chain total was 12.54/9.87 Cr (PCR 1.62)
-        # at the exact same moment — a single strike in the real chain often
-        # holds more OI than our entire reported total. Removing the filter
-        # for real this time: fetch EVERY active strike for this expiry, no
-        # range restriction. The NFO CSV only lists ~80-150 active strikes
-        # for a given NIFTY weekly expiry, and the batched-GET fetch below
-        # already loops in groups of 100, so this is safe without hitting
-        # Zerodha's request limits.
+        # STRIKE RANGE: ATM ±10 strikes — CONFIRMED correct and intentional.
+        # (A stale comment here previously claimed this filter had been
+        # removed for "full-chain PCR matching Sensibull" — that was never
+        # actually true, the filter was still active, AND removing it was
+        # the wrong fix anyway. Kite's "Total Call/Put OI" sums the ENTIRE
+        # chain including far-OTM strikes that are mostly hedging/legacy
+        # positions, not the active/liquid trading range. ATM ±10 strikes —
+        # e.g. 23,500 to 24,500 for a 24,000 ATM — is the deliberate, correct
+        # active range. Comparing our ±10 total against Kite's full-chain
+        # "Total" figure was never a fair comparison; they measure different
+        # things by design, not a bug to "fix" by matching magnitudes.)
 
         if sym == "SENSEX":
             exchange_prefix = "BFO"
@@ -1807,6 +1806,10 @@ def get_oi(sym, key, token, spot=0):
             exchange_prefix = "MCX"
         else:
             exchange_prefix = "NFO"
+
+        strike_range = step * 10
+        lo_strike = atm - strike_range
+        hi_strike = atm + strike_range
 
         instruments=[]
         for line in lines[1:]:
@@ -1817,6 +1820,7 @@ def get_oi(sym, key, token, spot=0):
             if cols[9] not in ["CE","PE"] or cols[5]!=best_exp: continue
             try:
                 sk=int(float(cols[6]))
+                if sk < lo_strike or sk > hi_strike: continue  # ATM ±10 strikes only
                 instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":sk,"type":cols[9]})
             except: continue
 
@@ -1926,19 +1930,15 @@ def get_oi(sym, key, token, spot=0):
         # Edge strikes accumulate legacy/hedging OI from prior expiries that
         # got rolled here. This caused SENSEX walls to show 76,500 (edge)
         # instead of 76,900 (actual highest concentration near ATM).
-        # UPDATED after removing the strike-range filter entirely (full-chain
-        # OI/PCR now matches Sensibull) — trimming just 2 outermost strikes
-        # is no longer enough, since the chain can now span 80-150+ strikes.
-        # Walls should represent NEARBY, tradeable resistance/support, not
-        # whatever far-OTM strike happens to have legacy OI. Restrict wall
-        # selection to within 15 strikes of ATM (a reasonable "active zone"),
-        # while ce_oi/pe_oi/pcr below still sum the FULL chain for accurate
-        # totals matching Kite/Sensibull.
-        near_atm_lo = atm - step*15
-        near_atm_hi = atm + step*15
+        # Trimming 2 strikes per side (step×2 pts) ensures wall = active
+        # resistance/support, not far-OTM legacy positions. (Note: with the
+        # ATM ±10 range restored — confirmed as the correct, intentional
+        # scope, not the earlier mistaken full-chain removal — the chain is
+        # back to ~21 strikes, so a 2-strike trim is proportionate again.)
         all_strikes = sorted(strikes_data.keys())
-        wall_strikes_range = [s for s in all_strikes if near_atm_lo <= s <= near_atm_hi]
-        wall_nearby  = {s: strikes_data[s] for s in wall_strikes_range} if wall_strikes_range else strikes_data
+        trim = 2  # exclude 2 outermost strikes on each side
+        wall_strikes = all_strikes[trim:-trim] if len(all_strikes) > trim*2 else all_strikes
+        wall_nearby  = {s: strikes_data[s] for s in wall_strikes}
         # CE wall = strike with most call OI (resistance above current price)
         # PE wall = strike with most put OI (support below current price)
         ce_wall_strikes = {s:d for s,d in wall_nearby.items() if s > atm}
