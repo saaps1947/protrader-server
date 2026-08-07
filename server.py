@@ -1462,6 +1462,61 @@ def get_technicals(sym):
         return tech
     return CACHE.get_val(cache_key) or {}
 
+def resolve_mcx_front_month(sym, key, token):
+    """
+    Returns the current front-month MCX futures Kite symbol for `sym`
+    (e.g. "MCX:SILVER25AUGFUT"), re-resolving from Zerodha's instrument
+    list whenever the cached contract has expired. Shared by both the
+    price-fetch path and the OI-fetch path so they can never disagree
+    about which contract is "current" — previously each had its own
+    separate, inconsistent caching logic (one never re-validated expiry
+    at all; the other only happened to re-fetch on a cache miss, not on
+    a genuinely expired-but-still-cached string).
+    """
+    cache_key = f"mcx_sym_{sym}"
+    cached = CACHE.get_val(cache_key)  # {"sym":..., "expiry":"YYYY-MM-DD"} or None
+    today_d = datetime.now(IST).date()
+    if cached and isinstance(cached, dict):
+        try:
+            exp_d = datetime.strptime(cached["expiry"], "%Y-%m-%d").date()
+            if exp_d >= today_d:
+                return cached["sym"]  # still valid, not yet expired
+        except Exception:
+            pass  # malformed cache entry — fall through and re-resolve
+
+    r_inst = requests.get("https://api.kite.trade/instruments/MCX",
+        headers=_kite_headers(key, token), timeout=10)
+    if r_inst.status_code != 200:
+        return None
+    from io import StringIO
+    import csv as _csv
+    reader = _csv.DictReader(StringIO(r_inst.text))
+    contracts = []
+    for row in reader:
+        if row.get("name","").upper() != sym or row.get("instrument_type","") != "FUT":
+            continue
+        exp_str = row.get("expiry","")
+        try:
+            exp_d = datetime.strptime(exp_str, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if exp_d < today_d: continue  # skip already-expired contracts
+        contracts.append((exp_str, f"MCX:{row.get('tradingsymbol','')}"))
+    if not contracts:
+        # No contracts matched this exact name — likely a naming mismatch
+        # vs Zerodha's MCX instrument master (e.g. if NATURALGAS is listed
+        # as "NATGASMINI" or similar). Log clearly so this doesn't fail
+        # silently.
+        print(f"[MCX] WARNING: no valid FUT contracts found for name='{sym}' — check exact Zerodha MCX instrument name")
+        return None
+    contracts.sort()  # earliest still-valid expiry first = front month
+    exp_str, mcx_kite_sym = contracts[0]
+    CACHE.set(cache_key, {"sym": mcx_kite_sym, "expiry": exp_str})
+    print(f"[MCX] {sym} front-month resolved: {mcx_kite_sym} (expires {exp_str})")
+    return mcx_kite_sym
+
+
+
 def get_all_prices(key, token):
     """
     Live prices from Zerodha ONLY — one bulk call, <3s target.
@@ -1520,31 +1575,7 @@ def get_all_prices(key, token):
     # MCX commodities — fetch from Zerodha using front-month futures
     for sym in ["CRUDEOIL","GOLD","SILVER","NATURALGAS"]:
         try:
-            # Fetch MCX instruments to find front-month contract
-            mcx_cache_key = f"mcx_sym_{sym}"
-            mcx_kite_sym = CACHE.get_val(mcx_cache_key)
-            if not mcx_kite_sym:
-                r_inst = requests.get("https://api.kite.trade/instruments/MCX",
-                    headers=_kite_headers(key, token), timeout=10)
-                if r_inst.status_code == 200:
-                    from io import StringIO
-                    import csv as _csv
-                    reader = _csv.DictReader(StringIO(r_inst.text))
-                    contracts = []
-                    for row in reader:
-                        if row.get("name","").upper() == sym and row.get("instrument_type","") == "FUT":
-                            contracts.append((row.get("expiry",""), f"MCX:{row.get('tradingsymbol','')}"))
-                    if contracts:
-                        contracts.sort()  # earliest expiry first
-                        mcx_kite_sym = contracts[0][1]
-                        CACHE.set(mcx_cache_key, mcx_kite_sym)
-                        print(f"[MCX] {sym} front-month: {mcx_kite_sym}")
-                    else:
-                        # No contracts matched this exact name — likely a naming
-                        # mismatch vs Zerodha's MCX instrument master (e.g. if
-                        # NATURALGAS is listed as "NATGASMINI" or similar). Log
-                        # clearly so this doesn't fail silently.
-                        print(f"[MCX] WARNING: no FUT contracts found for name='{sym}' — check exact Zerodha MCX instrument name")
+            mcx_kite_sym = resolve_mcx_front_month(sym, key, token)
 
             if mcx_kite_sym:
                 r_q = requests.get("https://api.kite.trade/quote",
@@ -1676,30 +1707,10 @@ def get_oi(sym, key, token, spot=0):
                            "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
                 kite_sym = idx_map.get(sym)
             elif sym in OI_MCX:
-                # MCX commodities — try cached front-month kite symbol first
-                kite_sym = CACHE.get_val(f"mcx_sym_{sym}")
-                if not kite_sym:
-                    # Fallback: find front-month MCX futures directly from instruments CSV
-                    mcx_csv = fetch_kite_instruments_mcx(key, token)
-                    if mcx_csv:
-                        today_n = datetime.now(IST).replace(tzinfo=None)
-                        best_fut_exp = None; best_fut_days = 999; best_fut_sym = None
-                        for line in mcx_csv.strip().split("\n")[1:]:
-                            cols = line.split(",")
-                            if len(cols) < 10: continue
-                            if not cols[2].startswith(sym): continue
-                            if cols[9] != "FUT": continue
-                            try:
-                                exp = datetime.strptime(cols[5], "%Y-%m-%d")
-                                d2 = (exp - today_n).days
-                                if 0 <= d2 < best_fut_days:
-                                    best_fut_days = d2
-                                    best_fut_sym = f"MCX:{cols[2]}"
-                            except: continue
-                        if best_fut_sym:
-                            kite_sym = best_fut_sym
-                            CACHE.set(f"mcx_sym_{sym}", kite_sym)
-                            print(f"[OI] MCX spot resolved: {sym} → {kite_sym}")
+                # Shared, expiry-aware resolver — see resolve_mcx_front_month()
+                # definition for why this used to be a separate, inconsistent
+                # implementation here.
+                kite_sym = resolve_mcx_front_month(sym, key, token)
             else:
                 kite_sym = INSTRUMENTS.get(sym,{}).get("kite","")
 
@@ -1732,10 +1743,12 @@ def get_oi(sym, key, token, spot=0):
         lines = csv.strip().split("\n")
         step  = INSTRUMENTS.get(sym,{}).get("step",50)
         atm   = int(round(spot/step)*step)
-        # Strike range: ATM ±10 strikes (confirmed correct active range).
-        # For NIFTY (step=50), ATM 24,000 -> range is 23,500 to 24,500.
-        # This intentionally does NOT match Kite's "Total Call/Put OI" (full
-        # chain including far-OTM/legacy strikes) — different, correct scope.
+        # NO strike range filter — fetch ALL active strikes for this expiry.
+        # ATM ±30 still only captures ~52% of full-chain OI (far OTM calls at
+        # 25,500-28,000 hold 10+ Cr CE OI, making PCR look too high vs Sensibull).
+        # Removing the filter and using POST (no URL length limit) gives full-chain
+        # PCR matching Sensibull. The NFO CSV only lists ~80-150 active strikes for
+        # a given NIFTY weekly expiry, so the quote call stays within Zerodha limits.
 
         # Find nearest expiry.
         # FIX: require digit immediately after sym prefix — "NIFTY" matches
@@ -1783,22 +1796,13 @@ def get_oi(sym, key, token, spot=0):
         # because far-OTM strikes (22000PE, 26500CE etc.) are included but Sensibull cuts them.
         # Since both sides inflate equally PCR stays right, but absolute values and walls are wrong.
         atm = int(round(spot/step)*step)
-        # BUG FIX: a strike-range filter (ATM ±10) was still active here despite
-        # a comment above claiming it had been removed for full-chain matching.
-        # That mismatch between comment and code meant we were summing only
-        # ~7% of the real open interest — confirmed against a live screenshot
-        # comparison: our app showed Put/Call OI of 1.59/1.63 Cr (PCR 0.98)
-        # STRIKE RANGE: ATM ±10 strikes — CONFIRMED correct and intentional.
-        # (A stale comment here previously claimed this filter had been
-        # removed for "full-chain PCR matching Sensibull" — that was never
-        # actually true, the filter was still active, AND removing it was
-        # the wrong fix anyway. Kite's "Total Call/Put OI" sums the ENTIRE
-        # chain including far-OTM strikes that are mostly hedging/legacy
-        # positions, not the active/liquid trading range. ATM ±10 strikes —
-        # e.g. 23,500 to 24,500 for a 24,000 ATM — is the deliberate, correct
-        # active range. Comparing our ±10 total against Kite's full-chain
-        # "Total" figure was never a fair comparison; they measure different
-        # things by design, not a bug to "fix" by matching magnitudes.)
+        # Strike range: ATM ±10 (original calibration).
+        # 21 strikes × 2 = 42 instruments. PCR thresholds are set for this range.
+        # Changing range without changing thresholds breaks signal scoring — they
+        # must stay in sync. If you need a wider range, recalibrate thresholds too.
+        strike_range = step * 10
+        lo_strike = atm - strike_range
+        hi_strike = atm + strike_range
 
         if sym == "SENSEX":
             exchange_prefix = "BFO"
@@ -1806,10 +1810,6 @@ def get_oi(sym, key, token, spot=0):
             exchange_prefix = "MCX"
         else:
             exchange_prefix = "NFO"
-
-        strike_range = step * 10
-        lo_strike = atm - strike_range
-        hi_strike = atm + strike_range
 
         instruments=[]
         for line in lines[1:]:
@@ -1820,7 +1820,7 @@ def get_oi(sym, key, token, spot=0):
             if cols[9] not in ["CE","PE"] or cols[5]!=best_exp: continue
             try:
                 sk=int(float(cols[6]))
-                if sk < lo_strike or sk > hi_strike: continue  # ATM ±10 strikes only
+                if sk < lo_strike or sk > hi_strike: continue  # ATM ±10 strikes
                 instruments.append({"sym":f"{exchange_prefix}:{cols[2]}","strike":sk,"type":cols[9]})
             except: continue
 
@@ -1876,28 +1876,6 @@ def get_oi(sym, key, token, spot=0):
         if new_snap:
             CACHE.set(prev_snap_key, new_snap)
 
-        # 15-MINUTE OI CHANGE TRACKING: separate from the fetch-to-fetch
-        # delta above (~2 min, mostly noise). Keeps a rolling history of
-        # (timestamp, total_ce_oi, total_pe_oi) samples and finds the one
-        # closest to 15 minutes ago for a meaningful medium-term OI
-        # build-up/unwind reading (e.g. "PE OI +1.2Cr in last 15min" =
-        # fresh put writing / support building).
-        hist_key = f"oi_hist_{sym}_{best_exp}"
-        oi_hist = CACHE.get_val(hist_key) or []
-        now_ts = time.time()
-        oi_hist.append({"t": now_ts, "ce": ce_oi, "pe": pe_oi})
-        oi_hist = [h for h in oi_hist if now_ts - h["t"] <= 2400]
-        CACHE.set(hist_key, oi_hist)
-
-        ce_chg_15m = 0; pe_chg_15m = 0; oi_15m_available = False
-        target_ts = now_ts - 900
-        if len(oi_hist) >= 2:
-            closest = min(oi_hist[:-1], key=lambda h: abs(h["t"]-target_ts))
-            if abs(closest["t"]-target_ts) <= 300:
-                ce_chg_15m = ce_oi - closest["ce"]
-                pe_chg_15m = pe_oi - closest["pe"]
-                oi_15m_available = True
-
         if not ce_oi and not pe_oi:
             return best_effort_cache("option chain response error")
         # Sanity check: if total OI is suspiciously low (< 0.05 Cr per side),
@@ -1931,10 +1909,7 @@ def get_oi(sym, key, token, spot=0):
         # got rolled here. This caused SENSEX walls to show 76,500 (edge)
         # instead of 76,900 (actual highest concentration near ATM).
         # Trimming 2 strikes per side (step×2 pts) ensures wall = active
-        # resistance/support, not far-OTM legacy positions. (Note: with the
-        # ATM ±10 range restored — confirmed as the correct, intentional
-        # scope, not the earlier mistaken full-chain removal — the chain is
-        # back to ~21 strikes, so a 2-strike trim is proportionate again.)
+        # resistance/support, not far-OTM legacy positions.
         all_strikes = sorted(strikes_data.keys())
         trim = 2  # exclude 2 outermost strikes on each side
         wall_strikes = all_strikes[trim:-trim] if len(all_strikes) > trim*2 else all_strikes
@@ -1992,7 +1967,6 @@ def get_oi(sym, key, token, spot=0):
 
         result = {
             "ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,
-            "ce_chg_15m":ce_chg_15m,"pe_chg_15m":pe_chg_15m,"oi_15m_available":oi_15m_available,
             "pcr":pcr,"max_pain":int(mp),"iv":iv_est,
             "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
             "spot":round(spot,1),"buildup":buildup,"pcr_interp":pcr_interp,
