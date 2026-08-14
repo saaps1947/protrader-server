@@ -14,7 +14,7 @@ Author: PRO Trader
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests, time, threading, re
+import requests, time, threading, re, os, hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
@@ -27,7 +27,320 @@ def now_ist(): return datetime.now(IST)
 def ist_str(): return now_ist().strftime("%H:%M:%S IST")
 
 app = Flask(__name__)
-CORS(app)
+
+# ── QUOTAGUARD STATIC IP — Kite Connect calls only ─────────────────────────
+# SEBI mandated static-IP whitelisting for all broker API order requests,
+# enforced since April 1, 2026 (SEBI/HO/MIRSD-PoD/P/CIR/2025/0000013).
+# Render's default IPs are shared and change on every deploy/restart, so
+# every Kite Connect call — not just order placement, to be safe — now
+# routes through this session. When QUOTAGUARDSTATIC_URL isn't set (local
+# dev, or before QuotaGuard is provisioned), it silently falls back to a
+# normal direct connection so nothing breaks.
+#
+# Deliberately NOT applied to Yahoo Finance calls (query1.finance.yahoo.com)
+# — Yahoo has no whitelist requirement, and routing that traffic through a
+# paid proxy would just burn QuotaGuard's bandwidth allowance for no reason.
+KITE_SESSION = requests.Session()
+_quotaguard_url = os.environ.get("QUOTAGUARDSTATIC_URL", "").strip()
+if _quotaguard_url:
+    KITE_SESSION.proxies = {"http": _quotaguard_url, "https": _quotaguard_url}
+    print("[QuotaGuard] Kite API calls routing through static IP proxy")
+else:
+    print("[QuotaGuard] QUOTAGUARDSTATIC_URL not set — Kite calls use Render's "
+          "default (non-static) IP. Order placement will be rejected by "
+          "Zerodha until this is configured — see setup notes.")
+
+# ── SUPABASE — persistent signal + journal storage ─────────────────────────
+# Uses the new sb_secret_... key (replaces the old JWT service_role key —
+# same permissions, drop-in compatible with the client library). This key
+# bypasses Row Level Security by design, which is why it must only ever be
+# set here, as a Render environment variable, never in index.html.
+#
+# Falls back to None when unconfigured, same pattern as QUOTAGUARDSTATIC_URL —
+# every write function below checks for that and no-ops with a log line
+# rather than crashing, so the app keeps working exactly as before if
+# Supabase isn't set up yet.
+from supabase import create_client, Client as _SupabaseClient
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+SB: "_SupabaseClient | None" = None
+if SUPABASE_URL and SUPABASE_SECRET_KEY:
+    try:
+        SB = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+        print("[Supabase] Connected — signals/journal persistence active")
+    except Exception as _sbe:
+        print(f"[Supabase] Failed to connect: {_sbe}")
+else:
+    print("[Supabase] SUPABASE_URL / SUPABASE_SECRET_KEY not set — "
+          "signal/journal persistence disabled, app runs as before")
+
+
+def write_signal(sig: dict, fired: bool, source: str = "worker"):
+    """
+    Persist one generated signal (fired into the feed, or filtered out below
+    threshold — both are logged, see schema notes). Never raises — a
+    Supabase hiccup should never take down a live scan.
+    """
+    if not SB: return
+    try:
+        SB.table("signals").insert({
+            "sym": sig.get("sym"), "bias": sig.get("bias"), "fired": fired,
+            "confidence": sig.get("confidence"), "urgency": sig.get("urgency"),
+            "bull_score": sig.get("bullScore"), "bear_score": sig.get("bearScore"),
+            "neutral_score": sig.get("neutralScore"), "layers": sig.get("layers"),
+            "has_oi": sig.get("hasOI"), "setup_key": sig.get("setupKey"),
+            "regime": sig.get("regime"),
+            "entry_px": sig.get("entry"), "sl_px": sig.get("sl"),
+            "t1_px": sig.get("target1"), "t2_px": sig.get("target2"),
+            "rr": sig.get("rr"), "why": sig.get("why"), "vix": sig.get("vix"),
+            "source": source,
+        }).execute()
+    except Exception as e:
+        print(f"[Supabase] write_signal failed for {sig.get('sym')}: {e}")
+
+
+def upsert_journal_entry(entry: dict):
+    """
+    Insert or update one journal/trade entry, keyed by its existing client-
+    generated id — same id scheme as SIGNAL_LOG uses today, so this can sync
+    both directions without inventing a second id system.
+    """
+    if not SB: return
+    try:
+        SB.table("journal").upsert({
+            "id": entry.get("id"), "sym": entry.get("sym"), "bias": entry.get("bias"),
+            "trade": entry.get("trade"), "strategy": entry.get("strategy"),
+            "setup_key": entry.get("setupKey"), "time_bucket": entry.get("timeBucket"),
+            "regime": entry.get("regime"), "layers": entry.get("layers"),
+            "has_oi": entry.get("hasOI"), "confidence": entry.get("confidence"),
+            "urgency": entry.get("urgency"),
+            "entry_px": entry.get("entry_px"), "sl_px": entry.get("sl_px"),
+            "t1_px": entry.get("t1_px"), "t2_px": entry.get("t2_px"),
+            "rr": entry.get("rr"), "why": entry.get("why"), "vix": entry.get("vix"),
+            "timeframe": entry.get("timeframe"), "status": entry.get("status"),
+            "exit_px": entry.get("exit_px"), "pnl": entry.get("pnl"),
+            "outcome": entry.get("outcome"), "exit_time": entry.get("exitTime"),
+            "notes": entry.get("notes"), "source": entry.get("source"),
+            "updated_at": datetime.now(IST).isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"[Supabase] upsert_journal_entry failed for {entry.get('id')}: {e}")
+
+
+def write_candles(sym: str, interval: str, bars: list):
+    """
+    Persist candle bars — appending only NEW ones since the last write,
+    tracked via a watermark in CACHE (the app's existing cache utility,
+    not a new dependency), rather than resending the whole window every
+    refresh. get_technicals() re-fetches up to ~750 bars every 5 min per
+    symbol via its own TTL, and the vast majority already exist in
+    Supabase on every refresh — sending only the new tail avoids ~98%
+    wasted payload on every single call.
+    First call for a symbol+interval has no watermark yet, so it backfills
+    whatever history it was given (up to 10 days for 5m, 35 days for 1d —
+    however much get_technicals() fetched).
+    """
+    if not SB or not bars: return
+    try:
+        hwm_key = f"candles_hwm_{sym}_{interval}"
+        hwm = CACHE.get_val(hwm_key) or 0
+        new_bars = [b for b in bars if b.get("t", 0) > hwm]
+        if not new_bars: return
+        rows = [{
+            "sym": sym, "interval": interval, "t": b["t"],
+            "ts": datetime.fromtimestamp(b["t"], tz=IST).isoformat(),
+            "o": b.get("o"), "h": b.get("h"), "l": b.get("l"), "c": b.get("c"),
+            "v": b.get("v"),
+        } for b in new_bars]
+        SB.table("candles").upsert(rows, on_conflict="sym,interval,t").execute()
+        CACHE.set(hwm_key, max(b["t"] for b in new_bars))
+    except Exception as e:
+        print(f"[Supabase] write_candles failed for {sym} {interval}: {e}")
+
+
+def write_oi_chain(sym: str, expiry: str, atm: int, spot: float, strikes_data: dict):
+    """
+    Persist the full per-strike OI chain (ATM ±10 strikes) — richer than the
+    aggregate PCR/wall numbers already in `snapshots`, useful for any future
+    strategy built on per-strike OI concentration/buildup rather than just
+    the pre-computed summary metrics this app currently scores on.
+
+    Throttled to at most once per 15 min per symbol via a CACHE watermark —
+    get_oi() itself refreshes every 2 min (TTL["oi"]), but writing the full
+    ~21-strike chain every 2 min across ~54 OI-tracked symbols would run
+    ~221K rows/day; 15 min cuts that to ~29K/day with little real loss for
+    strategy work, which typically looks at buildup over 15min+ windows
+    anyway. Independent of get_oi()'s own cache — this only gates the write,
+    never the OI computation itself.
+    """
+    if not SB or not strikes_data: return
+    try:
+        wm_key = f"oi_chain_last_write_{sym}"
+        last = CACHE.get_val(wm_key) or 0
+        if time.time() - last < 900: return
+        ts_now = datetime.now(IST).isoformat()
+        rows = [{
+            "sym": sym, "expiry": expiry, "ts": ts_now,
+            "atm": atm, "spot": spot, "strike": strike,
+            "ce_oi": d.get("ce", 0), "pe_oi": d.get("pe", 0),
+            "ce_chg": d.get("ce_chg", 0), "pe_chg": d.get("pe_chg", 0),
+        } for strike, d in strikes_data.items()]
+        SB.table("oi_chain").insert(rows).execute()
+        CACHE.set(wm_key, time.time())
+    except Exception as e:
+        print(f"[Supabase] write_oi_chain failed for {sym}: {e}")
+
+
+def write_snapshot(row: dict, source: str = "client"):
+    """
+    Persist one per-symbol snapshot row — mirrors captureSnapshot() in
+    index.html field-for-field. Called from /snapshot (client posts here in
+    addition to its existing IndexedDB save — this is purely additive, the
+    local IndexedDB behavior is untouched) and, later, from the always-on
+    worker once it exists.
+    """
+    if not SB: return
+    try:
+        payload = dict(row)
+        payload["source"] = source
+        payload.pop("id", None)   # let Supabase assign its own bigserial id
+        SB.table("snapshots").insert(payload).execute()
+    except Exception as e:
+        print(f"[Supabase] write_snapshot failed for {row.get('sym')}: {e}")
+
+
+def write_backtest_result(job_id: str, params: dict, result: dict):
+    """
+    Persist a completed backtest run — the aggregate summary into
+    backtest_runs, and every individual simulated trade from result["signals"]
+    into backtest_trades. Called automatically at the end of every backtest,
+    from _bt_run_job — no extra step needed on your end, every run you
+    kick off from the app is saved from now on.
+    """
+    if not SB: return
+    try:
+        run = SB.table("backtest_runs").insert({
+            "job_id": job_id, "params": params,
+            "total": result.get("total"), "closed": result.get("closed"),
+            "wins": result.get("wins"), "losses": result.get("losses"),
+            "win_rate": result.get("win_rate"), "avg_win": result.get("avg_win"),
+            "avg_loss": result.get("avg_loss"), "profit_factor": result.get("profit_factor"),
+            "mfe_stats": result.get("mfe_stats"),
+            "by_session": result.get("by_session"), "by_trend": result.get("by_trend"),
+            "by_bias": result.get("by_bias"), "by_conf": result.get("by_conf"),
+            "by_cpr": result.get("by_cpr"), "by_sym": result.get("by_sym"),
+            "by_setup": result.get("by_setup"), "by_regime": result.get("by_regime"),
+            "by_setup_regime": result.get("by_setup_regime"), "by_score": result.get("by_score"),
+            "by_layer": result.get("by_layer"), "by_time": result.get("by_time"),
+            "by_mfe": result.get("by_mfe"), "by_combo": result.get("by_combo"),
+        }).execute()
+        run_id = run.data[0]["id"]
+
+        trades = result.get("signals", [])
+        rows = []
+        for s in trades:
+            rows.append({
+                "run_id": run_id, "date": s.get("date"), "time": s.get("time"),
+                "sym": s.get("sym"), "bias": s.get("bias"), "conf": s.get("conf"),
+                "bull": s.get("bull"), "bear": s.get("bear"), "score": s.get("score"),
+                "trend15": s.get("trend15"), "regime": s.get("regime"),
+                "cpr_narrow": s.get("cpr_narrow"), "pcr": s.get("pcr"), "rsi": s.get("rsi"),
+                "setup_key": s.get("setup_key"), "entry": s.get("entry"), "sl": s.get("sl"),
+                "t1": s.get("t1"), "t2": s.get("t2"), "status": s.get("status"),
+                "exit": s.get("exit"), "pnl_pct": s.get("pnl_pct"), "mfe": s.get("mfe"),
+                "mae": s.get("mae"), "bars_to_t1": s.get("bars_to_t1"), "bars": s.get("bars"),
+                "session": s.get("session"), "layers": s.get("layers"),
+            })
+        # Batch insert — Supabase/PostgREST handles this in one round trip
+        # rather than one request per trade (a run can have 300 trades).
+        if rows:
+            SB.table("backtest_trades").insert(rows).execute()
+        print(f"[Supabase] Backtest run {job_id} saved — {len(rows)} trades")
+    except Exception as e:
+        print(f"[Supabase] write_backtest_result failed for job {job_id}: {e}")
+
+
+@app.route("/snapshot", methods=["POST"])
+def snapshot_ingest():
+    """
+    Client posts one snapshot row here in addition to its own IndexedDB save.
+    Fire-and-forget from the client's perspective — this never blocks or
+    changes the existing local snapshot behavior, it's a pure addition.
+    """
+    try:
+        row = request.get_json(force=True) or {}
+        if not row.get("sym"):
+            return jsonify({"ok": False, "error": "missing sym"}), 400
+        write_snapshot(row, source="client")
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+
+def supabase_health():
+    """Quick connectivity check — hit this once after setup to confirm the
+    keys and schema are both working before building anything on top."""
+    if not SB:
+        return jsonify({"ok": False, "connected": False,
+                         "reason": "SUPABASE_URL / SUPABASE_SECRET_KEY not set"})
+    try:
+        r = SB.table("signals").select("id", count="exact").limit(1).execute()
+        return jsonify({"ok": True, "connected": True, "signals_row_count": r.count})
+    except Exception as e:
+        return jsonify({"ok": False, "connected": False, "reason": str(e)})
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+# Configurable via ALLOWED_ORIGINS env var (comma-separated), e.g.
+#   ALLOWED_ORIGINS=https://yourname.github.io,http://localhost:8080
+# Defaults to "*" so existing deployments keep working. NOTE: CORS is a browser
+# convenience, NOT a security boundary — any non-browser client ignores it.
+# The real protection on the order route is the credential + secret check below.
+_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+CORS(app, origins=_ALLOWED_ORIGINS)
+
+# ── TIER-0 SECURITY: order-route authentication ───────────────────────────────
+# Optional shared secret. If PROTRADER_API_SECRET is set in the environment,
+# every order-placing request must present it in the X-PT-Secret header.
+# If it is NOT set, order routes still require live Kite credentials to be sent
+# explicitly in the request body (they no longer fall back to the server's
+# cached credentials), so an anonymous caller cannot trade someone else's account.
+API_SECRET = os.environ.get("PROTRADER_API_SECRET", "").strip()
+
+def _check_order_auth():
+    """Returns None if authorised, else an (json, status) error tuple."""
+    if API_SECRET:
+        sent = request.headers.get("X-PT-Secret", "")
+        if not sent or not hmac.compare_digest(sent, API_SECRET):
+            return jsonify({"ok": False, "error": "Unauthorised — bad or missing X-PT-Secret"}), 401
+    return None
+
+def _creds(data=None):
+    """
+    Resolve Kite credentials for READ-ONLY routes.
+    Priority: headers → JSON body → query string → server cache.
+    Headers are preferred so tokens stop appearing in URLs (and therefore in
+    Render request logs and browser history).
+    """
+    key = request.headers.get("X-Kite-Key", "") or ""
+    tok = request.headers.get("X-Kite-Token", "") or ""
+    if data:
+        key = key or data.get("key", "") or ""
+        tok = tok or data.get("token", "") or ""
+    key = key or request.args.get("key", "") or CACHE.get_val("_kite_key") or ""
+    tok = tok or request.args.get("token", "") or CACHE.get_val("_kite_token") or ""
+    return key, tok
+
+def _creds_strict(data):
+    """
+    Resolve Kite credentials for ORDER routes. NO server-cache fallback —
+    the caller must supply their own credentials. This is what stops an
+    anonymous POST from trading against the last-seen user's account.
+    """
+    key = request.headers.get("X-Kite-Key", "") or (data.get("key", "") if data else "") or ""
+    tok = request.headers.get("X-Kite-Token", "") or (data.get("token", "") if data else "") or ""
+    return key.strip(), tok.strip()
 
 # NSE 50 stocks — Zerodha symbol → Yahoo symbol
 INSTRUMENTS = {
@@ -210,7 +523,7 @@ def fetch_kite_quotes(key, token, kite_syms):
         # Use params= so requests handles URL encoding correctly
         # e.g. "NSE:NIFTY 50" → "NSE%3ANIFTY+50"
         params = [("i", s) for s in kite_syms]
-        r = requests.get("https://api.kite.trade/quote",
+        r = KITE_SESSION.get("https://api.kite.trade/quote",
             params=params,
             headers=_kite_headers(key,token), timeout=20)
         if r.status_code in [401,403]:
@@ -428,7 +741,7 @@ def _get_kite_instr_token(sym, key, token):
     csv_text = CACHE.get_val(csv_key)
     if not csv_text:
         try:
-            r = requests.get("https://api.kite.trade/instruments/NSE",
+            r = KITE_SESSION.get("https://api.kite.trade/instruments/NSE",
                 headers=_kite_headers(key, token), timeout=20)
             if r.status_code == 200:
                 csv_text = r.text
@@ -502,7 +815,7 @@ def fetch_kite_live_candles(sym, key, token, interval="5m", days=2):
            f"?from={from_dt}&to={to_dt}")
 
     try:
-        r = requests.get(url, headers=_kite_headers(key, token), timeout=15)
+        r = KITE_SESSION.get(url, headers=_kite_headers(key, token), timeout=15)
         if r.status_code in [401, 403]:
             print(f"[KiteLive] Auth failed for {sym} — Yahoo fallback")
             ticker = inst.get("yahoo", "")
@@ -711,7 +1024,7 @@ def fetch_kite_instruments_nfo(key, token):
     if CACHE.fresh(cache_key, TTL["instruments"]):
         return CACHE.get_val(cache_key)
     try:
-        r = requests.get("https://api.kite.trade/instruments/NFO",
+        r = KITE_SESSION.get("https://api.kite.trade/instruments/NFO",
             headers=_kite_headers(key,token), timeout=30)
         if r.status_code in [401,403]:
             return None
@@ -729,7 +1042,7 @@ def fetch_kite_instruments_bfo(key, token):
     if CACHE.fresh(cache_key, TTL["instruments"]):
         return CACHE.get_val(cache_key)
     try:
-        r = requests.get("https://api.kite.trade/instruments/BFO",
+        r = KITE_SESSION.get("https://api.kite.trade/instruments/BFO",
             headers=_kite_headers(key,token), timeout=30)
         if r.status_code in [401,403]:
             return None
@@ -747,7 +1060,7 @@ def fetch_kite_instruments_mcx(key, token):
     if CACHE.fresh(cache_key, TTL["instruments"]):
         return CACHE.get_val(cache_key)
     try:
-        r = requests.get("https://api.kite.trade/instruments/MCX",
+        r = KITE_SESSION.get("https://api.kite.trade/instruments/MCX",
             headers=_kite_headers(key,token), timeout=30)
         if r.status_code in [401,403]:
             return None
@@ -1457,8 +1770,10 @@ def get_technicals(sym):
         CACHE.set(cache_key, tech)
         if d.get("candles"):
             CACHE.set(f"candles5_{sym}", d["candles"])
+            write_candles(sym, "5m", d["candles"])
         if d.get("candles_daily"):
             CACHE.set(f"candles1d_{sym}", d["candles_daily"])
+            write_candles(sym, "1d", d["candles_daily"])
         return tech
     return CACHE.get_val(cache_key) or {}
 
@@ -1484,7 +1799,7 @@ def resolve_mcx_front_month(sym, key, token):
         except Exception:
             pass  # malformed cache entry — fall through and re-resolve
 
-    r_inst = requests.get("https://api.kite.trade/instruments/MCX",
+    r_inst = KITE_SESSION.get("https://api.kite.trade/instruments/MCX",
         headers=_kite_headers(key, token), timeout=10)
     if r_inst.status_code != 200:
         return None
@@ -1578,7 +1893,7 @@ def get_all_prices(key, token):
             mcx_kite_sym = resolve_mcx_front_month(sym, key, token)
 
             if mcx_kite_sym:
-                r_q = requests.get("https://api.kite.trade/quote",
+                r_q = KITE_SESSION.get("https://api.kite.trade/quote",
                     params={"i": mcx_kite_sym},
                     headers=_kite_headers(key, token), timeout=8)
                 if r_q.status_code == 200:
@@ -1715,7 +2030,7 @@ def get_oi(sym, key, token, spot=0):
                 kite_sym = INSTRUMENTS.get(sym,{}).get("kite","")
 
             if kite_sym:
-                r = requests.get("https://api.kite.trade/quote",
+                r = KITE_SESSION.get("https://api.kite.trade/quote",
                     params={"i": kite_sym}, headers=hdrs, timeout=10)
                 if r.status_code in [401,403]:
                     print(f"[OI] Auth failed for {sym} — token expired?")
@@ -1841,7 +2156,7 @@ def get_oi(sym, key, token, spot=0):
         for batch_start in range(0, len(syms), 100):
             batch = syms[batch_start:batch_start+100]
             try:
-                rb = requests.get("https://api.kite.trade/quote",
+                rb = KITE_SESSION.get("https://api.kite.trade/quote",
                     params=[("i",s) for s in batch], headers=hdrs, timeout=15)
                 if rb.status_code in [401,403]:
                     return best_effort_cache("auth failed 401/403 on batch quote")
@@ -1995,6 +2310,8 @@ def get_oi(sym, key, token, spot=0):
                 iv_est = min(iv_est, 80)  # cap at realistic max
         except Exception as iv_err:
             print(f"[OI] IV calc error: {iv_err}")
+
+        write_oi_chain(sym, best_exp, atm, spot, strikes_data)
 
         result = {
             "ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,
@@ -2499,8 +2816,7 @@ def debug_orb(sym):
     Shows exactly what timestamps Kite returns and whether ORB window is found.
     """
     sym = sym.upper()
-    key   = request.args.get("key","")   or CACHE.get_val("_kite_key")   or ""
-    token = request.args.get("token","") or CACHE.get_val("_kite_token") or ""
+    key, token = _creds()
     if key and token:
         CACHE.set("_kite_key", key)
         CACHE.set("_kite_token", token)
@@ -2583,8 +2899,7 @@ def usdinr():
 @app.route("/lot_sizes")
 def lot_sizes():
     """Get current lot sizes from Zerodha NFO instruments CSV."""
-    key   = request.args.get("key","")
-    token = request.args.get("token","")
+    key, token = _creds()
 
     # Fallback lot sizes — updated to current SEBI values (Nov 2024 revision)
     # NIFTY: 75 → 65, BANKNIFTY: 30 → 35, FINNIFTY: 40 → 65, SENSEX: 20 → 20
@@ -2646,8 +2961,7 @@ def hero():
     Ultra-fast hero data — NIFTY + BANKNIFTY only.
     Target: <1 second. Called first, independently of /market.
     """
-    key   = request.args.get("key","")
-    token = request.args.get("token","")
+    key, token = _creds()
     t0    = time.time()
 
     # Check cache first
@@ -2664,7 +2978,7 @@ def hero():
                    "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
         params_h = [("i", v) for v in indices.values()]
         try:
-            r = requests.get("https://api.kite.trade/quote", params=params_h, headers=hdrs, timeout=8)
+            r = KITE_SESSION.get("https://api.kite.trade/quote", params=params_h, headers=hdrs, timeout=8)
             if r.status_code == 200:
                 data = r.json().get("data",{})
                 result = {}
@@ -2684,8 +2998,7 @@ def hero():
 @app.route("/debug_market")
 def debug_market():
     """Shows exactly what /market sees — use to diagnose issues."""
-    key   = request.args.get("key","")
-    token = request.args.get("token","")
+    key, token = _creds()
     
     result = {"time": ist_str(), "key_provided": bool(key), "token_provided": bool(token)}
     
@@ -2714,8 +3027,7 @@ def debug_market():
 @app.route("/prices")
 def prices_only():
     """Ultra-fast prices-only endpoint. No technicals. ~2s response."""
-    key   = request.args.get("key","")
-    token = request.args.get("token","")
+    key, token = _creds()
     prices = get_all_prices(key, token)
     if not prices:
         return jsonify({"ok":False,"error":"No price data"}),503
@@ -2729,8 +3041,7 @@ def market():
     Never blocks on Yahoo — uses cached technicals if available, skips if not.
     Technicals are populated by background warmup and /smc calls.
     """
-    key   = request.args.get("key","")
-    token = request.args.get("token","")
+    key, token = _creds()
 
     # Cache credentials — stored for entire server lifetime (no TTL on CACHE.set)
     # This ensures /smc calls after this point can use Kite candles
@@ -2770,49 +3081,79 @@ def market():
                 "breakdown":  tech.get("breakdown",False),
                 "above_sma20":tech.get("above_sma20"),
             }
-            if not inst.get("mcx"):
-                # ── 15D trend + PDH/PDL + CPR + VWAP — NSE/BSE only ──
-                d["trend15"]         = tech.get("trend15","UNKNOWN")
-                d["trend_strength"]  = tech.get("trend_strength",0)
-                d["trend_up_count"]  = tech.get("trend_up_count",0)
-                d["trend_sessions"]  = tech.get("trend_sessions",0)
-                d["avg_range_pct"]   = tech.get("avg_range_pct",0)
-                d["hh_hl"]           = tech.get("hh_hl",False)
-                d["lh_ll"]           = tech.get("lh_ll",False)
-                d["prev_day_high"]   = tech.get("prev_day_high",0)
-                d["prev_day_low"]    = tech.get("prev_day_low",0)
-                d["prev_close"]      = tech.get("prev_close",0)
-                pdh = tech.get("prev_day_high",0)
-                pdl = tech.get("prev_day_low",0)
-                pdc = tech.get("prev_close",0)
-                if pdh and pdl and pdc:
-                    pivot = (pdh+pdl+pdc)/3
-                    tc    = (pdh+pdl)/2
-                    bc    = 2*pivot - tc
-                    width = round(abs(tc-bc)/pivot*100,3) if pivot else 0
-                    d["cpr"] = {
-                        "pivot": round(pivot,2), "tc": round(tc,2), "bc": round(bc,2),
-                        "type": "NARROW" if width<0.3 else "WIDE",
-                        "width_pct": width,
-                        "bias": "BULLISH" if pdc>pivot else "BEARISH"
-                    }
-                px  = d.get("px",0) or 0
-                hi  = d.get("high",0) or 0
-                lo  = d.get("low",0) or 0
-                if px and hi and lo:
-                    op  = d.get("open",0) or px
-                    d["vwap"] = round((op+hi+lo+px)/4, 2)
-                    d["above_vwap"] = px > d["vwap"]
-                # ORB from technicals (computed in get_technicals for all symbols)
-                if tech.get("orb"):
-                    d["orb"] = tech["orb"]
-                # SMC from technicals (same all-symbols fix as ORB).
-                # Trim redundant aliases (orderBlocks/fvgZones duplicate ob/fvg)
-                # to keep the 55-symbol market payload lean.
-                if tech.get("smc"):
-                    _smc = tech["smc"]
-                    d["smc"] = {k:v for k,v in _smc.items()
-                                if k not in ("orderBlocks","fvgZones")}
+            # FIX (commodity signals): this whole block — trend15, PDH/PDL, CPR,
+            # VWAP, ORB, and SMC — used to be wrapped in `if not inst.get("mcx")`,
+            # so it silently never ran for CRUDEOIL/GOLD/SILVER/NATURALGAS. But
+            # get_technicals() above computes ALL of this for MCX from the exact
+            # same candle pipeline as NSE/BSE (see the mcx_scale conversion loop
+            # in get_technicals) — the data already exists in `tech`, it was just
+            # being thrown away here before reaching the client.
+            #
+            # Downstream effect this caused: the client scoring engine treats a
+            # missing vwap/orb/smc/cpr as "this layer doesn't apply" (vwap>0
+            # checks fail, orb/smc objects are undefined) rather than "this
+            # layer is genuinely absent" — so for MCX, 4 of the 5 independent-
+            # layer categories (price action, SMC structure, and effectively
+            # regime, since regime derivation also leans on vwap/trend15) were
+            # PERMANENTLY zero. Only the OI category is meant to be zero for
+            # MCX (that exclusion is intentional and stays — see OI_MCX). With
+            # price/SMC/ORB also gone, bullLayers/bearLayers could basically
+            # never exceed 1, which hard-caps confidence at 74% and locks
+            # urgency at LOW forever (urg requires conf>=75 or layers>=2) — so
+            # commodity signals weren't weak, they were structurally silenced.
+            #
+            # OI itself stays excluded for MCX (client still gates that on
+            # !isMCX) — this fix only restores the price-action layers, which
+            # have no NSE-specific dependency at all.
+            d["trend15"]         = tech.get("trend15","UNKNOWN")
+            d["trend_strength"]  = tech.get("trend_strength",0)
+            d["trend_up_count"]  = tech.get("trend_up_count",0)
+            d["trend_sessions"]  = tech.get("trend_sessions",0)
+            d["avg_range_pct"]   = tech.get("avg_range_pct",0)
+            d["hh_hl"]           = tech.get("hh_hl",False)
+            d["lh_ll"]           = tech.get("lh_ll",False)
+            d["prev_day_high"]   = tech.get("prev_day_high",0)
+            d["prev_day_low"]    = tech.get("prev_day_low",0)
+            d["prev_close"]      = tech.get("prev_close",0)
+            pdh = tech.get("prev_day_high",0)
+            pdl = tech.get("prev_day_low",0)
+            pdc = tech.get("prev_close",0)
+            if pdh and pdl and pdc:
+                pivot = (pdh+pdl+pdc)/3
+                tc    = (pdh+pdl)/2
+                bc    = 2*pivot - tc
+                width = round(abs(tc-bc)/pivot*100,3) if pivot else 0
+                d["cpr"] = {
+                    "pivot": round(pivot,2), "tc": round(tc,2), "bc": round(bc,2),
+                    "type": "NARROW" if width<0.3 else "WIDE",
+                    "width_pct": width,
+                    "bias": "BULLISH" if pdc>pivot else "BEARISH"
+                }
+            px  = d.get("px",0) or 0
+            # FIX: MCX price entries use short keys "h"/"l" (see the MCX fetch
+            # loop above) and never carry "open" at all — only NSE/BSE entries
+            # use "high"/"low"/"open". Without these fallbacks, hi/lo silently
+            # evaluated to 0 for every commodity and the VWAP block below never
+            # ran even after un-gating it. tech's own high/low/open (computed
+            # from real candles, INR-scaled for MCX) is the fallback for open
+            # specifically, since no live "open" exists anywhere in the raw
+            # MCX price dict.
+            hi  = d.get("high",0) or d.get("h",0) or 0
+            lo  = d.get("low",0)  or d.get("l",0) or 0
+            if px and hi and lo:
+                op  = d.get("open",0) or tech.get("open",0) or px
+                d["vwap"] = round((op+hi+lo+px)/4, 2)
+                d["above_vwap"] = px > d["vwap"]
+            # ORB from technicals (computed in get_technicals for all symbols)
+            if tech.get("orb"):
+                d["orb"] = tech["orb"]
+            # SMC from technicals (same all-symbols fix as ORB).
+            # Trim redundant aliases (orderBlocks/fvgZones duplicate ob/fvg)
+            # to keep the 55-symbol market payload lean.
+            if tech.get("smc"):
+                _smc = tech["smc"]
+                d["smc"] = {k:v for k,v in _smc.items()
+                            if k not in ("orderBlocks","fvgZones")}
             # Merge cached stock OI — liquid stocks (5-min) AND extended stocks (15-min)
             if sym in OI_STOCKS or sym in OI_STOCKS_EXT:
                 oi_data = CACHE.get_val(f"oi_{sym}")
@@ -2851,23 +3192,175 @@ def market():
                     "time":now_ist().strftime("%H:%M:%S"),
                     "cached_age_s": int(CACHE.age("all_prices") or 0)})
 
+def _poll_fill_price(order_id, hdrs, tries=6, delay=0.7):
+    """
+    Read back the average fill price of a just-placed MARKET order.
+    Kite fills market orders in well under a second, but the order history can
+    lag briefly, so we poll a few times. Returns float or None.
+    """
+    for _ in range(tries):
+        try:
+            r = KITE_SESSION.get(f"https://api.kite.trade/orders/{order_id}",
+                             headers=hdrs, timeout=10)
+            j = r.json()
+            if j.get("status") == "success":
+                legs = j.get("data") or []
+                if legs:
+                    last = legs[-1]
+                    avg  = float(last.get("average_price") or 0)
+                    st   = (last.get("status") or "").upper()
+                    if st == "COMPLETE" and avg > 0:
+                        return avg
+                    if st in ("REJECTED","CANCELLED"):
+                        return None
+        except Exception:
+            pass
+        time.sleep(delay)
+    return None
+
+
+@app.route("/exit_order", methods=["POST"])
+def exit_order():
+    """
+    Square off an open option position at market, and cancel its resting stop.
+    The app previously had no exit path of any kind — this is it.
+
+    Body: sym, strike, option_type, qty, key, token,
+          [product=MIS], [cancel_order_id] (the SL-M order to pull first)
+    """
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
+    try:
+        data = request.get_json(force=True) or {}
+        sym    = data.get("sym","").upper()
+        strike = int(data.get("strike",0))
+        opt    = data.get("option_type","CE").upper()
+        qty    = int(data.get("qty",0))
+        product= (data.get("product","MIS") or "MIS").upper()
+        cancel_id = data.get("cancel_order_id","")
+        key, token = _creds_strict(data)
+
+        if not key or not token:
+            return jsonify({"ok":False,"error":"Missing Kite credentials"}),401
+        if not sym or not strike or not qty:
+            return jsonify({"ok":False,"error":"Need sym, strike and qty"}),400
+
+        hdrs = _kite_headers(key, token)
+
+        # Pull the resting stop first, otherwise it becomes a naked short once
+        # the long leg is gone.
+        cancelled = False
+        if cancel_id:
+            try:
+                rc = KITE_SESSION.delete(f"https://api.kite.trade/orders/regular/{cancel_id}",
+                                     headers=hdrs, timeout=10)
+                cancelled = (rc.status_code == 200)
+            except Exception:
+                cancelled = False
+
+        if sym == "SENSEX":
+            csv = fetch_kite_instruments_bfo(key, token); exchange = "BFO"
+        elif sym in OI_MCX:
+            csv = fetch_kite_instruments_mcx(key, token); exchange = "MCX"
+        else:
+            csv = fetch_kite_instruments_nfo(key, token); exchange = "NFO"
+        if not csv:
+            return jsonify({"ok":False,"error":"Could not fetch instruments"})
+
+        today_n = datetime.now(IST).replace(tzinfo=None)
+        best_exp = None; best_days = 999
+        for line in csv.strip().split("\n")[1:]:
+            cols = line.split(",")
+            if len(cols)<10 or not cols[2].startswith(sym): continue
+            if cols[9] not in ["CE","PE"]: continue
+            try:
+                d2 = (datetime.strptime(cols[5],"%Y-%m-%d")-today_n).days
+                if 0<=d2<best_days: best_days=d2; best_exp=cols[5]
+            except: continue
+
+        tradingsymbol = None
+        for line in csv.strip().split("\n")[1:]:
+            cols = line.split(",")
+            if len(cols)<10 or not cols[2].startswith(sym): continue
+            if cols[9]!=opt or cols[5]!=best_exp: continue
+            try:
+                if int(float(cols[6]))==strike:
+                    tradingsymbol = cols[2]; break
+            except: continue
+        if not tradingsymbol:
+            return jsonify({"ok":False,"error":f"Tradingsymbol not found for {sym} {strike} {opt}"})
+
+        r = KITE_SESSION.post("https://api.kite.trade/orders/regular", headers=hdrs, timeout=15,
+            data={"tradingsymbol":tradingsymbol,"exchange":exchange,
+                  "transaction_type":"SELL","order_type":"MARKET",
+                  "quantity":qty,"product":product,"validity":"DAY"})
+        resp = r.json()
+        if r.status_code==200 and resp.get("status")=="success":
+            oid = resp.get("data",{}).get("order_id","")
+            print(f"[Exit ✅] {tradingsymbol} qty:{qty} order_id:{oid}")
+            return jsonify({"ok":True,"order_id":oid,"tradingsymbol":tradingsymbol,
+                            "stop_cancelled":cancelled})
+        return jsonify({"ok":False,"error":resp.get("message","Exit failed"),
+                        "stop_cancelled":cancelled})
+    except Exception as e:
+        print(f"[Exit] Exception: {e}")
+        return jsonify({"ok":False,"error":str(e)})
+
+
 @app.route("/place_order", methods=["POST"])
 def place_order():
-    """Place a real Zerodha order. Resolves correct tradingsymbol from instruments CSV."""
+    """
+    Place a real Zerodha order. Resolves correct tradingsymbol from instruments CSV.
+
+    TIER-0 HARDENING (see notes below):
+      1. Requires caller-supplied Kite credentials — no server-cache fallback.
+      2. Optional X-PT-Secret shared-secret gate.
+      3. Defaults to MIS (intraday, broker auto-square-off) instead of NRML.
+      4. Rejects naked option selling unless explicitly opted into, so a
+         directional signal can never be routed as a short option by accident.
+      5. Automatically attaches a protective SL-M stop leg on option buys.
+    """
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
     try:
         data = request.get_json(force=True) or {}
         sym   = data.get("sym","").upper()
         strike= int(data.get("strike",0))
         opt   = data.get("option_type","CE").upper()  # CE or PE
         action= data.get("action","BUY").upper()       # BUY or SELL
-        key   = data.get("key","") or CACHE.get_val("_kite_key") or ""
-        token = data.get("token","") or CACHE.get_val("_kite_token") or ""
+        key, token = _creds_strict(data)
         qty   = int(data.get("qty",0))
+        # Product: MIS = intraday with broker auto-square-off. This app is an
+        # intraday engine, so NRML (carry-forward, full margin, no auto exit)
+        # is the wrong default and was the previous behaviour.
+        product = (data.get("product","MIS") or "MIS").upper()
+        if product not in ("MIS","NRML"): product = "MIS"
+        # Protective stop on the option premium, as a % of the fill price.
+        # 0 or None disables the stop leg.
+        sl_pct  = float(data.get("sl_pct", 30) or 0)
+        allow_short = bool(data.get("allow_short", False))
 
         if not key or not token:
-            return jsonify({"ok":False,"error":"Not connected to Zerodha — reconnect first"})
+            return jsonify({"ok":False,"error":"Missing Kite credentials — send key/token in the request body or X-Kite-Key / X-Kite-Token headers"}),401
         if not sym or not strike:
             return jsonify({"ok":False,"error":"Missing symbol or strike"})
+        if action not in ("BUY","SELL"):
+            return jsonify({"ok":False,"error":f"Invalid action '{action}' — must be BUY or SELL"}),400
+        if opt not in ("CE","PE"):
+            return jsonify({"ok":False,"error":f"Invalid option_type '{opt}' — must be CE or PE"}),400
+
+        # ── DIRECTION SAFETY GATE ─────────────────────────────────────────────
+        # A SELL on a CE/PE opens a NAKED SHORT OPTION: undefined risk, large
+        # margin, and — critically — the OPPOSITE market view to the one a
+        # "buy a put" bear signal intends. The old client sent SELL for every
+        # bearish signal, which silently converted "buy 24000 PE" into "short
+        # 24000 PE" (a bullish position). Refuse unless explicitly requested.
+        if action == "SELL" and not allow_short:
+            return jsonify({"ok":False,
+                "error":("Refused: SELL on an option is a naked short (undefined risk) and is the "
+                         "opposite view to a directional signal. To express a BEARISH view, send "
+                         "action=BUY with option_type=PE. If you really intend to write options, "
+                         "resend with allow_short=true.")}),400
 
         hdrs = _kite_headers(key, token)
 
@@ -2921,34 +3414,78 @@ def place_order():
             return jsonify({"ok":False,"error":f"Tradingsymbol not found for {sym} {strike} {opt} exp:{best_exp}"})
 
         # Step 2: Default lot size if not provided
-        default_lots = {"NIFTY":65,"BANKNIFTY":35,"FINNIFTY":65,"SENSEX":20,
+        # Fallback only — the client normally sends qty from /lot_sizes, which
+        # reads live lot sizes from the Zerodha NFO CSV. NIFTY was stale at 65.
+        default_lots = {"NIFTY":75,"BANKNIFTY":35,"FINNIFTY":65,"SENSEX":20,
                         "CRUDEOIL":100,"GOLD":100,"SILVER":30,"NATURALGAS":1250}
         if not qty:
             qty = default_lots.get(sym, 50)
 
-        # Step 3: Place order via Kite
+        # Step 3: Place entry order via Kite
         order_payload = {
             "tradingsymbol": tradingsymbol,
             "exchange": exchange,
             "transaction_type": action,
             "order_type": "MARKET",
             "quantity": qty,
-            "product": "NRML",
+            "product": product,
             "validity": "DAY"
         }
-        r = requests.post("https://api.kite.trade/orders/regular",
+        r = KITE_SESSION.post("https://api.kite.trade/orders/regular",
             data=order_payload, headers=hdrs, timeout=15)
         resp = r.json()
 
-        if r.status_code == 200 and resp.get("status") == "success":
-            order_id = resp.get("data",{}).get("order_id","")
-            print(f"[Order ✅] {action} {tradingsymbol} qty:{qty} order_id:{order_id}")
-            return jsonify({"ok":True,"order_id":order_id,"tradingsymbol":tradingsymbol,
-                           "exchange":exchange,"qty":qty,"expiry":best_exp})
-        else:
+        if not (r.status_code == 200 and resp.get("status") == "success"):
             err = resp.get("message","Unknown error")
             print(f"[Order ❌] {tradingsymbol}: {err}")
             return jsonify({"ok":False,"error":err,"tradingsymbol":tradingsymbol})
+
+        order_id = resp.get("data",{}).get("order_id","")
+        print(f"[Order ✅] {action} {tradingsymbol} qty:{qty} product:{product} order_id:{order_id}")
+
+        # ── Step 4: PROTECTIVE STOP LEG ───────────────────────────────────────
+        # Previously the app placed entries and never placed any exit at all —
+        # live positions sat in the market with no stop attached. We now read
+        # back the actual fill price and put a real SL-M order on the exchange.
+        stop = {"placed": False, "reason": "", "order_id": "", "trigger": 0}
+        if action == "BUY" and sl_pct > 0:
+            fill_px = _poll_fill_price(order_id, hdrs)
+            if not fill_px:
+                stop["reason"] = "Could not read fill price — NO STOP IS ATTACHED, exit manually"
+            else:
+                trigger = round(fill_px * (1 - sl_pct/100.0), 1)
+                if trigger < 0.05:
+                    stop["reason"] = "Computed trigger below tick size — no stop placed"
+                else:
+                    sl_payload = {
+                        "tradingsymbol": tradingsymbol,
+                        "exchange": exchange,
+                        "transaction_type": "SELL",   # exiting a long option
+                        "order_type": "SL-M",
+                        "quantity": qty,
+                        "product": product,
+                        "validity": "DAY",
+                        "trigger_price": trigger
+                    }
+                    try:
+                        r2 = KITE_SESSION.post("https://api.kite.trade/orders/regular",
+                            data=sl_payload, headers=hdrs, timeout=15)
+                        d2 = r2.json()
+                        if r2.status_code == 200 and d2.get("status") == "success":
+                            stop = {"placed": True, "reason": "",
+                                    "order_id": d2.get("data",{}).get("order_id",""),
+                                    "trigger": trigger, "fill_px": fill_px}
+                            print(f"[Stop ✅] SL-M {tradingsymbol} trigger:{trigger} (fill {fill_px})")
+                        else:
+                            stop["reason"] = d2.get("message","SL order rejected")
+                            print(f"[Stop ❌] {tradingsymbol}: {stop['reason']}")
+                    except Exception as se:
+                        stop["reason"] = str(se)
+                        print(f"[Stop ❌] {tradingsymbol}: {se}")
+
+        return jsonify({"ok":True,"order_id":order_id,"tradingsymbol":tradingsymbol,
+                       "exchange":exchange,"qty":qty,"expiry":best_exp,
+                       "product":product,"action":action,"stop":stop})
 
     except Exception as e:
         print(f"[Order] Exception: {e}")
@@ -2988,8 +3525,7 @@ def oi_debug():
 def zerodha_oi():
     """Live OI from Zerodha — ATM ±10 strikes. Works for indices AND stocks."""
     sym   = request.args.get("sym","NIFTY").upper()
-    key   = request.args.get("key","")
-    token = request.args.get("token","")
+    key, token = _creds()
 
     if sym not in OI_ALL:
         return jsonify({"ok":False,"error":f"{sym} not in F&O list"}),400
@@ -3033,8 +3569,7 @@ def smc_route(sym):
         return jsonify({"ok":False,"error":"Unknown symbol"}),400
     # Accept and cache Kite credentials if passed — allows /smc to use Kite
     # without depending on /market having been called first this session.
-    key   = request.args.get("key","")
-    token = request.args.get("token","")
+    key, token = _creds()
     if key and token:
         CACHE.set("_kite_key",   key)
         CACHE.set("_kite_token", token)
@@ -3066,8 +3601,7 @@ def mtf_route(sym):
 def full_route(sym):
     """Full analysis: price + technicals + OI + SMC + CPR."""
     sym   = sym.upper()
-    key   = request.args.get("key","")
-    token = request.args.get("token","")
+    key, token = _creds()
     if sym not in INSTRUMENTS:
         return jsonify({"ok":False,"error":"Unknown"}),400
 
@@ -3106,7 +3640,7 @@ def kite_token():
     checksum = hashlib.sha256(f"{api_key}{req_token}{api_secret}".encode()).hexdigest()
 
     try:
-        r = requests.post("https://api.kite.trade/session/token",
+        r = KITE_SESSION.post("https://api.kite.trade/session/token",
             headers={"X-Kite-Version":"3","User-Agent":"Mozilla/5.0"},
             data={"api_key":api_key,"request_token":req_token,"checksum":checksum},
             timeout=15)
@@ -3130,27 +3664,26 @@ def kite_token():
 
 def test_kite():
     """Diagnose Zerodha connection — open in browser to check."""
-    key   = request.args.get("key","")
-    token = request.args.get("token","")
+    key, token = _creds()
     if not key or not token:
         return jsonify({"error":"Pass ?key=YOUR_API_KEY&token=YOUR_ACCESS_TOKEN"})
     hdrs = _kite_headers(key,token)
     result = {"key_provided":bool(key),"token_provided":bool(token)}
     try:
         # Test 1: Profile
-        r1 = requests.get("https://api.kite.trade/user/profile",headers=hdrs,timeout=10)
+        r1 = KITE_SESSION.get("https://api.kite.trade/user/profile",headers=hdrs,timeout=10)
         result["profile_status"] = r1.status_code
         result["profile_ok"] = r1.status_code==200
         result["profile_response"] = r1.json() if r1.status_code!=200 else {"name": r1.json().get("data",{}).get("user_name","")}
 
         # Test 2: Spot price
-        r2 = requests.get("https://api.kite.trade/quote?i=NSE%3ANIFTY+50",headers=hdrs,timeout=10)
+        r2 = KITE_SESSION.get("https://api.kite.trade/quote?i=NSE%3ANIFTY+50",headers=hdrs,timeout=10)
         result["quote_status"] = r2.status_code
         result["quote_ok"] = r2.status_code==200
         result["quote_response"] = r2.json() if r2.status_code!=200 else {"price": list(r2.json().get("data",{}).values())[0].get("last_price",0) if r2.json().get("data") else 0}
 
         # Test 3: NFO instruments (just count lines)
-        r3 = requests.get("https://api.kite.trade/instruments/NFO",headers=hdrs,timeout=20)
+        r3 = KITE_SESSION.get("https://api.kite.trade/instruments/NFO",headers=hdrs,timeout=20)
         result["instruments_status"] = r3.status_code
         result["instruments_ok"] = r3.status_code==200
         if r3.status_code==200:
@@ -3334,7 +3867,7 @@ def _bt_kite_candles(sym, key, api_token, days=60, interval="5minute"):
            f"?from={from_dt}&to={to_dt}")
 
     try:
-        r = requests.get(url, headers=_kite_headers(key, api_token), timeout=30)
+        r = KITE_SESSION.get(url, headers=_kite_headers(key, api_token), timeout=30)
         if r.status_code in [401, 403]:
             print(f"[BT] Kite auth failed for {sym} — token expired?")
             return []
@@ -3965,6 +4498,7 @@ def _bt_run_job(job_id, params):
             "signals":    sorted(signals_all, key=lambda s:s["date"]+s["time"])[-300:],
         }
         _bt_jobs[job_id].update({"status":"done","progress":100,"message":"Complete","result":result})
+        write_backtest_result(job_id, params, result)
     except Exception as e:
         import traceback
         _bt_jobs[job_id].update({"status":"error","message":str(e),"trace":traceback.format_exc()})
