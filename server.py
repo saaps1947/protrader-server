@@ -557,6 +557,12 @@ def ingest_signal():
             return jsonify({"ok": False, "error": "missing sym or bias"}), 400
         source = sig.pop("_source", "worker")
         write_signal(sig, fired=True, source=source)
+        # Was completely silent on success — meant no real-time confirmation
+        # anywhere that a signal write actually happened, only discoverable
+        # later via a separate SQL query. Now visible immediately in
+        # Render's own logs, the moment it fires.
+        print(f"[Signal ✅] {sig.get('sym')} {sig.get('bias')} {sig.get('urgency')} "
+              f"{sig.get('confidence')}% from {source}")
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
