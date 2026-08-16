@@ -538,6 +538,16 @@ INSTRUMENTS = {
     "BEL":        {"kite":"NSE:BEL",       "yahoo":"BEL.NS",       "step":5,  "sector":"DEFENCE"},
     "INDIGO":     {"kite":"NSE:INDIGO",    "yahoo":"INDIGO.NS",    "step":50, "sector":"AVIATION"},
     "HAL":        {"kite":"NSE:HAL",       "yahoo":"HAL.NS",       "step":100,"sector":"DEFENCE"},
+    # Exchange operators — real NSE-listed equities (BSE Ltd, MCX Ltd), not
+    # to be confused with the "mcx" boolean flag used elsewhere for MCX
+    # commodity contracts (CRUDEOIL/GOLD/SILVER/NATURALGAS). Deliberately no
+    # "mcx" key here, same as every other NSE stock — that flag is only ever
+    # set on the actual commodity entries. step:50 matches what both the
+    # server's own get_oi() fallback (default 50) and the client's price-
+    # tiered fallback (>1000 -> 50) would already produce for this price
+    # range — not a fresh guess, both existing safety nets agree.
+    "BSE":        {"kite":"NSE:BSE",       "yahoo":"BSE.NS",       "step":50, "sector":"EXCHANGE"},
+    "MCX":        {"kite":"NSE:MCX",       "yahoo":"MCX.NS",       "step":50, "sector":"EXCHANGE"},
 }
 
 OI_INDICES = {"NIFTY","BANKNIFTY","FINNIFTY","SENSEX"}  # Index option chains
@@ -560,6 +570,8 @@ OI_STOCKS = {
     "LT","ADANIPORTS",
     # Telecom
     "BHARTIARTL",
+    # Exchange operators — heavily traded, added on request
+    "BSE","MCX",
 }
 
 # Extended Nifty50 stocks — OI fetched every 15 min (less liquid options)
@@ -3542,7 +3554,11 @@ def place_order():
         # Fallback only — the client normally sends qty from /lot_sizes, which
         # reads live lot sizes from the Zerodha NFO CSV. NIFTY was stale at 65.
         default_lots = {"NIFTY":75,"BANKNIFTY":35,"FINNIFTY":65,"SENSEX":20,
-                        "CRUDEOIL":100,"GOLD":100,"SILVER":30,"NATURALGAS":1250}
+                        "CRUDEOIL":100,"GOLD":100,"SILVER":30,"NATURALGAS":1250,
+                        "BSE":200}  # confirmed. MCX Ltd deliberately omitted — lot
+                        # size figures I found for it weren't confident enough to
+                        # hardcode; falls back to the generic 50 default below
+                        # only if the live lookup ever fails, same as before.
         if not qty:
             qty = default_lots.get(sym, 50)
 
@@ -3992,22 +4008,40 @@ def _backfill_run_job(job_id):
                     "sym": sym, "bars": len(bars), "written": written,
                     "mcx_limited": is_mcx,
                 })
+                # FIX: previously the per-symbol failure reason only lived in
+                # this in-memory results list, retrievable only via
+                # /backfill_status/<job_id> — useless once the job_id isn't
+                # in hand anymore (e.g. triggered from the phone button,
+                # which doesn't surface it prominently) or the process has
+                # restarted since. Now every outcome prints straight to
+                # Render's logs as it happens — the actual reason is always
+                # right there, no job_id needed.
+                if written == 0:
+                    print(f"[Backfill] {sym}: fetched {len(bars)} bars but wrote 0 "
+                          f"— {'expected for MCX (Yahoo fallback only)' if is_mcx else 'unexpected, worth checking Supabase connectivity'}")
             except Exception as e:
                 _backfill_jobs[job_id]["results"].append({
                     "sym": sym, "bars": 0, "written": 0, "error": str(e),
                 })
+                print(f"[Backfill] {sym}: FAILED — {e}")
             _backfill_jobs[job_id]["done"] = i + 1
             time.sleep(1)  # pace requests — avoid Zerodha's rate limit on rapid historical calls
 
         results = _backfill_jobs[job_id]["results"]
         total_bars = sum(r.get("written", 0) for r in results)
-        failed = [r["sym"] for r in results if r.get("error") or r.get("written", 0) == 0]
+        failed = [r for r in results if r.get("error") or r.get("written", 0) == 0]
+        real_failures = [r for r in failed if not r.get("mcx_limited")]
         _backfill_jobs[job_id].update({
             "status": "done", "progress": 100,
             "message": f"Complete — {total_bars} candles written across {total} symbols"
-                       + (f", {len(failed)} symbols got nothing" if failed else ""),
+                       + (f", {len(real_failures)} unexpected failures (MCX shortfall excluded)" if real_failures else ""),
         })
-        print(f"[Backfill] Done: {total_bars} candles, {len(failed)} symbols failed: {failed}")
+        # Distinguish "expected MCX shortfall" from "genuinely failed, worth
+        # investigating" right in the summary — a wall of symbol names with
+        # no reason attached (the old behaviour) isn't actionable on its own.
+        fail_detail = ", ".join(f"{r['sym']} ({r.get('error','wrote 0 bars')})" for r in real_failures)
+        print(f"[Backfill] Done: {total_bars} candles across {total} symbols. "
+              f"Real failures: {fail_detail or 'none'}")
     except Exception as e:
         _backfill_jobs[job_id] = {"status": "error", "progress": 0, "message": str(e)}
         print(f"[Backfill] Job {job_id} crashed: {e}")
