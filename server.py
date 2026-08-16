@@ -150,6 +150,102 @@ def last_session_signals():
     return jsonify({"ok": True, "signals": get_last_session_signals()})
 
 
+def _normalize_setup_key_for_backtest(live_setup_key: str):
+    """
+    The backtest's setup_key taxonomy is NOT identical to the live engine's —
+    see _bt_setup_key()'s own docstring. It never includes "OI" (no reliable
+    intraday OI history when that function was written), and uses "ORB"
+    where live uses "Structure"/"CHoCH". A live setup_key like
+    "OI+Price+Momentum+CHoCH+Regime" cannot exist verbatim in backtest data —
+    an exact-string match would silently fail for most real signals.
+
+    This strips what the backtest can't produce and maps live's structure
+    tag onto its closest backtest proxy, so an approximate match is still
+    possible. Callers must treat this as a DIFFERENT, LABELED tier from an
+    exact match — never present it as the same setup, since it isn't.
+    Returns None if nothing meaningful survives the strip (backtest has no
+    equivalent at all for this setup).
+    """
+    parts = (live_setup_key or "").split("+")
+    mapped = set()
+    for p in parts:
+        if p == "OI": continue          # backtest never produces this
+        if p in ("CHoCH", "Structure"): mapped.add("ORB"); continue
+        if p in ("Price", "Momentum", "Regime"): mapped.add(p); continue
+        # "Unconfirmed" or anything else unrecognized — skip
+    order = ["Price", "Momentum", "ORB", "Regime"]
+    normalized = [p for p in order if p in mapped]
+    return "+".join(normalized) if normalized else None
+
+
+def get_setup_winrate(setup_key: str, regime: str = ""):
+    """
+    Historical win-rate lookup for the "confidence" badge on new signal
+    cards — reads the by_setup/by_setup_regime breakdown from the most
+    recent completed backtest run in Supabase. A fast read, not a live
+    simulation — running a full backtest per new signal would be far too
+    slow for real-time scanning.
+
+    Tries progressively looser matches, always labeling which tier matched:
+      1. setup_key + regime, EXACT match — most specific, most trustworthy
+      2. setup_key alone, EXACT match
+      3. normalized (backtest-compatible) setup_key — approximate, labeled
+    Returns available=False rather than guessing when nothing reasonable
+    matches — a missing badge is honest; a misleading one isn't.
+    """
+    if not setup_key or not SB:
+        return {"ok": True, "available": False, "reason": "no_setup_key" if not setup_key else "supabase_not_configured"}
+    try:
+        r = (SB.table("backtest_runs")
+             .select("by_setup,by_setup_regime,created_at")
+             .order("created_at", desc=True)
+             .limit(1)
+             .execute())
+        rows = r.data or []
+        if not rows:
+            return {"ok": True, "available": False, "reason": "no_backtest_run_yet"}
+        run = rows[0]
+        by_setup = run.get("by_setup") or []
+        by_setup_regime = run.get("by_setup_regime") or []
+
+        def find(lst, key):
+            return next((x for x in lst if x.get("k") == key), None)
+
+        match, match_type = None, None
+        if regime:
+            match = find(by_setup_regime, setup_key + " / " + regime)
+            if match: match_type = "exact_setup_and_regime"
+        if not match:
+            match = find(by_setup, setup_key)
+            if match: match_type = "exact_setup"
+        if not match:
+            norm = _normalize_setup_key_for_backtest(setup_key)
+            if norm and norm != setup_key:
+                match = find(by_setup, norm)
+                if match: match_type = "approximate"
+
+        if not match:
+            return {"ok": True, "available": False, "reason": "no_historical_match",
+                    "backtest_date": run.get("created_at")}
+
+        return {
+            "ok": True, "available": True,
+            "win_rate": match.get("wr"), "n": match.get("n"),
+            "reliable": match.get("reliable"), "avg_pnl": match.get("avg"),
+            "match_type": match_type, "backtest_date": run.get("created_at"),
+        }
+    except Exception as e:
+        print(f"[Supabase] get_setup_winrate failed for {setup_key}: {e}")
+        return {"ok": False, "available": False, "error": str(e)}
+
+
+@app.route("/setup_winrate")
+def setup_winrate():
+    setup_key = request.args.get("setup_key", "")
+    regime = request.args.get("regime", "")
+    return jsonify(get_setup_winrate(setup_key, regime))
+
+
 def upsert_journal_entry(entry: dict):
     """
     Insert or update one journal/trade entry, keyed by its existing client-
@@ -4781,6 +4877,69 @@ def _bt_run_job(job_id, params):
         import traceback
         _bt_jobs[job_id].update({"status":"error","message":str(e),"trace":traceback.format_exc()})
         print(f"[BT] Job {job_id} failed: {e}")
+
+
+_last_auto_backtest_date = None  # tracks which trading day we last auto-ran
+
+def _bg_daily_backtest():
+    """
+    Runs the SAME backtest logic the manual "Run Backtest" button triggers
+    (_bt_run_job, identical defaults: 60 days, 82% min conf, all symbols),
+    automatically once per trading day shortly after NSE close. This is
+    what keeps the win-rate confidence badge on signal cards fresh without
+    needing you to remember to trigger it — every day gets a new
+    backtest_runs row in Supabase, referable later.
+
+    Deliberately NOT rewiring the candle source here — this still fetches
+    fresh from Zerodha's historical API each run, same as the manual
+    trigger always has. Migrating that to read from the Supabase candle
+    archive instead is a separate, larger change (removes the daily Zerodha
+    API load and the same-day Kite-token dependency below) — worth doing,
+    but scoped out of this change to keep it low-risk.
+
+    Known limitation: `_last_auto_backtest_date` is in-memory only, so a
+    server restart mid-day could reset it and trigger one redundant re-run
+    later that same day. Harmless (just a wasted ~5 min of Zerodha calls),
+    not worth the added complexity of a Supabase-backed check for something
+    this low-stakes.
+    """
+    global _last_auto_backtest_date
+    time.sleep(60)  # let the server finish booting before the first check
+    print("[AutoBacktest] Scheduler started — runs once daily after market close")
+    while True:
+        try:
+            now = datetime.now(IST)
+            today_str = now.strftime("%Y-%m-%d")
+            is_weekday = now.weekday() < 5
+            # 15:45 IST — NSE closes 15:30, small buffer for the day's final
+            # candles to actually be available via Kite's historical API.
+            past_close = (now.hour > 15) or (now.hour == 15 and now.minute >= 45)
+            already_ran_today = (_last_auto_backtest_date == today_str)
+
+            if is_weekday and past_close and not already_ran_today:
+                key = CACHE.get_val("_kite_key") or ""
+                token = CACHE.get_val("_kite_token") or ""
+                if not key or not token:
+                    print(f"[AutoBacktest] Skipping {today_str} — no cached Kite credentials "
+                          f"(phone hasn't connected today). Will retry on next check.")
+                else:
+                    print(f"[AutoBacktest] Starting scheduled run for {today_str}")
+                    job_id = str(_uuid.uuid4())[:8]
+                    _bt_jobs[job_id] = {"status":"running","progress":0,"message":"Starting…","result":None}
+                    _bt_run_job(job_id, {"days":60,"min_conf":82,"syms":"all"})
+                    _last_auto_backtest_date = today_str
+                    final_status = _bt_jobs.get(job_id,{}).get("status")
+                    print(f"[AutoBacktest] Run for {today_str} finished — status: {final_status}")
+
+            time.sleep(600)  # check every 10 min — cheap, no harm checking often
+        except Exception as e:
+            print(f"[AutoBacktest] Scheduler error: {e}")
+            time.sleep(600)
+
+
+_auto_backtest_thread = threading.Thread(target=_bg_daily_backtest, daemon=True)
+_auto_backtest_thread.start()
+
 
 @app.route("/backtest", methods=["POST"])
 def backtest_start():
