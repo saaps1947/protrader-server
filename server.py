@@ -178,6 +178,49 @@ def _normalize_setup_key_for_backtest(live_setup_key: str):
     return "+".join(normalized) if normalized else None
 
 
+def get_latest_backtest_summary():
+    """
+    Simple headline summary for the Backtest tab's default view — latest
+    run's key numbers plus a trend comparison against the previous run, so
+    "is my strategy improving or decaying" is answerable at a glance
+    without digging into the 13 detailed breakdown tabs.
+    """
+    if not SB:
+        return {"ok": True, "available": False, "reason": "supabase_not_configured"}
+    try:
+        r = (SB.table("backtest_runs")
+             .select("win_rate,closed,total,profit_factor,created_at")
+             .order("created_at", desc=True)
+             .limit(2)
+             .execute())
+        rows = r.data or []
+        if not rows:
+            return {"ok": True, "available": False, "reason": "no_backtest_run_yet"}
+        latest = rows[0]
+        prev = rows[1] if len(rows) > 1 else None
+        trend = None
+        if prev and prev.get("win_rate") is not None and latest.get("win_rate") is not None:
+            diff = latest["win_rate"] - prev["win_rate"]
+            trend = {"direction": "up" if diff > 0 else "down" if diff < 0 else "flat",
+                      "change": diff, "prev_win_rate": prev["win_rate"], "prev_date": prev.get("created_at")}
+        return {
+            "ok": True, "available": True,
+            "win_rate": latest.get("win_rate"), "closed": latest.get("closed"),
+            "total": latest.get("total"), "profit_factor": latest.get("profit_factor"),
+            "created_at": latest.get("created_at"),
+            "reliable": (latest.get("closed") or 0) >= 30,
+            "trend": trend,
+        }
+    except Exception as e:
+        print(f"[Supabase] get_latest_backtest_summary failed: {e}")
+        return {"ok": False, "available": False, "error": str(e)}
+
+
+@app.route("/latest_backtest_summary")
+def latest_backtest_summary():
+    return jsonify(get_latest_backtest_summary())
+
+
 def get_setup_winrate(setup_key: str, regime: str = ""):
     """
     Historical win-rate lookup for the "confidence" badge on new signal
