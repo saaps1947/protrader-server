@@ -186,26 +186,34 @@ def write_candles_bulk(sym: str, interval: str, bars: list):
     means a repeat backfill just re-upserts the same rows, not duplicates.
     """
     if not SB or not bars: return 0
-    try:
-        rows = [{
-            "sym": sym, "interval": interval, "t": b["t"],
-            "ts": datetime.fromtimestamp(b["t"], tz=IST).isoformat(),
-            "o": b.get("o"), "h": b.get("h"), "l": b.get("l"), "c": b.get("c"),
-            "v": b.get("v"),
-        } for b in bars]
-        # Batch in chunks — a 60-day/5-min backfill can be ~4600 rows for a
-        # single NSE symbol (60 days × ~78 bars/day), and sending that as
-        # one giant request risks a payload-size or timeout issue. 500 rows
-        # per call is comfortably small either way.
-        CHUNK = 500
-        written = 0
-        for i in range(0, len(rows), CHUNK):
-            SB.table("candles").upsert(rows[i:i+CHUNK], on_conflict="sym,interval,t").execute()
-            written += len(rows[i:i+CHUNK])
-        return written
-    except Exception as e:
-        print(f"[Supabase] write_candles_bulk failed for {sym} {interval}: {e}")
-        return 0
+    rows = [{
+        "sym": sym, "interval": interval, "t": b["t"],
+        "ts": datetime.fromtimestamp(b["t"], tz=IST).isoformat(),
+        "o": b.get("o"), "h": b.get("h"), "l": b.get("l"), "c": b.get("c"),
+        "v": b.get("v"),
+    } for b in bars]
+    # Batch in chunks — a 60-day/5-min backfill can be ~3200+ rows for a
+    # single NSE symbol, and sending that as one giant request risks a
+    # payload-size or timeout issue. 500 rows per call is comfortably small.
+    #
+    # FIX: this used to catch exceptions around the WHOLE chunk loop, so a
+    # failure on, say, chunk 7 of 7 discarded credit for chunks 1-6, which
+    # had already committed successfully to Supabase — reporting "wrote 0"
+    # for what was actually a mostly-successful write. Each chunk is now
+    # independent: a later failure doesn't erase earlier progress, and the
+    # specific failing chunk's error gets logged, not swallowed into a
+    # generic top-level exception message.
+    CHUNK = 500
+    written = 0
+    for i in range(0, len(rows), CHUNK):
+        chunk = rows[i:i+CHUNK]
+        try:
+            SB.table("candles").upsert(chunk, on_conflict="sym,interval,t").execute()
+            written += len(chunk)
+        except Exception as e:
+            print(f"[Supabase] write_candles_bulk: {sym} chunk {i}-{i+len(chunk)} "
+                  f"failed ({written} rows already written before this) — {e}")
+    return written
 
 
 def write_candles(sym: str, interval: str, bars: list):
