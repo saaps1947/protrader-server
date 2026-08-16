@@ -155,9 +155,40 @@ def upsert_journal_entry(entry: dict):
     Insert or update one journal/trade entry, keyed by its existing client-
     generated id — same id scheme as SIGNAL_LOG uses today, so this can sync
     both directions without inventing a second id system.
+
+    CROSS-INSTANCE DEDUP: the phone app and the always-on worker are two
+    separate browser instances, each with their own local SIGNAL_LOG and
+    dedup guards — neither knows what the other has already logged. Without
+    a check here, both could independently decide "this is a new trade" for
+    the same symbol+bias and each write their own row, corrupting the one
+    thing this whole pipeline exists to get right: an authoritative signal
+    history. This is the single place every write from any instance passes
+    through, so it's the only place a cross-instance check can actually work
+    without a much larger client-side refactor (the client's own
+    _writeJournal() is synchronous and used immediately by its callers —
+    making it async to pre-check Supabase first would mean touching every
+    call site, real risk for real headline gain).
+
+    Only checked for entry.get("status")=="OPEN" — a genuinely new position.
+    Status transitions (SL_HIT/T1_HIT/T2_HIT/MANUAL) update an EXISTING id
+    that's already the authoritative row, so they're never blocked here.
     """
     if not SB: return
     try:
+        if entry.get("status") == "OPEN":
+            existing = (SB.table("journal")
+                        .select("id,status")
+                        .eq("sym", entry.get("sym"))
+                        .eq("bias", entry.get("bias"))
+                        .in_("status", ["OPEN", "T1_HIT"])
+                        .execute())
+            dupes = [r for r in (existing.data or []) if r.get("id") != entry.get("id")]
+            if dupes:
+                print(f"[Supabase] Duplicate journal entry blocked: {entry.get('sym')} "
+                      f"{entry.get('bias')} already open as {dupes[0]['id']} "
+                      f"(a different instance sent {entry.get('id')}) — not creating a second live row")
+                return
+
         SB.table("journal").upsert({
             "id": entry.get("id"), "sym": entry.get("sym"), "bias": entry.get("bias"),
             "trade": entry.get("trade"), "strategy": entry.get("strategy"),
