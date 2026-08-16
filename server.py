@@ -100,6 +100,56 @@ def write_signal(sig: dict, fired: bool, source: str = "worker"):
         print(f"[Supabase] write_signal failed for {sig.get('sym')}: {e}")
 
 
+def get_last_session_signals(limit_symbols: int = 40):
+    """
+    Read-only: most recent signal per symbol, for display when the market
+    is closed and the live feed is empty. Returns [] on any failure or if
+    Supabase isn't configured — this must never block the app from loading.
+
+    Only HIGH/MEDIUM urgency — LOW-urgency signals aren't meaningful as a
+    "here's what was happening" reference and would just add noise.
+
+    Dedup to one-per-symbol happens here in Python rather than in the query
+    itself: PostgREST's fluent query builder (what supabase-py wraps) doesn't
+    expose SQL's DISTINCT ON, so the simplest correct approach is fetching a
+    reasonably large recent batch (already ordered newest-first) and keeping
+    only the first occurrence of each symbol.
+    """
+    if not SB: return []
+    try:
+        r = (SB.table("signals")
+             .select("sym,bias,confidence,urgency,entry_px,sl_px,t1_px,t2_px,rr,why,created_at,setup_key,regime")
+             .in_("urgency", ["HIGH", "MEDIUM"])
+             .order("created_at", desc=True)
+             .limit(300)
+             .execute())
+        rows = r.data or []
+        seen = set()
+        out = []
+        for row in rows:
+            sym = row.get("sym")
+            if not sym or sym in seen: continue
+            seen.add(sym)
+            out.append(row)
+            if len(out) >= limit_symbols: break
+        return out
+    except Exception as e:
+        print(f"[Supabase] get_last_session_signals failed: {e}")
+        return []
+
+
+@app.route("/last_session_signals")
+def last_session_signals():
+    """
+    Read-only endpoint for the closed-market reference view. Explicitly
+    NOT meant to be treated as live/tradeable data by the client — that
+    distinction is enforced client-side (separate render path from allSigs,
+    no execute action available on these cards), this endpoint just returns
+    whatever the most recent real signals were.
+    """
+    return jsonify({"ok": True, "signals": get_last_session_signals()})
+
+
 def upsert_journal_entry(entry: dict):
     """
     Insert or update one journal/trade entry, keyed by its existing client-
@@ -126,6 +176,36 @@ def upsert_journal_entry(entry: dict):
         }).execute()
     except Exception as e:
         print(f"[Supabase] upsert_journal_entry failed for {entry.get('id')}: {e}")
+
+
+def write_candles_bulk(sym: str, interval: str, bars: list):
+    """
+    One-shot bulk write for the 60-day backfill — writes the ENTIRE batch
+    given, unlike write_candles() which only sends the new tail since a
+    watermark. Safe to re-run: the (sym, interval, t) unique constraint
+    means a repeat backfill just re-upserts the same rows, not duplicates.
+    """
+    if not SB or not bars: return 0
+    try:
+        rows = [{
+            "sym": sym, "interval": interval, "t": b["t"],
+            "ts": datetime.fromtimestamp(b["t"], tz=IST).isoformat(),
+            "o": b.get("o"), "h": b.get("h"), "l": b.get("l"), "c": b.get("c"),
+            "v": b.get("v"),
+        } for b in bars]
+        # Batch in chunks — a 60-day/5-min backfill can be ~4600 rows for a
+        # single NSE symbol (60 days × ~78 bars/day), and sending that as
+        # one giant request risks a payload-size or timeout issue. 500 rows
+        # per call is comfortably small either way.
+        CHUNK = 500
+        written = 0
+        for i in range(0, len(rows), CHUNK):
+            SB.table("candles").upsert(rows[i:i+CHUNK], on_conflict="sym,interval,t").execute()
+            written += len(rows[i:i+CHUNK])
+        return written
+    except Exception as e:
+        print(f"[Supabase] write_candles_bulk failed for {sym} {interval}: {e}")
+        return 0
 
 
 def write_candles(sym: str, interval: str, bars: list):
@@ -3871,6 +3951,86 @@ print(f"[StockOI] Background thread started for {len(OI_STOCKS)} liquid F&O stoc
 # ═══════════════════════════════════════════════════════════════════
 import uuid as _uuid
 _bt_jobs = {}   # job_id → {status, progress, message, result}
+_backfill_jobs = {}   # job_id → {status, progress, message, done, total, results}
+
+
+def _backfill_run_job(job_id):
+    """
+    One-time (re-runnable) 60-day candle backfill across every tracked
+    symbol. Runs in a background thread — a full pass across ~58 symbols,
+    rate-limited, realistically takes a couple of minutes, too long for a
+    single blocking request.
+
+    Kite's per-request limit for 5-minute candles is 100 days (confirmed
+    against Zerodha's own developer forum) — 60 days fits in ONE call per
+    symbol, no pagination needed. Rate-limited to ~1 req/sec across symbols,
+    since Zerodha's historical API throttles rapid-fire requests across many
+    instruments.
+
+    MCX commodities are included but will NOT get a real 60-day backfill —
+    Kite's historical API doesn't cover MCX at all, so these fall back to
+    Yahoo, which only offers a ~2-day window. That's a real, known ceiling,
+    not a bug in this job — flagged clearly in the results so it's visible
+    rather than silently incomplete.
+    """
+    try:
+        key = CACHE.get_val("_kite_key") or ""
+        token = CACHE.get_val("_kite_token") or ""
+        syms = sorted(INSTRUMENTS.keys())
+        total = len(syms)
+        _backfill_jobs[job_id] = {"status": "running", "progress": 0,
+                                   "message": "Starting…", "done": 0, "total": total,
+                                   "results": []}
+        for i, sym in enumerate(syms):
+            is_mcx = INSTRUMENTS.get(sym, {}).get("mcx", False)
+            _backfill_jobs[job_id]["message"] = f"Fetching {sym} ({i+1}/{total})"
+            _backfill_jobs[job_id]["progress"] = round((i / total) * 100, 1)
+            try:
+                bars = fetch_kite_live_candles(sym, key, token, "5m", days=60)
+                written = write_candles_bulk(sym, "5m", bars)
+                _backfill_jobs[job_id]["results"].append({
+                    "sym": sym, "bars": len(bars), "written": written,
+                    "mcx_limited": is_mcx,
+                })
+            except Exception as e:
+                _backfill_jobs[job_id]["results"].append({
+                    "sym": sym, "bars": 0, "written": 0, "error": str(e),
+                })
+            _backfill_jobs[job_id]["done"] = i + 1
+            time.sleep(1)  # pace requests — avoid Zerodha's rate limit on rapid historical calls
+
+        results = _backfill_jobs[job_id]["results"]
+        total_bars = sum(r.get("written", 0) for r in results)
+        failed = [r["sym"] for r in results if r.get("error") or r.get("written", 0) == 0]
+        _backfill_jobs[job_id].update({
+            "status": "done", "progress": 100,
+            "message": f"Complete — {total_bars} candles written across {total} symbols"
+                       + (f", {len(failed)} symbols got nothing" if failed else ""),
+        })
+        print(f"[Backfill] Done: {total_bars} candles, {len(failed)} symbols failed: {failed}")
+    except Exception as e:
+        _backfill_jobs[job_id] = {"status": "error", "progress": 0, "message": str(e)}
+        print(f"[Backfill] Job {job_id} crashed: {e}")
+
+
+@app.route("/backfill_candles", methods=["POST"])
+def backfill_candles_start():
+    """Kick off the 60-day candle backfill. Returns immediately with a job_id
+    to poll — the actual fetch runs in a background thread."""
+    job_id = str(_uuid.uuid4())[:8]
+    t = threading.Thread(target=_backfill_run_job, args=(job_id,), daemon=True)
+    t.start()
+    return jsonify({"ok": True, "job_id": job_id})
+
+
+@app.route("/backfill_status/<job_id>")
+def backfill_status(job_id):
+    job = _backfill_jobs.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "error": "Unknown job_id"}), 404
+    return jsonify({"ok": True, **job})
+
+
 
 def _bt_fetch_candles(ticker, interval="5m", days=61):
     """Fetch historical OHLCV using proven fetch_yahoo_candles. Reuses proxy + parsing."""
