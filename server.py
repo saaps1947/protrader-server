@@ -502,7 +502,7 @@ INSTRUMENTS = {
     "WIPRO":  {"kite":"NSE:WIPRO",  "yahoo":"WIPRO.NS",  "step":10,  "sector":"IT"},
     "HCLTECH":{"kite":"NSE:HCLTECH","yahoo":"HCLTECH.NS","step":50,  "sector":"IT"},
     "TECHM":  {"kite":"NSE:TECHM",  "yahoo":"TECHM.NS",  "step":20,  "sector":"IT"},
-    "LTIM":   {"kite":"NSE:LTIM",   "yahoo":"LTIM.NS",   "step":100, "sector":"IT"},
+    "LTM":    {"kite":"NSE:LTM",    "yahoo":"LTM.NS",    "step":100, "sector":"IT"},  # was LTIM until 27 Feb 2026 rebrand
     # ── Energy ──
     "RELIANCE": {"kite":"NSE:RELIANCE","yahoo":"RELIANCE.NS","step":50, "sector":"ENERGY"},
     "ONGC":     {"kite":"NSE:ONGC",   "yahoo":"ONGC.NS",    "step":5,  "sector":"ENERGY"},
@@ -512,7 +512,7 @@ INSTRUMENTS = {
     "COALINDIA":{"kite":"NSE:COALINDIA","yahoo":"COALINDIA.NS","step":10,"sector":"ENERGY"},
     # ── Auto ──
     "MARUTI":    {"kite":"NSE:MARUTI",    "yahoo":"MARUTI.NS",    "step":100, "sector":"AUTO"},
-    "TATAMOTORS":{"kite":"NSE:TATAMOTORS","yahoo":"TATAMOTORS.NS","step":10,  "sector":"AUTO"},
+    "TMPV":   {"kite":"NSE:TMPV",   "yahoo":"TMPV.NS",   "step":10,  "sector":"AUTO"},  # was TATAMOTORS — renamed after the Oct 2025 CV demerger (passenger-vehicle entity, incl. JLR/EVs — the direct continuation of the original business, not the spun-off commercial-vehicle entity now trading as TMCV)
     "M&M":       {"kite":"NSE:M&M",       "yahoo":"M&M.NS",       "step":50,  "sector":"AUTO"},
     "BAJAJ-AUTO":{"kite":"NSE:BAJAJ-AUTO","yahoo":"BAJAJ-AUTO.NS","step":100, "sector":"AUTO"},
     "EICHERMOT": {"kite":"NSE:EICHERMOT", "yahoo":"EICHERMOT.NS", "step":100, "sector":"AUTO"},
@@ -573,7 +573,7 @@ OI_STOCKS = {
     # Energy / Conglomerate
     "RELIANCE",
     # Auto
-    "TATAMOTORS","MARUTI",
+    "TMPV","MARUTI",
     # Infra
     "LT","ADANIPORTS",
     # Telecom
@@ -586,7 +586,7 @@ OI_STOCKS = {
 OI_STOCKS_EXT = {
     "APOLLOHOSP","ASIANPAINT","BEL","BPCL","BRITANNIA","CIPLA","COALINDIA",
     "DIVISLAB","DRREDDY","EICHERMOT","GRASIM","HAL","HEROMOTOCO","HINDALCO",
-    "HINDUNILVR","INDIGO","ITC","JSWSTEEL","LTIM","M&M","NESTLEIND","NTPC",
+    "HINDUNILVR","INDIGO","ITC","JSWSTEEL","LTM","M&M","NESTLEIND","NTPC",
     "ONGC","POWERGRID","SHRIRAMFIN","SUNPHARMA","TATACONSUM","TATASTEEL",
     "TECHM","TITAN","TRENT","ULTRACEMCO",
 }
