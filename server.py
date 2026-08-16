@@ -3747,6 +3747,12 @@ def place_order():
             qty = default_lots.get(sym, 50)
 
         # Step 3: Place entry order via Kite
+        # FIX: SEBI's algo-trading compliance rules (enforced since April 1,
+        # 2026) reject any market order missing market_protection — orders
+        # with it at 0, or simply absent, get rejected outright. -1 tells
+        # Zerodha to auto-calculate the protection band per their own
+        # guidelines — this is Kite's own documented default, matches their
+        # official API example exactly, not a guess.
         order_payload = {
             "tradingsymbol": tradingsymbol,
             "exchange": exchange,
@@ -3754,7 +3760,8 @@ def place_order():
             "order_type": "MARKET",
             "quantity": qty,
             "product": product,
-            "validity": "DAY"
+            "validity": "DAY",
+            "market_protection": "-1"
         }
         r = KITE_SESSION.post("https://api.kite.trade/orders/regular",
             data=order_payload, headers=hdrs, timeout=15)
@@ -3790,7 +3797,15 @@ def place_order():
                         "quantity": qty,
                         "product": product,
                         "validity": "DAY",
-                        "trigger_price": trigger
+                        "trigger_price": trigger,
+                        # Genuinely unclear whether SL-M requires this — one
+                        # source explicitly says SL/Limit orders don't need
+                        # it, only true MARKET orders do. Included anyway:
+                        # Kite's API is generally tolerant of extra optional
+                        # params, and the cost of a wrongly-omitted required
+                        # field (order rejected, position left unprotected)
+                        # is far worse than an unneeded field being present.
+                        "market_protection": "-1"
                     }
                     try:
                         r2 = KITE_SESSION.post("https://api.kite.trade/orders/regular",
