@@ -278,6 +278,51 @@ def snapshot_ingest():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/ingest_signal", methods=["POST"])
+def ingest_signal():
+    """
+    Any client posts a generated signal here — the phone app, or the
+    always-on worker. Fire-and-forget, same pattern as /snapshot: never
+    blocks the caller, a failed write here never surfaces as an error to
+    whoever's scanning.
+
+    NOTE on `fired`: every signal reaching this endpoint has already cleared
+    the engine's admission threshold (bullScore/bearScore >= minScore) — the
+    scoring loop doesn't currently retain a record for symbols that scored
+    but never cleared that bar, so this is "signals that made it into the
+    live feed" (any urgency: HIGH/MEDIUM/LOW), not literally every candidate
+    the engine ever considered. Always writes fired=true for now.
+    """
+    try:
+        sig = request.get_json(force=True) or {}
+        if not sig.get("sym") or not sig.get("bias"):
+            return jsonify({"ok": False, "error": "missing sym or bias"}), 400
+        source = sig.pop("_source", "worker")
+        write_signal(sig, fired=True, source=source)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/ingest_journal", methods=["POST"])
+def ingest_journal():
+    """
+    Any client posts a journal entry here (new OPEN entry, or a status
+    update — SL_HIT/T1_HIT/T2_HIT/MANUAL) — the phone app's _writeJournal()
+    and checkSignalLevels(), or the worker's equivalent. upsert_journal_entry
+    keys on `id`, so a status change just updates the existing row rather
+    than duplicating it.
+    """
+    try:
+        entry = request.get_json(force=True) or {}
+        if not entry.get("id") or not entry.get("sym"):
+            return jsonify({"ok": False, "error": "missing id or sym"}), 400
+        upsert_journal_entry(entry)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 
 def supabase_health():
     """Quick connectivity check — hit this once after setup to confirm the
