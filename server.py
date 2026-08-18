@@ -76,6 +76,47 @@ else:
           "signal/journal persistence disabled, app runs as before")
 
 
+def _num(v):
+    """
+    Coerce a value into a real number, or None. Client-side UI placeholders
+    like "—" (em-dash, used throughout the app's own display for "not
+    applicable" — e.g. a NEUTRAL signal has no real entry/SL/target) were
+    being sent as literal strings straight into NUMERIC Postgres columns.
+    Confirmed live, repeatedly, across both signals and snapshots:
+    'invalid input syntax for type numeric: "—"' — every such insert failed
+    outright, silently, with only a log line nobody was watching for it.
+    None is the genuinely correct representation of "no value" here, not a
+    workaround — this is what should have been sent in the first place.
+    """
+    if v is None: return None
+    if isinstance(v, (int, float)): return v
+    if isinstance(v, str):
+        v = v.strip()
+        if not v or v in ("—", "-", "–", "N/A", "NA", "null", "undefined", "NaN"):
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+    return None
+
+
+_PLACEHOLDER_TOKENS = {"—", "-", "–", "N/A", "NA", "null", "undefined", "NaN", ""}
+
+def _scrub_placeholders(payload: dict):
+    """
+    For functions like write_snapshot() that forward an arbitrary
+    client-supplied dict without per-field type knowledge — _num() can't be
+    used there, since blindly float()-ing every value would corrupt
+    legitimate text fields like sym:"NIFTY". This only replaces EXACT
+    matches of known UI placeholder tokens with None, leaving every other
+    string completely untouched — safe precisely because none of these
+    tokens are ever a legitimate value for any real field in this schema.
+    """
+    return {k: (None if isinstance(v, str) and v.strip() in _PLACEHOLDER_TOKENS else v)
+            for k, v in payload.items()}
+
+
 def write_signal(sig: dict, fired: bool, source: str = "worker"):
     """
     Persist one generated signal (fired into the feed, or filtered out below
@@ -86,14 +127,14 @@ def write_signal(sig: dict, fired: bool, source: str = "worker"):
     try:
         SB.table("signals").insert({
             "sym": sig.get("sym"), "bias": sig.get("bias"), "fired": fired,
-            "confidence": sig.get("confidence"), "urgency": sig.get("urgency"),
-            "bull_score": sig.get("bullScore"), "bear_score": sig.get("bearScore"),
-            "neutral_score": sig.get("neutralScore"), "layers": sig.get("layers"),
+            "confidence": _num(sig.get("confidence")), "urgency": sig.get("urgency"),
+            "bull_score": _num(sig.get("bullScore")), "bear_score": _num(sig.get("bearScore")),
+            "neutral_score": _num(sig.get("neutralScore")), "layers": _num(sig.get("layers")),
             "has_oi": sig.get("hasOI"), "setup_key": sig.get("setupKey"),
             "regime": sig.get("regime"),
-            "entry_px": sig.get("entry"), "sl_px": sig.get("sl"),
-            "t1_px": sig.get("target1"), "t2_px": sig.get("target2"),
-            "rr": sig.get("rr"), "why": sig.get("why"), "vix": sig.get("vix"),
+            "entry_px": _num(sig.get("entry")), "sl_px": _num(sig.get("sl")),
+            "t1_px": _num(sig.get("target1")), "t2_px": _num(sig.get("target2")),
+            "rr": sig.get("rr"), "why": sig.get("why"), "vix": _num(sig.get("vix")),
             "source": source,
         }).execute()
     except Exception as e:
@@ -332,14 +373,20 @@ def upsert_journal_entry(entry: dict):
             "id": entry.get("id"), "sym": entry.get("sym"), "bias": entry.get("bias"),
             "trade": entry.get("trade"), "strategy": entry.get("strategy"),
             "setup_key": entry.get("setupKey"), "time_bucket": entry.get("timeBucket"),
-            "regime": entry.get("regime"), "layers": entry.get("layers"),
-            "has_oi": entry.get("hasOI"), "confidence": entry.get("confidence"),
+            "regime": entry.get("regime"), "layers": _num(entry.get("layers")),
+            "has_oi": entry.get("hasOI"), "confidence": _num(entry.get("confidence")),
             "urgency": entry.get("urgency"),
-            "entry_px": entry.get("entry_px"), "sl_px": entry.get("sl_px"),
-            "t1_px": entry.get("t1_px"), "t2_px": entry.get("t2_px"),
-            "rr": entry.get("rr"), "why": entry.get("why"), "vix": entry.get("vix"),
+            # FIX: this was the one write function with zero sanitization on
+            # its numeric fields — write_signal already used _num() per-field,
+            # write_snapshot already used _scrub_placeholders() for its
+            # arbitrary-dict case, but this one just passed raw .get() calls
+            # straight through. Same class of bug, confirmed gap, closed
+            # with the same _num() pattern write_signal already established.
+            "entry_px": _num(entry.get("entry_px")), "sl_px": _num(entry.get("sl_px")),
+            "t1_px": _num(entry.get("t1_px")), "t2_px": _num(entry.get("t2_px")),
+            "rr": entry.get("rr"), "why": entry.get("why"), "vix": _num(entry.get("vix")),
             "timeframe": entry.get("timeframe"), "status": entry.get("status"),
-            "exit_px": entry.get("exit_px"), "pnl": entry.get("pnl"),
+            "exit_px": _num(entry.get("exit_px")), "pnl": _num(entry.get("pnl")),
             "outcome": entry.get("outcome"), "exit_time": entry.get("exitTime"),
             "notes": entry.get("notes"), "source": entry.get("source"),
             "updated_at": datetime.now(IST).isoformat(),
@@ -463,6 +510,7 @@ def write_snapshot(row: dict, source: str = "client"):
         payload = dict(row)
         payload["source"] = source
         payload.pop("id", None)   # let Supabase assign its own bigserial id
+        payload = _scrub_placeholders(payload)
         SB.table("snapshots").insert(payload).execute()
     except Exception as e:
         print(f"[Supabase] write_snapshot failed for {row.get('sym')}: {e}")
@@ -2396,7 +2444,21 @@ def get_oi(sym, key, token, spot=0):
                     (ts[sym_len].isdigit() or sym in ("SENSEX","CRUDEOIL","GOLD")))
 
         now_ist = datetime.now(IST)
-        today_n = now_ist.replace(tzinfo=None)
+        # FIX: was now_ist.replace(tzinfo=None) — a full datetime INCLUDING
+        # the current time-of-day. Every expiry gets parsed at midnight
+        # (datetime.strptime("%Y-%m-%d") has no time component), so
+        # subtracting a full current-time datetime from today's own midnight
+        # expiry always went NEGATIVE the moment any time had passed since
+        # midnight — which is always. Confirmed directly: at 10:31 AM,
+        # (today's expiry - today_n).days computed as -1, not 0, so today's
+        # own expiry could NEVER pass the `d2 >= 0` check and got silently
+        # excluded, every single day, at every time except right at
+        # midnight. This is why OI was aggregating the NEXT week's contract
+        # instead of today's, on every expiry day, confirmed in production
+        # logs (expiry=2026-08-25 selected instead of 2026-08-18 on 18-Aug
+        # itself). .date() strips the time component from both sides before
+        # subtracting, so only whole calendar days are compared.
+        today_n = now_ist.date()
         # EXPIRY DAY HANDLING:
         # Keep showing the CURRENT (expiring) contract all day so intraday expiry
         # moves — short covering, unwinding, pinning — remain visible and tradeable.
@@ -2415,7 +2477,7 @@ def get_oi(sym, key, token, spot=0):
             if not sym_match_fn(ts): continue
             if cols[9] not in ["CE","PE"]: continue
             try:
-                exp=datetime.strptime(cols[5],"%Y-%m-%d")
+                exp=datetime.strptime(cols[5],"%Y-%m-%d").date()
                 d2=(exp-today_n).days
                 all_exps.add(cols[5])
                 if min_days_allowed<=d2<best_days: best_days=d2; best_exp=cols[5]
@@ -2423,6 +2485,30 @@ def get_oi(sym, key, token, spot=0):
 
         if not best_exp: return best_effort_cache("no valid expiry found")
         is_expiry_today = (best_days == 0)  # current contract expires today
+
+        # FIX: this collected all_exps (every expiry actually seen in the
+        # CSV) but never surfaced it anywhere. Confirmed live: on NIFTY's
+        # own weekly expiry day, this selected 2026-08-25 (next week)
+        # instead of today's contract — producing OI totals ~4x smaller
+        # than Sensibull's (a contract 7 days out naturally has far less
+        # accumulated OI than one expiring today). Root cause not yet
+        # certain: Kite's own docs confirm the instruments dump is
+        # generated once daily, and community reports say it typically
+        # lists "current/next/far month" — plausible that a same-day-
+        # expiring weekly simply isn't in that day's own snapshot, though
+        # not confirmed with certainty. This log line is what will prove
+        # it directly next time: if today's date is genuinely absent from
+        # all_exps, that confirms the CSV itself never had it — a Kite
+        # instrument-dump behavior to work around, not a matching bug here.
+        today_str = today_n.strftime("%Y-%m-%d")
+        if not is_expiry_today and today_str not in all_exps:
+            print(f"[OI ⚠️ EXPIRY] {sym}: today ({today_str}) not found in instrument "
+                  f"list at all — selected {best_exp} ({best_days}d out) instead. "
+                  f"All expiries seen: {sorted(all_exps)}")
+        elif not is_expiry_today and today_str in all_exps:
+            print(f"[OI ⚠️ EXPIRY] {sym}: today ({today_str}) WAS present in the data "
+                  f"but got skipped in favor of {best_exp} — this points to a real bug "
+                  f"in the selection logic itself, not a missing-data issue.")
         best_days = best_days  # days to expiry — used for IV calculation
 
         # Collect instruments for ATM ±10
@@ -3620,14 +3706,20 @@ def exit_order():
         if not csv:
             return jsonify({"ok":False,"error":"Could not fetch instruments"})
 
-        today_n = datetime.now(IST).replace(tzinfo=None)
+        # FIX: same bug as get_oi() — was comparing a full current-time
+        # datetime against expiry dates parsed at midnight, which always
+        # went negative for TODAY's own expiry the moment any time had
+        # passed since midnight. Meant this could select the wrong week's
+        # contract when exiting a position on expiry day itself. .date()
+        # compares whole calendar days only.
+        today_n = datetime.now(IST).date()
         best_exp = None; best_days = 999
         for line in csv.strip().split("\n")[1:]:
             cols = line.split(",")
             if len(cols)<10 or not cols[2].startswith(sym): continue
             if cols[9] not in ["CE","PE"]: continue
             try:
-                d2 = (datetime.strptime(cols[5],"%Y-%m-%d")-today_n).days
+                d2 = (datetime.strptime(cols[5],"%Y-%m-%d").date()-today_n).days
                 if 0<=d2<best_days: best_days=d2; best_exp=cols[5]
             except: continue
 
@@ -3732,7 +3824,14 @@ def place_order():
             return jsonify({"ok":False,"error":"Could not fetch instruments — check token"})
 
         # Find closest expiry
-        today_n = datetime.now(IST).replace(tzinfo=None)
+        # FIX: same bug as get_oi() and exit_order() — was comparing a full
+        # current-time datetime against expiry dates parsed at midnight,
+        # always going negative for TODAY's own expiry once any time had
+        # passed since midnight. This is the most serious of the three
+        # occurrences: it meant a real order placed on expiry day could
+        # select and trade the WRONG WEEK's contract entirely. .date()
+        # compares whole calendar days only, not time-of-day.
+        today_n = datetime.now(IST).date()
         best_exp = None; best_days = 999
         for line in csv.strip().split("\n")[1:]:
             cols = line.split(",")
@@ -3740,7 +3839,7 @@ def place_order():
             if not cols[2].startswith(sym): continue
             if cols[9] not in ["CE","PE"]: continue
             try:
-                exp = datetime.strptime(cols[5],"%Y-%m-%d")
+                exp = datetime.strptime(cols[5],"%Y-%m-%d").date()
                 d2 = (exp-today_n).days
                 if 0<=d2<best_days: best_days=d2; best_exp=cols[5]
             except: continue
