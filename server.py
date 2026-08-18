@@ -2494,7 +2494,21 @@ def get_oi(sym, key, token, spot=0):
             except Exception as be:
                 print(f"[OI] batch GET error: {be}")
         strikes_used = [i['strike'] for i in instruments]
-        print(f"[OI] {sym}: expiry={best_exp} ATM={atm} range={min(strikes_used) if strikes_used else 0}-{max(strikes_used) if strikes_used else 0} count={len(strikes_used)} quoted={len(qdata)}")
+        quote_pct = round(100*len(qdata)/len(strikes_used), 1) if strikes_used else 0
+        print(f"[OI] {sym}: expiry={best_exp} ATM={atm} range={min(strikes_used) if strikes_used else 0}-{max(strikes_used) if strikes_used else 0} count={len(strikes_used)} quoted={len(qdata)} ({quote_pct}%)")
+        # FIX: a significant shortfall here (Zerodha returning quotes for far
+        # fewer instruments than requested) silently produces an
+        # UNDER-COUNTED total OI — the aggregation loop below just skips any
+        # instrument with no matching quote, with nothing surfaced beyond
+        # this one routine log line, easy to miss. A real, reported
+        # discrepancy against Sensibull (confirmed: ~4x lower OI, PCR
+        # direction flipped) is exactly the symptom this would produce if
+        # quote coverage were incomplete. Now impossible to miss.
+        if strikes_used and quote_pct < 80:
+            print(f"[OI ⚠️ INCOMPLETE] {sym}: only {quote_pct}% of {len(strikes_used)} requested "
+                  f"strikes got a quote back — resulting CE/PE OI totals are UNDER-COUNTED, "
+                  f"not representative of the true ±10-strike chain. This is the single most "
+                  f"likely explanation for any reported mismatch against Sensibull right now.")
 
         # Step 4 — Aggregate OI with correct change calculation
         # FIX: oi_day_low is the MINIMUM OI seen today (a level, not a delta).
