@@ -2437,15 +2437,23 @@ def get_oi(sym, key, token, spot=0):
         # Changing range without changing thresholds breaks signal scoring — they
         # must stay in sync. If you need a wider range, recalibrate thresholds too.
         #
-        # EXPIRY-DAY WIDENING: on expiry day OI genuinely concentrates further
-        # from ATM than a normal day — heavy far-strike writing as premium
-        # collapses, last-minute pinning/unwinding, plus positions built up
-        # over the whole prior week can sit at strikes outside a narrow
-        # same-day window. Confirmed against live Kite/Sensibull comparison
-        # screenshots that a flat ±10 window mismatches PCR specifically on
-        # expiry day. Widen to ±30 strikes on expiry day ONLY, so every other
-        # day keeps the exact calibration the PCR thresholds were tuned for.
-        strike_range = step * (30 if is_expiry_today else 10)
+        # EXPIRY-DAY WIDENING — REMOVED per explicit request (was ATM ±30 on
+        # expiry day, ±10 every other day). History, so this isn't silently
+        # lost: an earlier session found live PCR mismatched Sensibull
+        # specifically on expiry day using a flat ±10 window, and widened to
+        # ±30 on expiry day only as the fix. That widening itself carried a
+        # known tradeoff — its own comment warned that PCR/max-pain/wall
+        # detection all shift shape when the strike count changes, so
+        # expiry-day numbers were never on the same calibration as every
+        # other day's ±10-tuned thresholds. That mismatch is very plausibly
+        # what's now being reported as "expiry day data is always wrong" —
+        # not the original Sensibull gap, but a NEW inconsistency this fix
+        # introduced. Reverted to a flat ±10 always, so every day uses the
+        # same calibration, no special-cased shape change. If the original
+        # Sensibull-mismatch symptom reappears, the right fix is more likely
+        # adjusting how expiry-day PCR gets INTERPRETED, not changing how
+        # many strikes get counted — flagged, not solved here.
+        strike_range = step * 10
         lo_strike = atm - strike_range
         hi_strike = atm + strike_range
 
@@ -3010,7 +3018,17 @@ def get_smc_cpr(sym, oi_data=None):
     result = {}
 
     # ── 5min candles ─────────────────────────────────────────────────────────
-    if use_kite:
+    # FIX: this always fetched fresh from Zerodha, even when get_technicals()
+    # (called moments earlier via /market, which polls every 30s) already
+    # fetched and cached this exact same candle data. Every /smc call paid a
+    # real network round-trip it usually didn't need. Now checks freshness
+    # against the SAME TTL that governs get_technicals' own refresh cadence
+    # (TTL["technicals"]) before deciding to reuse — never trusts data staler
+    # than get_technicals itself would consider acceptable, only skips the
+    # redundant fetch when the cache is genuinely still fresh.
+    if use_kite and CACHE.fresh(f"candles5_{sym}", TTL["technicals"]):
+        candles5 = CACHE.get_val(f"candles5_{sym}") or []
+    elif use_kite:
         candles5 = fetch_kite_live_candles(sym, kite_key, kite_token, "5m", 2)
     else:
         d5_yh = fetch_yahoo_candles(ticker, "5m", "2d") if ticker else None
