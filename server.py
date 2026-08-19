@@ -3483,6 +3483,40 @@ def lot_sizes():
             except: continue
             if len(seen) >= 8: break
 
+        # FIX: MCX symbols (CRUDEOIL/GOLD/SILVER/NATURALGAS) were NEVER
+        # covered by the loop above — it only ever fetched NFO instruments.
+        # They always fell back to the hardcoded table below, regardless of
+        # whether Kite credentials were available. The hardcoded values are
+        # currently believed correct, but were never actually verified
+        # against live data the way NSE symbols are. Reuses the same MCX
+        # instrument fetch already built and tested for the option-premium
+        # fix — same CSV column schema, just a different exchange segment.
+        try:
+            mcx_csv = fetch_kite_instruments_mcx(key, token)
+            if mcx_csv:
+                mcx_seen = set()
+                for line in mcx_csv.strip().split("\n")[1:]:
+                    cols = line.split(",")
+                    if len(cols) < 10: continue
+                    sym = cols[2]
+                    opt_type = cols[9]
+                    if opt_type not in ("CE", "PE"): continue
+                    underlying = None
+                    for idx in ("CRUDEOIL", "GOLD", "SILVER", "NATURALGAS"):
+                        if sym.startswith(idx):
+                            underlying = idx
+                            break
+                    if not underlying or underlying in mcx_seen: continue
+                    try:
+                        lot = int(cols[11]) if cols[11] else 0
+                        if lot > 0:
+                            result[underlying] = lot
+                            mcx_seen.add(underlying)
+                    except: continue
+                    if len(mcx_seen) >= 4: break
+        except Exception as e:
+            print(f"[LotSizes] MCX fetch failed, keeping fallback for MCX symbols: {e}")
+
         # Merge with fallback for any missing
         for k,v in fallback.items():
             if k not in result:
