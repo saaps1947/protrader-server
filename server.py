@@ -3461,17 +3461,33 @@ def lot_sizes():
         lines = csv.strip().split("\n")
         result = {}
         seen = set()
+        # FIX: this only ever checked against 5 hardcoded index names —
+        # every individual stock (CIPLA, RELIANCE, every one of them) was
+        # NEVER matched, and silently fell through to the generic 50-lot
+        # fallback regardless of its real lot size. Confirmed directly
+        # from a real trade: CIPLA showed a ₹30 loss where the real lot
+        # size (425) would have made it ₹255 — a 50-lot fallback was
+        # being used for a stock whose real lot size is over 8x that.
+        # This has affected every stock trade's P&L, not just this one.
+        # Now checks against every symbol this app actually tracks (NFO
+        # ones — MCX is handled separately below), longest name first so
+        # a more specific symbol is matched before a shorter one that
+        # could be a false-positive prefix of it. Same digit-after-prefix
+        # safeguard already used elsewhere in this file for instrument
+        # matching (e.g. NIFTY matching NIFTY25JUN... but not NIFTYNXT50).
+        all_underlyings = sorted(
+            [s for s in INSTRUMENTS.keys() if not INSTRUMENTS[s].get("mcx") and s != "SENSEX"],
+            key=len, reverse=True
+        )
         for line in lines[1:]:
             cols = line.split(",")
             if len(cols) < 10: continue
             sym = cols[2]  # tradingsymbol
             opt_type = cols[9]  # CE/PE
             if opt_type not in ["CE","PE"]: continue
-            # Extract underlying from symbol name
-            # e.g. NIFTY25JUN24500CE -> NIFTY
             underlying = None
-            for idx in ["NIFTY","BANKNIFTY","FINNIFTY","SENSEX","MIDCPNIFTY"]:
-                if sym.startswith(idx):
+            for idx in all_underlyings:
+                if sym.startswith(idx) and len(sym) > len(idx) and sym[len(idx)].isdigit():
                     underlying = idx
                     break
             if not underlying or underlying in seen: continue
@@ -3481,7 +3497,7 @@ def lot_sizes():
                     result[underlying] = lot
                     seen.add(underlying)
             except: continue
-            if len(seen) >= 8: break
+            if len(seen) >= len(all_underlyings): break
 
         # FIX: MCX symbols (CRUDEOIL/GOLD/SILVER/NATURALGAS) were NEVER
         # covered by the loop above — it only ever fetched NFO instruments.
