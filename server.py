@@ -262,6 +262,109 @@ def latest_backtest_summary():
     return jsonify(get_latest_backtest_summary())
 
 
+def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: str):
+    """
+    Fetches the REAL, live premium for a specific option contract — the
+    fix for the bug found in a real signal-report analysis: entry_px/
+    sl_px/t1_px/t2_px were the UNDERLYING's own price, not the option's
+    actual premium. GOLD showed "Capital Deployed" of ₹1.55 crore for one
+    lot because entry_px was GOLD's own price (₹155,253, essentially the
+    strike itself) — a real option premium is a small fraction of that.
+
+    Reuses the exact expiry-selection fix already tested elsewhere in this
+    file (.date() comparison — the bug that made OI select next week's
+    contract instead of today's, on today's own expiry day) and the exact
+    same column layout/strike-matching pattern already proven correct in
+    place_order() — cols[0]=token, cols[2]=tradingsymbol, cols[5]=expiry,
+    cols[6]=strike, cols[9]=CE/PE, matched as int(float(cols[6]))==strike.
+    """
+    if not key or not token:
+        return {"ok": False, "error": "not connected"}
+    try:
+        if sym == "SENSEX":
+            csv = fetch_kite_instruments_bfo(key, token)
+            exchange_prefix = "BFO"
+        elif INSTRUMENTS.get(sym, {}).get("mcx"):
+            # FIX: caught by testing before shipping — this originally
+            # checked `sym in OI_MCX`, which is a completely different,
+            # deliberately-empty set (MCX symbols with OI TRACKING enabled,
+            # not "is this symbol an MCX commodity" at all). That silently
+            # routed GOLD/SILVER/CRUDEOIL/NATURALGAS through the NFO
+            # instrument list instead of MCX's, guaranteeing "no contract
+            # found" for every MCX symbol. INSTRUMENTS[sym]['mcx'] is the
+            # actual, correct flag — same one used everywhere else in this
+            # file for this exact purpose.
+            csv = fetch_kite_instruments_mcx(key, token)
+            exchange_prefix = "MCX"
+        else:
+            csv = fetch_kite_instruments_nfo(key, token)
+            exchange_prefix = "NFO"
+        if not csv:
+            return {"ok": False, "error": "instruments CSV unavailable"}
+
+        lines = csv.strip().split("\n")
+        today_n = datetime.now(IST).date()
+        best_exp = None; best_days = 999
+        for line in lines[1:]:
+            cols = line.split(",")
+            if len(cols) < 10: continue
+            if not cols[2].startswith(sym): continue
+            if cols[9] not in ("CE", "PE"): continue
+            try:
+                exp = datetime.strptime(cols[5], "%Y-%m-%d").date()
+                d2 = (exp - today_n).days
+                if 0 <= d2 < best_days:
+                    best_days = d2; best_exp = cols[5]
+            except: continue
+        if not best_exp:
+            return {"ok": False, "error": f"no valid expiry found for {sym}"}
+
+        tradingsymbol = None
+        for line in lines[1:]:
+            cols = line.split(",")
+            if len(cols) < 10: continue
+            if not cols[2].startswith(sym): continue
+            if cols[9] != opt_type: continue
+            if cols[5] != best_exp: continue
+            try:
+                if int(float(cols[6])) == int(strike):
+                    tradingsymbol = cols[2]
+                    break
+            except: continue
+        if not tradingsymbol:
+            return {"ok": False, "error": f"no contract found for {sym} {strike} {opt_type} exp:{best_exp}"}
+
+        kite_sym = f"{exchange_prefix}:{tradingsymbol}"
+        qdata = fetch_kite_quotes(key, token, [kite_sym])
+        if qdata.get("_token_expired"):
+            return {"ok": False, "error": "token expired"}
+        q = qdata.get(kite_sym, {})
+        premium = q.get("last_price")
+        if not premium or premium <= 0:
+            return {"ok": False, "error": "no valid premium in quote response"}
+
+        return {
+            "ok": True, "premium": premium, "tradingsymbol": tradingsymbol,
+            "expiry": best_exp, "strike": strike, "opt_type": opt_type,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.route("/option_premium")
+def option_premium():
+    key, token = _creds()
+    sym = request.args.get("sym", "").upper()
+    try:
+        strike = float(request.args.get("strike", ""))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid strike"})
+    opt_type = request.args.get("type", "").upper()
+    if opt_type not in ("CE", "PE"):
+        return jsonify({"ok": False, "error": "invalid type"})
+    return jsonify(get_option_premium(sym, strike, opt_type, key, token))
+
+
 def get_setup_winrate(setup_key: str, regime: str = ""):
     """
     Historical win-rate lookup for the "confidence" badge on new signal
@@ -3597,6 +3700,23 @@ def market():
             if sym in OI_STOCKS or sym in OI_STOCKS_EXT:
                 oi_data = CACHE.get_val(f"oi_{sym}")
                 if oi_data:
+                    # FIX: this used to hardcode "cached":True unconditionally,
+                    # with NO age information at all. The client's own
+                    # staleness check does `oiServerStale = stale || cached`
+                    # — since cached was always True here, EVERY stock's OI
+                    # was being treated as stale regardless of how fresh it
+                    # actually was. Confirmed directly: 70% of signals from
+                    # properly OI-tracked stocks showed "OI not fresh" —
+                    # identical rate across both the 5-min and 15-min
+                    # refresh tiers, which only makes sense if staleness was
+                    # never actually being measured by age at all. Now
+                    # computes the REAL age from when the background thread
+                    # last wrote this cache entry — "cached" (this data came
+                    # from a cache, which is always true architecturally)
+                    # and "stale" (this data is actually too old to trust)
+                    # are no longer the same thing.
+                    age_sec = CACHE.age(f"oi_{sym}")
+                    age_min = round(age_sec / 60, 1) if age_sec is not None else 999
                     d["oi"] = {
                         "pcr":       oi_data.get("pcr",0),
                         "max_pain":  oi_data.get("max_pain",0),
@@ -3609,6 +3729,7 @@ def market():
                         "expiry":    oi_data.get("expiry",""),
                         "atm":       oi_data.get("atm",0),
                         "cached":    True,
+                        "cache_age_min": age_min,
                         "refresh":   "5min" if sym in OI_STOCKS else "15min",
                     }
         result[sym] = d
