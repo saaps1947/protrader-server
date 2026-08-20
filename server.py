@@ -2493,7 +2493,14 @@ def get_oi(sym, key, token, spot=0):
                 idx_map = {"NIFTY":"NSE:NIFTY 50","BANKNIFTY":"NSE:NIFTY BANK",
                            "FINNIFTY":"NSE:NIFTY FIN SERVICE","SENSEX":"BSE:SENSEX"}
                 kite_sym = idx_map.get(sym)
-            elif sym in OI_MCX:
+            elif INSTRUMENTS.get(sym, {}).get("mcx"):
+                # FIX: found via systematic review — was `sym in OI_MCX`,
+                # same wrong check as the order-placement functions. This
+                # one is currently dormant (OI_ALL, which gates every real
+                # caller of get_oi(), never contains an MCX symbol since
+                # OI_MCX is deliberately empty — so MCX never actually
+                # reaches this branch today), but wrong is wrong, and it'd
+                # become a live bug the moment that gating logic changes.
                 # Shared, expiry-aware resolver — see resolve_mcx_front_month()
                 # definition for why this used to be a separate, inconsistent
                 # implementation here.
@@ -2521,7 +2528,7 @@ def get_oi(sym, key, token, spot=0):
         # Route to correct exchange instruments file
         if sym == "SENSEX":
             csv = fetch_kite_instruments_bfo(key, token)   # BSE/BFO
-        elif sym in OI_MCX:
+        elif INSTRUMENTS.get(sym, {}).get("mcx"):
             csv = fetch_kite_instruments_mcx(key, token)   # MCX commodities
         else:
             csv = fetch_kite_instruments_nfo(key, token)   # NSE/NFO (default)
@@ -2648,7 +2655,7 @@ def get_oi(sym, key, token, spot=0):
 
         if sym == "SENSEX":
             exchange_prefix = "BFO"
-        elif sym in OI_MCX:
+        elif INSTRUMENTS.get(sym, {}).get("mcx"):
             exchange_prefix = "MCX"
         else:
             exchange_prefix = "NFO"
@@ -3870,7 +3877,16 @@ def exit_order():
 
         if sym == "SENSEX":
             csv = fetch_kite_instruments_bfo(key, token); exchange = "BFO"
-        elif sym in OI_MCX:
+        elif INSTRUMENTS.get(sym, {}).get("mcx"):
+            # FIX: found via systematic review — was `sym in OI_MCX`, the
+            # exact same wrong check already fixed once in
+            # get_option_premium(), but never checked for elsewhere. Highest
+            # severity of all six occurrences found: this is exit_order() —
+            # if a user held a real, open MCX position and tried to close
+            # it, this would route through the NFO instrument list instead
+            # of MCX's, almost certainly failing to find the contract at
+            # all. A real position could have been stuck, unable to be
+            # closed through this app.
             csv = fetch_kite_instruments_mcx(key, token); exchange = "MCX"
         else:
             csv = fetch_kite_instruments_nfo(key, token); exchange = "NFO"
@@ -3984,7 +4000,12 @@ def place_order():
         if sym == "SENSEX":
             csv = fetch_kite_instruments_bfo(key, token)
             exchange = "BFO"
-        elif sym in OI_MCX:
+        elif INSTRUMENTS.get(sym, {}).get("mcx"):
+            # FIX: found via systematic review — same wrong check as
+            # exit_order() above, this time on the buy side. A real MCX
+            # order (CRUDEOIL/GOLD/SILVER/NATURALGAS) would have routed
+            # through the NFO instrument list and almost certainly failed
+            # to find the contract at all.
             csv = fetch_kite_instruments_mcx(key, token)
             exchange = "MCX"
         else:
@@ -4151,7 +4172,7 @@ def oi_debug():
             "in_memory": bool(cached),
             "mem_pcr": cached.get("pcr") if cached else None,
             "disk_age_min": disk_age,
-            "mcx_sym": CACHE.get_val(f"mcx_sym_{sym}") if sym in OI_MCX else None
+            "mcx_sym": CACHE.get_val(f"mcx_sym_{sym}") if INSTRUMENTS.get(sym, {}).get("mcx") else None
         }
     key = CACHE.get_val("_kite_key") or ""
     token = CACHE.get_val("_kite_token") or ""
