@@ -17,6 +17,7 @@ from flask_cors import CORS
 import requests, time, threading, re, os, hmac
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
+from pywebpush import webpush, WebPushException
 
 # ═══════════════════════════════════════════════════════════════
 # LAYER 0 — SETUP & CONSTANTS
@@ -65,6 +66,16 @@ from supabase import create_client, Client as _SupabaseClient
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "").strip()
 SB: "_SupabaseClient | None" = None
+
+# ── PUSH NOTIFICATIONS (Web Push / VAPID) ───────────────────────────────
+# Generated once, offline — never regenerate these casually, since doing
+# so invalidates every existing subscription and every device would need
+# to re-subscribe. VAPID_PRIVATE_KEY is the sensitive half; treat it with
+# the same care as the Kite/Supabase secrets above.
+VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY", "").strip()
+VAPID_CLAIMS_SUB = os.environ.get("VAPID_CONTACT_EMAIL", "mailto:admin@example.com").strip()
+
 if SUPABASE_URL and SUPABASE_SECRET_KEY:
     try:
         SB = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
@@ -139,6 +150,115 @@ def write_signal(sig: dict, fired: bool, source: str = "worker"):
         }).execute()
     except Exception as e:
         print(f"[Supabase] write_signal failed for {sig.get('sym')}: {e}")
+
+
+def send_push_to_all(title: str, body: str, url: str = "/"):
+    """
+    Sends a Web Push notification to every currently-active subscribed
+    device. Never raises — same fire-and-forget philosophy as
+    write_signal(): a push failure must never take down the signal
+    pipeline that triggered it.
+
+    Self-healing: if the push service reports a subscription as gone
+    (HTTP 404/410 — the user revoked permission, uninstalled the PWA, or
+    the subscription simply expired), that row gets deactivated so this
+    doesn't keep retrying a dead endpoint on every future signal forever.
+    """
+    if not SB or not VAPID_PRIVATE_KEY:
+        return
+    try:
+        rows = (SB.table("push_subscriptions")
+                .select("id,endpoint,p256dh,auth")
+                .eq("active", True)
+                .execute()).data or []
+    except Exception as e:
+        print(f"[Push] failed to read subscriptions: {e}")
+        return
+
+    if not rows:
+        return
+
+    import json as _json
+    payload = _json.dumps({"title": title, "body": body, "url": url})
+
+    sent, failed, deactivated = 0, 0, 0
+    for row in rows:
+        subscription_info = {
+            "endpoint": row["endpoint"],
+            "keys": {"p256dh": row["p256dh"], "auth": row["auth"]}
+        }
+        try:
+            webpush(
+                subscription_info=subscription_info,
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={"sub": VAPID_CLAIMS_SUB}
+            )
+            sent += 1
+        except WebPushException as e:
+            failed += 1
+            status = getattr(e.response, "status_code", None)
+            if status in (404, 410):
+                try:
+                    SB.table("push_subscriptions").update({"active": False}).eq("id", row["id"]).execute()
+                    deactivated += 1
+                except Exception:
+                    pass
+        except Exception as e:
+            failed += 1
+            print(f"[Push] unexpected error sending to subscription {row.get('id')}: {e}")
+
+    print(f"[Push] '{title}' — sent:{sent} failed:{failed} deactivated:{deactivated}")
+
+
+@app.route("/push_vapid_public_key")
+def push_vapid_public_key():
+    """Read-only — the client needs this to call pushManager.subscribe()."""
+    if not VAPID_PUBLIC_KEY:
+        return jsonify({"ok": False, "error": "push not configured on server"}), 503
+    return jsonify({"ok": True, "key": VAPID_PUBLIC_KEY})
+
+
+@app.route("/push_subscribe", methods=["POST"])
+def push_subscribe():
+    """
+    Client posts its PushSubscription object here after the user grants
+    notification permission. Upserts on endpoint (unique) so re-subscribing
+    the same device updates rather than duplicates.
+    """
+    if not SB:
+        return jsonify({"ok": False, "error": "storage not configured"}), 503
+    try:
+        data = request.get_json(force=True) or {}
+        endpoint = data.get("endpoint")
+        keys = data.get("keys") or {}
+        p256dh, auth = keys.get("p256dh"), keys.get("auth")
+        if not endpoint or not p256dh or not auth:
+            return jsonify({"ok": False, "error": "incomplete subscription"}), 400
+        SB.table("push_subscriptions").upsert({
+            "endpoint": endpoint, "p256dh": p256dh, "auth": auth,
+            "active": True, "last_used_at": datetime.now(timezone.utc).isoformat(),
+        }, on_conflict="endpoint").execute()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/push_unsubscribe", methods=["POST"])
+def push_unsubscribe():
+    """Client calls this if the user explicitly disables notifications."""
+    if not SB:
+        return jsonify({"ok": False, "error": "storage not configured"}), 503
+    try:
+        data = request.get_json(force=True) or {}
+        endpoint = data.get("endpoint")
+        if not endpoint:
+            return jsonify({"ok": False, "error": "missing endpoint"}), 400
+        SB.table("push_subscriptions").update({"active": False}).eq("endpoint", endpoint).execute()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 def get_last_session_signals(limit_symbols: int = 40):
@@ -714,6 +834,16 @@ def ingest_signal():
         # Render's own logs, the moment it fires.
         print(f"[Signal ✅] {sig.get('sym')} {sig.get('bias')} {sig.get('urgency')} "
               f"{sig.get('confidence')}% from {source}")
+        # Tiered by urgency, matching the app's own conviction badges — only
+        # HIGH pushes immediately. MEDIUM/LOW stay in-app only; pushing
+        # everything would make this noise you start ignoring within a day.
+        # Runs in a background thread: a real network call to Apple's push
+        # service must never delay the response to whichever client (phone
+        # or the always-on worker) is mid-scan waiting on this endpoint.
+        if sig.get("urgency") == "HIGH":
+            title = f"🔥 {sig.get('sym')} — {sig.get('urgency')} {sig.get('confidence')}%"
+            body = f"{sig.get('trade','')} · {sig.get('strategy','')}"
+            threading.Thread(target=send_push_to_all, args=(title, body, "/"), daemon=True).start()
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -5326,6 +5456,51 @@ def _bg_daily_backtest():
 
 _auto_backtest_thread = threading.Thread(target=_bg_daily_backtest, daemon=True)
 _auto_backtest_thread.start()
+
+
+_last_heartbeat_date = None
+def _bg_daily_heartbeat():
+    """
+    Sends one push notification per weekday, before market open, confirming
+    the server is up and the pipeline is alive. This is deliberately simple
+    — not a scan count or health score, just a signal that this fired at
+    all. Its real value is in its ABSENCE: if this doesn't arrive on a
+    trading day, that's the first, earliest sign something is actually
+    wrong with the worker or server, well before you'd otherwise notice a
+    gap in signals hours into the day.
+
+    Same in-memory-only limitation as _last_auto_backtest_date above — a
+    server restart could reset this and trigger one redundant extra
+    heartbeat that day. Harmless.
+    """
+    global _last_heartbeat_date
+    time.sleep(60)
+    print("[Heartbeat] Scheduler started — one push per weekday before market open")
+    while True:
+        try:
+            now = datetime.now(IST)
+            today_str = now.strftime("%Y-%m-%d")
+            is_weekday = now.weekday() < 5
+            # 8:45 IST — well before the 9:15 open, so it reads as "ready
+            # for today" rather than arriving mid-session.
+            past_845 = (now.hour > 8) or (now.hour == 8 and now.minute >= 45)
+            already_sent_today = (_last_heartbeat_date == today_str)
+
+            if is_weekday and past_845 and not already_sent_today:
+                send_push_to_all(
+                    "☀️ PRO Trader — Ready",
+                    f"Server and worker are up, scanning starts shortly.",
+                    "/"
+                )
+                _last_heartbeat_date = today_str
+                print(f"[Heartbeat] Sent for {today_str}")
+        except Exception as e:
+            print(f"[Heartbeat] Scheduler error (will retry next cycle): {e}")
+        time.sleep(300)  # check every 5 min — this only needs to fire once a day
+
+
+_heartbeat_thread = threading.Thread(target=_bg_daily_heartbeat, daemon=True)
+_heartbeat_thread.start()
 
 
 @app.route("/backtest", methods=["POST"])
