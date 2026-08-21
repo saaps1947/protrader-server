@@ -152,7 +152,7 @@ def write_signal(sig: dict, fired: bool, source: str = "worker"):
         print(f"[Supabase] write_signal failed for {sig.get('sym')}: {e}")
 
 
-def send_push_to_all(title: str, body: str, url: str = "/"):
+def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrader-signal"):
     """
     Sends a Web Push notification to every currently-active subscribed
     device. Never raises — same fire-and-forget philosophy as
@@ -163,6 +163,15 @@ def send_push_to_all(title: str, body: str, url: str = "/"):
     (HTTP 404/410 — the user revoked permission, uninstalled the PWA, or
     the subscription simply expired), that row gets deactivated so this
     doesn't keep retrying a dead endpoint on every future signal forever.
+
+    `tag` defaults to the old shared value for any other caller (e.g. the
+    daily heartbeat), but /ingest_signal passes the symbol specifically —
+    flagged in an independent review: the service worker previously used
+    one hardcoded tag for every notification, meaning a second HIGH signal
+    for a different symbol would silently replace the first one on the
+    lock screen before the user ever saw it. Per-symbol tags fix that
+    while still correctly collapsing repeat notifications for the SAME
+    symbol into one, rather than stacking.
     """
     if not SB or not VAPID_PRIVATE_KEY:
         # FIX: this was a completely silent early-exit — if this ever
@@ -185,7 +194,7 @@ def send_push_to_all(title: str, body: str, url: str = "/"):
         return
 
     import json as _json
-    payload = _json.dumps({"title": title, "body": body, "url": url})
+    payload = _json.dumps({"title": title, "body": body, "url": url, "tag": tag})
 
     sent, failed, deactivated = 0, 0, 0
     for row in rows:
@@ -847,10 +856,26 @@ def ingest_signal():
         # service must never delay the response to whichever client (phone
         # or the always-on worker) is mid-scan waiting on this endpoint.
         if sig.get("urgency") == "HIGH":
-            title = f"🔥 {sig.get('sym')} — {sig.get('urgency')} {sig.get('confidence')}%"
-            body = f"{sig.get('trade','')} · {sig.get('strategy','')}"
-            print(f"[Push] Triggering for {sig.get('sym')} (HIGH) — title: {title}")
-            threading.Thread(target=send_push_to_all, args=(title, body, "/"), daemon=True).start()
+            # FIX: flagged in an independent review, confirmed real — there
+            # was zero dedup here. The client calls this endpoint for
+            # EVERY signal currently in the feed, every scan cycle, not
+            # just newly-discovered ones. A single HIGH signal that stays
+            # valid for 30 minutes across 10 scan cycles would have
+            # generated 10 separate push notifications for the same
+            # signal. Now dedupes by symbol+bias with a 1-hour window —
+            # long enough that an ongoing signal doesn't spam, short
+            # enough that a genuinely new occurrence later in the day
+            # still notifies.
+            push_dedup_key = f"push_sent_{sig.get('sym')}_{sig.get('bias')}"
+            last_pushed_age = CACHE.age(push_dedup_key)
+            if last_pushed_age is None or last_pushed_age > 3600:
+                title = f"🔥 {sig.get('sym')} — {sig.get('urgency')} {sig.get('confidence')}%"
+                body = f"{sig.get('trade','')} · {sig.get('strategy','')}"
+                print(f"[Push] Triggering for {sig.get('sym')} (HIGH) — title: {title}")
+                threading.Thread(target=send_push_to_all, args=(title, body, "/", "protrader-signal-"+str(sig.get('sym'))), daemon=True).start()
+                CACHE.set(push_dedup_key, True)
+            else:
+                print(f"[Push] SKIPPED {sig.get('sym')} — already notified {int(last_pushed_age)}s ago (dedup window: 3600s)")
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
