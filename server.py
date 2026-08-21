@@ -165,6 +165,11 @@ def send_push_to_all(title: str, body: str, url: str = "/"):
     doesn't keep retrying a dead endpoint on every future signal forever.
     """
     if not SB or not VAPID_PRIVATE_KEY:
+        # FIX: this was a completely silent early-exit — if this ever
+        # actually fired, there would be zero trace of it anywhere in
+        # Render's logs, making a real failure here indistinguishable from
+        # "no HIGH signal happened to fire." Now it's at least visible.
+        print(f"[Push] SKIPPED '{title}' — SB configured: {bool(SB)}, VAPID_PRIVATE_KEY set: {bool(VAPID_PRIVATE_KEY)}")
         return
     try:
         rows = (SB.table("push_subscriptions")
@@ -176,6 +181,7 @@ def send_push_to_all(title: str, body: str, url: str = "/"):
         return
 
     if not rows:
+        print(f"[Push] SKIPPED '{title}' — zero active subscriptions in push_subscriptions table")
         return
 
     import json as _json
@@ -843,6 +849,7 @@ def ingest_signal():
         if sig.get("urgency") == "HIGH":
             title = f"🔥 {sig.get('sym')} — {sig.get('urgency')} {sig.get('confidence')}%"
             body = f"{sig.get('trade','')} · {sig.get('strategy','')}"
+            print(f"[Push] Triggering for {sig.get('sym')} (HIGH) — title: {title}")
             threading.Thread(target=send_push_to_all, args=(title, body, "/"), daemon=True).start()
         return jsonify({"ok": True})
     except Exception as e:
