@@ -256,6 +256,12 @@ def push_subscribe():
     notification permission. Upserts on endpoint (unique) so re-subscribing
     the same device updates rather than duplicates.
     """
+    # FIX: flagged in an independent review — this accepted client data
+    # with no proof of origin. Reuses the same gate already proven on the
+    # order routes; a no-op if PROTRADER_API_SECRET isn't set, same as
+    # everywhere else it's used.
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
     if not SB:
         return jsonify({"ok": False, "error": "storage not configured"}), 503
     try:
@@ -277,6 +283,8 @@ def push_subscribe():
 @app.route("/push_unsubscribe", methods=["POST"])
 def push_unsubscribe():
     """Client calls this if the user explicitly disables notifications."""
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
     if not SB:
         return jsonify({"ok": False, "error": "storage not configured"}), 503
     try:
@@ -827,6 +835,10 @@ def snapshot_ingest():
     Fire-and-forget from the client's perspective — this never blocks or
     changes the existing local snapshot behavior, it's a pure addition.
     """
+    # FIX: flagged in an independent review — accepted client data with no
+    # proof of origin, same gate as the order routes and push endpoints.
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
     try:
         row = request.get_json(force=True) or {}
         if not row.get("sym"):
@@ -852,6 +864,14 @@ def ingest_signal():
     live feed" (any urgency: HIGH/MEDIUM/LOW), not literally every candidate
     the engine ever considered. Always writes fired=true for now.
     """
+    # FIX: flagged in an independent review as the most important of the
+    # gaps found — this is the one that can trigger an actual push
+    # notification, with zero proof the request came from this app.
+    # Confirmed the client already sends X-PT-Secret whenever it's
+    # configured (ptHeaders()), so this is safe to enable — a no-op until
+    # PROTRADER_API_SECRET is actually set, enforced correctly once it is.
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
     try:
         sig = request.get_json(force=True) or {}
         if not sig.get("sym") or not sig.get("bias"):
@@ -908,6 +928,8 @@ def ingest_journal():
     keys on `id`, so a status change just updates the existing row rather
     than duplicating it.
     """
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
     try:
         entry = request.get_json(force=True) or {}
         if not entry.get("id") or not entry.get("sym"):
@@ -4326,9 +4348,23 @@ def place_order():
                         stop["reason"] = str(se)
                         print(f"[Stop ❌] {tradingsymbol}: {se}")
 
-        return jsonify({"ok":True,"order_id":order_id,"tradingsymbol":tradingsymbol,
-                       "exchange":exchange,"qty":qty,"expiry":best_exp,
-                       "product":product,"action":action,"stop":stop})
+        # FIX: flagged in an independent review, confirmed real. This used
+        # to return ok:true unconditionally whenever the ENTRY succeeded,
+        # even if the protective stop below completely failed to attach —
+        # meaning a real, unprotected position could sit in the market
+        # while the API response looked like a normal success. The client
+        # had no reliable way to distinguish "fully protected trade" from
+        # "naked position" without specifically inspecting a nested field.
+        # Now: the top-level response explicitly flags this as critical
+        # when it happens, so it can't be silently missed downstream.
+        response = {"ok":True,"order_id":order_id,"tradingsymbol":tradingsymbol,
+                   "exchange":exchange,"qty":qty,"expiry":best_exp,
+                   "product":product,"action":action,"stop":stop}
+        if action == "BUY" and sl_pct > 0 and not stop.get("placed"):
+            response["critical"] = True
+            response["critical_reason"] = "Entry filled but NO PROTECTIVE STOP is attached — position is currently unprotected: " + stop.get("reason", "unknown reason")
+            print(f"[Order 🚨 CRITICAL] {tradingsymbol} filled with NO STOP attached — {stop.get('reason','unknown reason')}")
+        return jsonify(response)
 
     except Exception as e:
         print(f"[Order] Exception: {e}")
@@ -5285,6 +5321,14 @@ def _bt_run_job(job_id, params):
         closed = [s for s in signals_all if s["status"]!="OPEN"]
         wins   = [s for s in closed if s["pnl_pct"]>0]
         losses = [s for s in closed if s["pnl_pct"]<0]
+        # FIX: flagged in an independent review — breakeven trades (exactly
+        # 0 pnl_pct) were already correctly included in win_rate's
+        # denominator (len(closed), not len(wins)+len(losses) as the
+        # review actually described), but were never reported as their own
+        # explicit number anywhere. A trade that's neither a win nor a
+        # loss deserves its own visible line, not just a silent drag on
+        # the win rate with no way to see it.
+        breakeven = [s for s in closed if s["pnl_pct"]==0]
 
         def breakdown(fn):
             from collections import defaultdict as _dd2
@@ -5405,12 +5449,47 @@ def _bt_run_job(job_id, params):
             return "+".join(sorted(fires)) if fires else "none"
         by_combo = sorted([r for r in breakdown(combo_key) if r["n"]>=20], key=lambda x:-x["wr"])[:25]
 
+        # ── Portfolio-level max drawdown ──────────────────────────────────
+        # FIX: flagged in an independent review as genuinely missing — there
+        # was no equity-curve/drawdown calculation anywhere in this file,
+        # only MAE at the individual-trade level (a different thing). Built
+        # from a real chronological sequence: sorts every closed trade by
+        # actual date+time, walks a running cumulative pnl_pct total as a
+        # proxy equity curve (no capital-allocation model exists here, so
+        # this treats each trade as contributing its own % — the same
+        # R-multiple-style approach already used everywhere else in this
+        # backtest, not a new convention), and tracks the largest peak-to-
+        # trough drop encountered along the way.
+        max_drawdown_pct = 0
+        if closed:
+            chrono = sorted(closed, key=lambda s: (s["date"], s["time"]))
+            equity, peak, running = [], 0, 0
+            for s in chrono:
+                running += s["pnl_pct"]
+                peak = max(peak, running)
+                equity.append(running - peak)  # drawdown at this point, always <= 0
+            max_drawdown_pct = round(abs(min(equity)), 2) if equity else 0
+
+        # Standard Profit Factor = gross profit / gross loss, NOT the
+        # average-win/average-loss payoff ratio this used to compute under
+        # the same name — flagged directly in an independent review as a
+        # real metric-naming bug, not just a labeling nitpick.
+        gross_profit = sum(s["pnl_pct"] for s in wins)
+        gross_loss = abs(sum(s["pnl_pct"] for s in losses))
+        expectancy_pct = round(sum(s["pnl_pct"] for s in closed)/len(closed), 3) if closed else 0
+
         result = {
             "total":len(signals_all), "closed":len(closed),
             "wins":len(wins), "losses":len(losses),
+            "breakeven":len(breakeven),
             "win_rate":round(len(wins)/len(closed)*100) if closed else 0,
+            "loss_rate":round(len(losses)/len(closed)*100) if closed else 0,
+            "breakeven_rate":round(len(breakeven)/len(closed)*100) if closed else 0,
             "avg_win":aw, "avg_loss":al,
-            "profit_factor":round(abs(aw/al),2) if al else 0,
+            "payoff_ratio":round(abs(aw/al),2) if al else 0,  # what this used to mislabel "profit_factor"
+            "profit_factor":round(gross_profit/gross_loss,2) if gross_loss else 0,  # now the real thing
+            "expectancy_pct":expectancy_pct,  # average pnl_pct per trade, across wins+losses+breakeven
+            "max_drawdown_pct":max_drawdown_pct,
             # ── MFE/MAE stats ──
             "mfe_stats": {
                 "avg_mfe_win":   avg_mfe_win,
