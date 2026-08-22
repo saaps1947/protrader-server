@@ -628,7 +628,16 @@ def write_snapshot(row: dict, source: str = "client"):
     local IndexedDB behavior is untouched) and, later, from the always-on
     worker once it exists.
     """
-    if not SB: return
+    if not SB:
+        # FIX: this was a completely silent early-exit — the exact same
+        # pattern that caused the push notification bug earlier this
+        # session (a real failure looked identical to "nothing happened").
+        # Given this is now the sole foundation for a future backtest that
+        # needs months of reliably-accumulated data, a silent gap here
+        # could go unnoticed for a long time before anyone realized the
+        # data simply wasn't there. Now at least visible in the logs.
+        print(f"[Snapshot] SKIPPED {row.get('sym','?')} — Supabase not configured (SB is None)")
+        return
     try:
         payload = dict(row)
         payload["source"] = source
