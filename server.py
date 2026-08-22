@@ -5625,8 +5625,15 @@ def _bg_daily_backtest():
             time.sleep(600)
 
 
-_auto_backtest_thread = threading.Thread(target=_bg_daily_backtest, daemon=True)
-_auto_backtest_thread.start()
+# Daily automated backtest scheduler — disabled alongside the backtest tab
+# removal. This was running continuously, consuming real memory/CPU
+# (which has been a genuine, ongoing concern on the worker's 512MB
+# instance this whole session) to produce a daily backtest_runs row that
+# the UI no longer displays and the win-rate badge no longer reads. The
+# _bg_daily_backtest() function itself is untouched above — restoring
+# this is these exact two lines, uncommented, alongside re-adding the tab.
+# _auto_backtest_thread = threading.Thread(target=_bg_daily_backtest, daemon=True)
+# _auto_backtest_thread.start()
 
 
 _last_heartbeat_date = None
