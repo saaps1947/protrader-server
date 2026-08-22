@@ -4364,6 +4364,48 @@ def place_order():
             response["critical"] = True
             response["critical_reason"] = "Entry filled but NO PROTECTIVE STOP is attached — position is currently unprotected: " + stop.get("reason", "unknown reason")
             print(f"[Order 🚨 CRITICAL] {tradingsymbol} filled with NO STOP attached — {stop.get('reason','unknown reason')}")
+
+            # FIX: flagged in an independent review as the remaining gap —
+            # "detection fixed, risk containment not fixed." The position
+            # used to just sit open and unprotected once this state was
+            # reached. Now immediately attempts a market sell of the exact
+            # same contract/qty/exchange already resolved for the entry
+            # above — no re-resolution needed, everything's already in
+            # scope. This is a genuinely consequential change (the system
+            # is now automatically selling something the user just bought),
+            # so every outcome gets logged loudly and reflected explicitly
+            # in the response, never silently.
+            auto_squareoff = {"attempted": True, "ok": False, "order_id": "", "error": ""}
+            try:
+                sq_payload = {
+                    "tradingsymbol": tradingsymbol,
+                    "exchange": exchange,
+                    "transaction_type": "SELL",
+                    "order_type": "MARKET",
+                    "quantity": qty,
+                    "product": product,
+                    "validity": "DAY",
+                    "market_protection": "-1"
+                }
+                r3 = KITE_SESSION.post("https://api.kite.trade/orders/regular",
+                    data=sq_payload, headers=hdrs, timeout=15)
+                d3 = r3.json()
+                if r3.status_code == 200 and d3.get("status") == "success":
+                    auto_squareoff["ok"] = True
+                    auto_squareoff["order_id"] = d3.get("data",{}).get("order_id","")
+                    print(f"[Order 🛡️ AUTO-SQUARED-OFF] {tradingsymbol} — no stop, so the position was immediately closed at market to avoid leaving it unprotected")
+                else:
+                    auto_squareoff["error"] = d3.get("message","auto-square-off order rejected")
+                    print(f"[Order 🚨🚨 CRITICAL] {tradingsymbol} — stop failed AND auto-square-off ALSO failed ({auto_squareoff['error']}). Position is genuinely open and unprotected. Manual intervention required immediately.")
+            except Exception as sqe:
+                auto_squareoff["error"] = str(sqe)
+                print(f"[Order 🚨🚨 CRITICAL] {tradingsymbol} — stop failed AND auto-square-off ALSO failed ({sqe}). Position is genuinely open and unprotected. Manual intervention required immediately.")
+
+            response["auto_squareoff"] = auto_squareoff
+            if auto_squareoff["ok"]:
+                response["critical_reason"] += " — position was automatically closed at market as a result."
+            else:
+                response["critical_reason"] += " — AUTO-SQUARE-OFF ALSO FAILED (" + auto_squareoff["error"] + "). This position is genuinely open and unprotected. Close it manually in Kite immediately."
         return jsonify(response)
 
     except Exception as e:
