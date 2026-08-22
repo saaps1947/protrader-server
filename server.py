@@ -152,7 +152,7 @@ def write_signal(sig: dict, fired: bool, source: str = "worker"):
         print(f"[Supabase] write_signal failed for {sig.get('sym')}: {e}")
 
 
-def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrader-signal"):
+def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrader-signal", dedup_key: str = None):
     """
     Sends a Web Push notification to every currently-active subscribed
     device. Never raises — same fire-and-forget philosophy as
@@ -172,6 +172,16 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
     lock screen before the user ever saw it. Per-symbol tags fix that
     while still correctly collapsing repeat notifications for the SAME
     symbol into one, rather than stacking.
+
+    `dedup_key`, if given, only gets marked in the cache AFTER confirming
+    at least one send genuinely succeeded — not merely attempted. This
+    used to be set by the caller immediately, before this function even
+    ran (since it's called via a background thread). That meant a single
+    failed attempt — for any reason, transient or otherwise — would still
+    silently block every retry for a full hour, with the user never
+    actually receiving anything and no way to know why. Confirmed as a
+    real, live bug: a HIGH CRUDEOIL signal fired, but no notification
+    ever arrived.
     """
     if not SB or not VAPID_PRIVATE_KEY:
         # FIX: this was a completely silent early-exit — if this ever
@@ -224,6 +234,11 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
             print(f"[Push] unexpected error sending to subscription {row.get('id')}: {e}")
 
     print(f"[Push] '{title}' — sent:{sent} failed:{failed} deactivated:{deactivated}")
+
+    if dedup_key and sent > 0:
+        CACHE.set(dedup_key, True)
+    elif dedup_key and sent == 0:
+        print(f"[Push] NOT marking dedup for '{title}' — zero sends succeeded, next signal for this symbol should retry immediately rather than wait out the hour")
 
 
 @app.route("/push_vapid_public_key")
@@ -872,8 +887,11 @@ def ingest_signal():
                 title = f"🔥 {sig.get('sym')} — {sig.get('urgency')} {sig.get('confidence')}%"
                 body = f"{sig.get('trade','')} · {sig.get('strategy','')}"
                 print(f"[Push] Triggering for {sig.get('sym')} (HIGH) — title: {title}")
-                threading.Thread(target=send_push_to_all, args=(title, body, "/", "protrader-signal-"+str(sig.get('sym'))), daemon=True).start()
-                CACHE.set(push_dedup_key, True)
+                threading.Thread(
+                    target=send_push_to_all,
+                    args=(title, body, "/", "protrader-signal-"+str(sig.get('sym')), push_dedup_key),
+                    daemon=True
+                ).start()
             else:
                 print(f"[Push] SKIPPED {sig.get('sym')} — already notified {int(last_pushed_age)}s ago (dedup window: 3600s)")
         return jsonify({"ok": True})
