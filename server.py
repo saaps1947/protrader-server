@@ -15,7 +15,7 @@ Author: PRO Trader
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests, time, threading, re, os, hmac
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pywebpush import webpush, WebPushException
 
