@@ -4730,9 +4730,8 @@ def _warmup_token_cache():
             print(f"[Warmup] {sym}: {e}")
     print(f"[Warmup] Done — {warmed}/{len(nsyms)} tokens cached")
 
-import threading as _threading
-_warmup_thread = _threading.Thread(target=_warmup_token_cache, daemon=True)
-_warmup_thread.start()
+_token_warmup_thread = threading.Thread(target=_warmup_token_cache, daemon=True)
+_token_warmup_thread.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000, debug=False)
