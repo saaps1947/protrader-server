@@ -771,7 +771,7 @@ def ingest_signal():
         # Runs in a background thread: a real network call to Apple's push
         # service must never delay the response to whichever client (phone
         # or the always-on worker) is mid-scan waiting on this endpoint.
-        if sig.get("urgency") == "HIGH":
+        if sig.get("urgency") == "HIGH" and sig.get("sym", "").upper() in PUSH_ALLOWED_SYMBOLS:
             # FIX: flagged in an independent review, confirmed real — there
             # was zero dedup here. The client calls this endpoint for
             # EVERY signal currently in the feed, every scan cycle, not
@@ -821,6 +821,11 @@ def ingest_signal():
                 ).start()
             else:
                 print(f"[Push] SKIPPED {sig.get('sym')} — already notified {int(last_pushed_age)}s ago (dedup window: 3600s)")
+        elif sig.get("urgency") == "HIGH":
+            # Genuinely HIGH, just not on the push allow-list — still shows
+            # normally in the app and journals normally, this is purely a
+            # notification-volume decision, not a signal-quality one.
+            print(f"[Push] SKIPPED {sig.get('sym')} — not on PUSH_ALLOWED_SYMBOLS")
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -876,6 +881,22 @@ CORS(app, origins=_ALLOWED_ORIGINS)
 # explicitly in the request body (they no longer fall back to the server's
 # cached credentials), so an anonymous caller cannot trade someone else's account.
 API_SECRET = os.environ.get("PROTRADER_API_SECRET", "").strip()
+
+# Which symbols are allowed to actually push a notification, even when
+# they're HIGH conviction. Every symbol still shows normally in the app —
+# this only narrows what buzzes the phone. Comma-separated, configurable
+# from Render's dashboard (PUSH_ALLOWED_SYMBOLS) without needing a new
+# deploy. Default matches what was explicitly requested: the four indices,
+# the four MCX commodities, and MCX Ltd + BSE Ltd specifically called out
+# as volatile individual stocks worth an alert — confirmed as genuinely
+# tracked, distinct equity symbols in INSTRUMENTS, not shorthand for the
+# commodity segment.
+_default_push_symbols = "NIFTY,BANKNIFTY,SENSEX,FINNIFTY,CRUDEOIL,GOLD,SILVER,NATURALGAS,MCX,BSE"
+PUSH_ALLOWED_SYMBOLS = set(
+    s.strip().upper() for s in
+    os.environ.get("PUSH_ALLOWED_SYMBOLS", _default_push_symbols).split(",")
+    if s.strip()
+)
 
 def _check_order_auth():
     """Returns None if authorised, else an (json, status) error tuple."""
