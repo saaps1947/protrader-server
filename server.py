@@ -298,6 +298,45 @@ def push_unsubscribe():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/push_test")
+def push_test():
+    """
+    Diagnostic-only: sends a real, immediate push through the exact same
+    send_push_to_all() path a genuine HIGH signal uses, bypassing dedup and
+    the wait for a real market signal entirely. Built specifically to
+    answer one question fast: does push actually reach this device right
+    now, with the currently-active subscription — rather than waiting for
+    the next real signal and hoping the phone happens to be closed at the
+    right moment. GET, not POST, so it can be triggered by just opening
+    the URL in a browser. Same auth gate as every other push/order route —
+    a no-op unless PROTRADER_API_SECRET is configured.
+    """
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
+    if not SB:
+        return jsonify({"ok": False, "error": "storage not configured"}), 503
+    try:
+        rows = (SB.table("push_subscriptions")
+                .select("id", count="exact")
+                .eq("active", True)
+                .execute())
+        active_count = rows.count if rows.count is not None else len(rows.data or [])
+    except Exception as e:
+        return jsonify({"ok": False, "error": f"could not read subscription count: {e}"}), 500
+
+    if active_count == 0:
+        return jsonify({"ok": False, "error": "zero active subscriptions — nothing to send to. Re-enable notifications in Settings first."}), 400
+
+    send_push_to_all(
+        "🧪 PRO Trader — Test Push",
+        f"Sent manually at {ist_str()}. If this reached your device, push delivery is confirmed working end-to-end.",
+        "/",
+        "protrader-test-push"
+    )
+    return jsonify({"ok": True, "active_subscriptions": active_count,
+                     "note": "Push send attempted — check Render logs for '[Push]' to see sent/failed counts, and check your device for the actual notification."})
+
+
 
 def get_last_session_signals(limit_symbols: int = 40):
     """
@@ -746,9 +785,35 @@ def ingest_signal():
             push_dedup_key = f"push_sent_{sig.get('sym')}_{sig.get('bias')}"
             last_pushed_age = CACHE.age(push_dedup_key)
             if last_pushed_age is None or last_pushed_age > 3600:
-                title = f"🔥 {sig.get('sym')} — {sig.get('urgency')} {sig.get('confidence')}%"
-                body = f"{sig.get('trade','')} · {sig.get('strategy','')}"
-                print(f"[Push] Triggering for {sig.get('sym')} (HIGH) — title: {title}")
+                # FIX: confirmed via direct code trace — push dedup resets
+                # every hour, but journal dedup blocks a new row for as
+                # long as a position on this symbol+bias stays open, with
+                # no time limit at all. Neither is a bug on its own, but
+                # together they guarantee push count will run ahead of
+                # journal count for any symbol that re-qualifies as HIGH
+                # more than once while its original position is still
+                # open — and there was previously no way to tell which
+                # kind of push you were looking at without cross-checking
+                # the app. Now checked directly and labeled on the
+                # notification itself, so this is self-evident on the
+                # lock screen rather than requiring a manual comparison.
+                is_repeat_alert = False
+                if SB:
+                    try:
+                        existing = (SB.table("journal")
+                                    .select("id")
+                                    .eq("sym", sig.get("sym"))
+                                    .eq("bias", sig.get("bias"))
+                                    .in_("status", ["OPEN", "T1_HIT"])
+                                    .execute())
+                        is_repeat_alert = bool(existing.data)
+                    except Exception as e:
+                        print(f"[Push] could not check existing position for {sig.get('sym')} — labeling as new: {e}")
+                label = "STILL ACTIVE" if is_repeat_alert else "NEW"
+                title = f"🔥 {sig.get('sym')} — {label} {sig.get('urgency')} {sig.get('confidence')}%"
+                body = f"{sig.get('trade','')} · {sig.get('strategy','')}" + (
+                    " (existing position — no new journal entry)" if is_repeat_alert else "")
+                print(f"[Push] Triggering for {sig.get('sym')} (HIGH, {label}) — title: {title}")
                 threading.Thread(
                     target=send_push_to_all,
                     args=(title, body, "/", "protrader-signal-"+str(sig.get('sym')), push_dedup_key),
