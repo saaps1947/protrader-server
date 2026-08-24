@@ -476,6 +476,28 @@ def upsert_journal_entry(entry: dict):
     Status transitions (SL_HIT/T1_HIT/T2_HIT/MANUAL) update an EXISTING id
     that's already the authoritative row, so they're never blocked here.
     """
+    # FIX: confirmed via a real production log — every write where exitTime
+    # was set was failing outright with "invalid input syntax for type
+    # timestamp with time zone", because the client sends its own
+    # human-readable display format here ("24 Aug 12:56 PM" — which has NO
+    # YEAR at all, so it's not just wrong-format, genuinely ambiguous).
+    # Worse than losing just this field: Supabase's upsert() rejects the
+    # WHOLE row on one bad field, so every other valid field in the same
+    # write (entry price, SL, confidence, everything) was being silently
+    # discarded too. Parsed here into a real, unambiguous timestamp using
+    # the server's own known-correct current year — falls back to None
+    # (a valid, harmless NULL) rather than raising if parsing ever fails
+    # for any reason, so a parsing edge case can never again take down an
+    # otherwise-valid write the way the raw string did.
+    exit_time_iso = None
+    raw_exit_time = entry.get("exitTime")
+    if raw_exit_time:
+        try:
+            parsed = datetime.strptime(f"{raw_exit_time} {datetime.now(IST).year}", "%d %b %I:%M %p %Y")
+            exit_time_iso = parsed.replace(tzinfo=IST).isoformat()
+        except Exception as e:
+            print(f"[Supabase] Could not parse exitTime '{raw_exit_time}' for {entry.get('id')} — storing NULL instead: {e}")
+
     if not SB: return
     try:
         if entry.get("status") == "OPEN":
@@ -510,7 +532,7 @@ def upsert_journal_entry(entry: dict):
             "rr": entry.get("rr"), "why": entry.get("why"), "vix": _num(entry.get("vix")),
             "timeframe": entry.get("timeframe"), "status": entry.get("status"),
             "exit_px": _num(entry.get("exit_px")), "pnl": _num(entry.get("pnl")),
-            "outcome": entry.get("outcome"), "exit_time": entry.get("exitTime"),
+            "outcome": entry.get("outcome"), "exit_time": exit_time_iso,
             "notes": entry.get("notes"), "source": entry.get("source"),
             "updated_at": datetime.now(IST).isoformat(),
         }).execute()
