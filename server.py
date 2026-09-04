@@ -236,7 +236,22 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
     print(f"[Push] '{title}' — sent:{sent} failed:{failed} deactivated:{deactivated}")
 
     if dedup_key and sent > 0:
-        CACHE.set(dedup_key, True)
+        # FIX: same persistence fix as the check above — this must write to
+        # the same place that gets read, or the whole fix is a no-op.
+        # Upsert (not insert) because the same key gets written repeatedly
+        # over a trading day, and this only ever needs to remember the
+        # MOST RECENT successful push, not a history of all of them.
+        if SB:
+            try:
+                SB.table("push_dedup").upsert({
+                    "dedup_key": dedup_key,
+                    "last_sent_at": datetime.now(timezone.utc).isoformat()
+                }).execute()
+            except Exception as e:
+                print(f"[Push] could not persist dedup for '{dedup_key}', falling back to in-memory only: {e}")
+                CACHE.set(dedup_key, True)
+        else:
+            CACHE.set(dedup_key, True)
     elif dedup_key and sent == 0:
         print(f"[Push] NOT marking dedup for '{title}' — zero sends succeeded, next signal for this symbol should retry immediately rather than wait out the hour")
 
@@ -782,8 +797,33 @@ def ingest_signal():
             # long enough that an ongoing signal doesn't spam, short
             # enough that a genuinely new occurrence later in the day
             # still notifies.
-            push_dedup_key = f"push_sent_{sig.get('sym')}_{sig.get('bias')}"
-            last_pushed_age = CACHE.age(push_dedup_key)
+            push_dedup_key = f"{sig.get('sym')}_{sig.get('bias')}"
+            # FIX: confirmed real — CACHE is purely in-memory (self._store =
+            # {}), tied to the single running process. Every server
+            # restart wipes it completely, resetting the "already notified"
+            # clock to zero for every symbol. Given this server has been
+            # confirmed to restart frequently (memory pressure on the
+            # 512MB instance), the 1-hour dedup window was never actually
+            # reliable — a signal pushed 10 minutes before a restart could
+            # re-push immediately after. Now backed by Supabase, which
+            # survives restarts the way the in-memory cache never could.
+            # Falls back to the old in-memory behavior only if Supabase is
+            # genuinely unavailable, so this degrades rather than breaks.
+            last_pushed_age = None
+            if SB:
+                try:
+                    row = (SB.table("push_dedup")
+                           .select("last_sent_at")
+                           .eq("dedup_key", push_dedup_key)
+                           .execute())
+                    if row.data:
+                        last_sent = datetime.fromisoformat(row.data[0]["last_sent_at"])
+                        last_pushed_age = (datetime.now(timezone.utc) - last_sent).total_seconds()
+                except Exception as e:
+                    print(f"[Push] dedup lookup failed for {push_dedup_key}, falling back to in-memory: {e}")
+                    last_pushed_age = CACHE.age(push_dedup_key)
+            else:
+                last_pushed_age = CACHE.age(push_dedup_key)
             if last_pushed_age is None or last_pushed_age > 3600:
                 # FIX: confirmed via direct code trace — push dedup resets
                 # every hour, but journal dedup blocks a new row for as
