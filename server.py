@@ -568,6 +568,49 @@ def upsert_journal_entry(entry: dict):
                       f"(a different instance sent {entry.get('id')}) — not creating a second live row")
                 return
 
+        # FIX: confirmed via direct code trace — checkSignalLevels() already
+        # correctly detects and PERSISTS every SL/T1/T2 transition via this
+        # exact function, on every market update, from both the phone and
+        # the worker. But nothing anywhere pushed a notification for it —
+        # only the very first "new HIGH signal" event ever did. A position
+        # could hit its target or stop and the user would have zero
+        # indication until they happened to open the app. This is the one
+        # place every status write passes through regardless of source, so
+        # it's the only place a transition can be detected reliably. Compares
+        # the OLD recorded status to the NEW incoming one — this is a
+        # cleaner dedup than time-based: once a transition is recorded, the
+        # old-status query returns the new value on any subsequent post of
+        # the same status, so a duplicate re-send from a second instance
+        # (phone + worker both detecting the same exit) can never re-push.
+        exit_statuses = ("SL_HIT", "T1_HIT", "T2_HIT")
+        new_status = entry.get("status")
+        if new_status in exit_statuses:
+            try:
+                prior = (SB.table("journal").select("status").eq("id", entry.get("id")).execute())
+                old_status = prior.data[0]["status"] if prior.data else None
+            except Exception as e:
+                print(f"[Push] could not check prior status for {entry.get('id')}, skipping exit push to avoid a duplicate: {e}")
+                old_status = new_status  # fail safe: treat as "already recorded", skip the push rather than risk a dupe
+
+            if old_status != new_status:
+                sym = entry.get("sym", "")
+                if sym.upper() in PUSH_ALLOWED_SYMBOLS:
+                    outcome = entry.get("outcome", "")
+                    pnl = entry.get("pnl")
+                    icon = {"SL_HIT": "🔴", "T1_HIT": "✅", "T2_HIT": "🏆"}.get(new_status, "")
+                    label = {"SL_HIT": "SL Hit", "T1_HIT": "T1 Hit", "T2_HIT": "T2 Hit"}.get(new_status, new_status)
+                    pnl_str = f" | P&L: ₹{pnl}" if pnl is not None else ""
+                    title = f"{icon} {label} — {sym}"
+                    body = f"{entry.get('trade','')}{pnl_str}" if outcome != "BREAKEVEN" else f"{entry.get('trade','')} | Breakeven stop{pnl_str}"
+                    print(f"[Push] Triggering exit notification for {sym} ({new_status})")
+                    threading.Thread(
+                        target=send_push_to_all,
+                        args=(title, body, "/", f"protrader-exit-{entry.get('id')}"),
+                        daemon=True
+                    ).start()
+                else:
+                    print(f"[Push] SKIPPED exit notification for {sym} — not on PUSH_ALLOWED_SYMBOLS")
+
         SB.table("journal").upsert({
             "id": entry.get("id"), "sym": entry.get("sym"), "bias": entry.get("bias"),
             "trade": entry.get("trade"), "strategy": entry.get("strategy"),
