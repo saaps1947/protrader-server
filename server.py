@@ -2974,6 +2974,35 @@ def get_oi(sym, key, token, spot=0):
                 pe_chg_15m = pe_oi - closest["pe"]
                 oi_15m_available = True
 
+        # FIX: the existing `buildup` classification below is computed from
+        # ce_chg/pe_chg — the raw fetch-to-fetch delta, ~2 minutes apart,
+        # which the comment on that exact variable already calls "mostly
+        # noise." Using it to trigger a notification would flip-flop
+        # constantly. This is a genuinely separate classification, built
+        # the same way but fed the 15-minute deltas instead — the
+        # meaningfully-smoothed basis actually worth alerting on. A 0.20 Cr
+        # minimum magnitude gate on the dominant side filters out the small,
+        # directionless noise that flat/quiet periods would otherwise
+        # misclassify as a "buildup." This threshold is a considered
+        # starting point, not a proven-optimal number — worth revisiting
+        # once there's a real day of index alerts to look back on.
+        regime_15m = "UNKNOWN"
+        if oi_15m_available:
+            _min_delta = 2_000_000  # 0.20 Cr
+            if abs(ce_chg_15m) >= _min_delta or abs(pe_chg_15m) >= _min_delta:
+                if ce_chg_15m > 0 and pe_chg_15m > 0:
+                    regime_15m = "LONG_BUILDUP" if pe_chg_15m > ce_chg_15m else "SHORT_BUILDUP"
+                elif ce_chg_15m < 0 and pe_chg_15m < 0:
+                    regime_15m = "SHORT_COVERING" if ce_chg_15m < pe_chg_15m else "LONG_UNWINDING"
+                elif ce_chg_15m > 0:
+                    regime_15m = "SHORT_BUILDUP"
+                elif pe_chg_15m > 0:
+                    regime_15m = "LONG_BUILDUP"
+                elif ce_chg_15m < 0:
+                    regime_15m = "SHORT_COVERING"
+                elif pe_chg_15m < 0:
+                    regime_15m = "LONG_UNWINDING"
+
         if not ce_oi and not pe_oi:
             return best_effort_cache("option chain response error")
         # Sanity check: if total OI is suspiciously low (< 0.05 Cr per side),
@@ -3068,6 +3097,7 @@ def get_oi(sym, key, token, spot=0):
         result = {
             "ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,
             "ce_chg_15m":ce_chg_15m,"pe_chg_15m":pe_chg_15m,"oi_15m_available":oi_15m_available,
+            "regime_15m":regime_15m,
             "pcr":pcr,"max_pain":int(mp),"iv":iv_est,
             "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
             "spot":round(spot,1),"buildup":buildup,"pcr_interp":pcr_interp,
@@ -3081,6 +3111,51 @@ def get_oi(sym, key, token, spot=0):
         CACHE.set(cache_key, result)
         save_disk(result)
         print(f"[OI ✅] {sym} PCR:{pcr} MP:{mp} CE:{ce_oi} PE:{pe_oi} Exp:{best_exp} Strikes:{len(strikes_data)}")
+
+        # FIX: new feature — notify on a genuine 15-min OI regime SHIFT for
+        # indices specifically (long/short buildup, short covering, long
+        # unwinding), not on every OI fetch. Only fires on an actual
+        # transition, detected by comparing against the last known regime
+        # for this symbol. Persisted in Supabase rather than CACHE — the
+        # in-memory dedup for push notifications already caused real
+        # duplicate-notification bugs across server restarts earlier this
+        # session; this uses that same lesson from the start rather than
+        # repeating it. Deliberately excludes UNKNOWN in both directions —
+        # neither "not enough data yet" nor "genuinely too quiet to
+        # classify" is itself a notification-worthy event.
+        if sym in OI_INDICES and sym in PUSH_ALLOWED_SYMBOLS and regime_15m != "UNKNOWN" and SB:
+            try:
+                prior = SB.table("oi_regime_state").select("regime").eq("sym", sym).execute()
+                last_regime = prior.data[0]["regime"] if prior.data else None
+            except Exception as e:
+                print(f"[OI Regime] could not read prior regime for {sym}, skipping to avoid a duplicate: {e}")
+                last_regime = regime_15m  # fail safe: treat as unchanged, skip rather than risk a dupe
+
+            if last_regime != regime_15m:
+                try:
+                    SB.table("oi_regime_state").upsert({"sym": sym, "regime": regime_15m,
+                                                          "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
+                except Exception as e:
+                    print(f"[OI Regime] could not persist new regime for {sym}: {e}")
+
+                labels = {
+                    "LONG_BUILDUP":   ("🟢", "Long Buildup",   "Fresh longs adding — bullish, strengthening"),
+                    "SHORT_BUILDUP":  ("🔴", "Short Buildup",  "Fresh shorts adding — bearish, strengthening"),
+                    "SHORT_COVERING": ("🟡", "Short Covering", "Shorts closing out — bullish, could reverse"),
+                    "LONG_UNWINDING": ("🟠", "Long Unwinding", "Longs closing out — bearish, could reverse"),
+                }
+                icon, label, desc = labels.get(regime_15m, ("📊", regime_15m, ""))
+                ce_str = f"{ce_chg_15m/1e7:+.2f}Cr"
+                pe_str = f"{pe_chg_15m/1e7:+.2f}Cr"
+                title = f"{icon} {sym} — {label}"
+                body = f"{desc} | CE {ce_str} · PE {pe_str} (15min)"
+                print(f"[OI Regime] {sym} transitioned {last_regime} -> {regime_15m}")
+                threading.Thread(
+                    target=send_push_to_all,
+                    args=(title, body, "/", f"protrader-oiregime-{sym}"),
+                    daemon=True
+                ).start()
+
         return result
 
     except Exception as e:
