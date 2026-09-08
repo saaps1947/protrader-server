@@ -12,6 +12,23 @@ Layer 5 — API ROUTES        : Clean REST endpoints
 Author: PRO Trader
 """
 
+import sys
+# FIX: no unbuffered-output configuration existed anywhere in this file,
+# unlike the worker's Dockerfile (ENV PYTHONUNBUFFERED=1). Without this,
+# Python fully buffers stdout when it isn't connected to a real terminal —
+# the exact case here — so print() output can sit unflushed for extended
+# periods and only appear in bursts, often exactly at process restart.
+# This plausibly explains a real pattern hit repeatedly while debugging
+# stock OI this session: dozens of identical log lines all sharing the
+# same millisecond timestamp (a buffer's accumulated contents dumped at
+# once, each stamped with the flush moment, not each line's real print
+# time), and long stretches with zero visible [StockOI ✅/❌] lines despite
+# the thread confirmed running. Forcing line buffering makes every print
+# appear at the moment it actually happens, which is what let this
+# investigation get this far in the first place, and is needed to trust
+# log timing going forward.
+sys.stdout.reconfigure(line_buffering=True)
+
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests, time, threading, re, os, hmac
@@ -28,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-09-08-v1")
+print("[BUILD_MARKER] server.py — build 2026-09-08-v2")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
