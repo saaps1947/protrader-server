@@ -1211,6 +1211,48 @@ class Cache:
 
 CACHE = Cache()
 
+# FIX: confirmed via direct PID diagnostic evidence — the background OI
+# threads (_bg_stock_oi, _bg_stock_oi_extended) run in a genuinely
+# different OS process than the one handling HTTP requests, despite both
+# appearing to reference the same CACHE object (a coincidence of Python's
+# memory allocator reusing addresses across separate process launches,
+# not actual shared memory). In-memory CACHE writes from a request
+# handler are therefore invisible to these background threads no matter
+# how correct the code looks. This mirrors the exact pattern already
+# proven reliable elsewhere this session (push_dedup, oi_regime_state) —
+# Supabase as the genuinely cross-process store, CACHE kept only as a
+# same-process fast path.
+def _persist_kite_creds(key, token):
+    CACHE.set("_kite_key", key)
+    CACHE.set("_kite_token", token)
+    if SB:
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            SB.table("server_kv").upsert({"key": "kite_key",   "value": key,   "updated_at": now}).execute()
+            SB.table("server_kv").upsert({"key": "kite_token", "value": token, "updated_at": now}).execute()
+        except Exception as e:
+            print(f"[KiteCreds] could not persist to Supabase: {e}")
+
+def _get_kite_creds():
+    """Prefer the fast in-memory CACHE (works when caller is in the same
+    process as request handlers); fall back to Supabase (works regardless
+    of process topology, which is what background threads actually need)."""
+    key = CACHE.get_val("_kite_key")
+    token = CACHE.get_val("_kite_token")
+    if key and token:
+        return key, token
+    if SB:
+        try:
+            rows = SB.table("server_kv").select("key,value").in_("key", ["kite_key", "kite_token"]).execute()
+            vals = {r["key"]: r["value"] for r in (rows.data or [])}
+            k, t = vals.get("kite_key"), vals.get("kite_token")
+            if k and t:
+                CACHE.set("_kite_key", k); CACHE.set("_kite_token", t)  # warm local cache too
+                return k, t
+        except Exception as e:
+            print(f"[KiteCreds] could not read from Supabase: {e}")
+    return None, None
+
 # Cache TTLs (seconds)
 TTL = {
     "prices":      30,    # Zerodha prices — refresh every 30s
@@ -3686,8 +3728,7 @@ def debug_orb(sym):
     sym = sym.upper()
     key, token = _creds()
     if key and token:
-        CACHE.set("_kite_key", key)
-        CACHE.set("_kite_token", token)
+        _persist_kite_creds(key, token)  # FIX: was CACHE-only, invisible to background threads in a different process — see helper definition
 
     bars = fetch_kite_live_candles(sym, key, token, "5m", 2)
     orb  = calc_orb(bars) if bars else None
@@ -3964,9 +4005,8 @@ def market():
     # Cache credentials — stored for entire server lifetime (no TTL on CACHE.set)
     # This ensures /smc calls after this point can use Kite candles
     if key and token:
-        CACHE.set("_kite_key",   key)
-        CACHE.set("_kite_token", token)
-        print(f"[market][DIAG] credentials SET — pid={os.getpid()} CACHE id={id(CACHE)}")
+        _persist_kite_creds(key, token)  # FIX: was CACHE-only, invisible to background threads in a different process — see helper definition
+
 
     prices = get_all_prices(key, token)
     if not prices:
@@ -4571,8 +4611,7 @@ def zerodha_oi():
 
     # Cache credentials for background stock OI thread
     if key and token:
-        CACHE.set("_kite_key", key)
-        CACHE.set("_kite_token", token)
+        _persist_kite_creds(key, token)  # FIX: was CACHE-only, invisible to background threads in a different process — see helper definition
 
     # Try to get spot from prices cache first (avoids extra API call)
     # If cache is cold, get_oi() will fetch spot directly from Zerodha
@@ -4610,8 +4649,7 @@ def smc_route(sym):
     # without depending on /market having been called first this session.
     key, token = _creds()
     if key and token:
-        CACHE.set("_kite_key",   key)
-        CACHE.set("_kite_token", token)
+        _persist_kite_creds(key, token)  # FIX: was CACHE-only, invisible to background threads in a different process — see helper definition
         print(f"[SMC] Kite credentials updated from /smc request for {sym}")
     # Pass OI data if available for writer behavior analysis
     oi_data = CACHE.get_val(f"oi_{sym}")
@@ -4762,20 +4800,17 @@ def _bg_stock_oi():
     """
     time.sleep(30)  # wait for server boot and first client /market call with credentials
     print(f"[StockOI] Started — {len(OI_STOCKS)} liquid stocks + {len(OI_MCX)} MCX (5-min cycle)")
-    # FIX: diagnostic — every static-code explanation for the credential
-    # miss has now checked out as correct (key names match exactly, no TTL
-    # on reads, single process/worker/thread confirmed via Render's own
-    # settings). This proves or rules out the one remaining possibility
-    # directly: that this thread is somehow reading a different CACHE
-    # object, or running in a different process, than request handlers —
-    # rather than continuing to infer it from behavior alone.
-    print(f"[StockOI][DIAG] pid={os.getpid()} CACHE id={id(CACHE)} store_keys={list(CACHE._store.keys())[:5]}...")
+    # FIX: confirmed via direct PID diagnostic — this thread runs in a
+    # different OS process than request handlers, so CACHE alone was
+    # never visible to it despite looking correct in every other way.
+    # _get_kite_creds() falls back to Supabase, which is genuinely shared
+    # across processes. See _get_kite_creds definition for the full story.
     while True:
         try:
-            key   = CACHE.get_val("_kite_key") or ""
-            token = CACHE.get_val("_kite_token") or ""
+            key, token = _get_kite_creds()
+            key = key or ""; token = token or ""
             if not key or not token:
-                print(f"[StockOI] No credentials yet — waiting... [DIAG pid={os.getpid()} CACHE id={id(CACHE)} store_size={len(CACHE._store)}]")
+                print("[StockOI] No credentials yet (checked CACHE + Supabase) — waiting...")
                 time.sleep(60); continue
             prices = CACHE.get_val("all_prices") or {}
             fetched = 0; auth_failed = 0
@@ -4819,8 +4854,8 @@ def _bg_stock_oi_extended():
     print(f"[ExtOI] Started — {len(OI_STOCKS_EXT)} extended stocks (15-min cycle)")
     while True:
         try:
-            key   = CACHE.get_val("_kite_key") or ""
-            token = CACHE.get_val("_kite_token") or ""
+            key, token = _get_kite_creds()
+            key = key or ""; token = token or ""
             if not key or not token:
                 time.sleep(120); continue
             now_ist = datetime.now(IST)
