@@ -3966,6 +3966,7 @@ def market():
     if key and token:
         CACHE.set("_kite_key",   key)
         CACHE.set("_kite_token", token)
+        print(f"[market][DIAG] credentials SET — pid={os.getpid()} CACHE id={id(CACHE)}")
 
     prices = get_all_prices(key, token)
     if not prices:
@@ -4761,12 +4762,20 @@ def _bg_stock_oi():
     """
     time.sleep(30)  # wait for server boot and first client /market call with credentials
     print(f"[StockOI] Started — {len(OI_STOCKS)} liquid stocks + {len(OI_MCX)} MCX (5-min cycle)")
+    # FIX: diagnostic — every static-code explanation for the credential
+    # miss has now checked out as correct (key names match exactly, no TTL
+    # on reads, single process/worker/thread confirmed via Render's own
+    # settings). This proves or rules out the one remaining possibility
+    # directly: that this thread is somehow reading a different CACHE
+    # object, or running in a different process, than request handlers —
+    # rather than continuing to infer it from behavior alone.
+    print(f"[StockOI][DIAG] pid={os.getpid()} CACHE id={id(CACHE)} store_keys={list(CACHE._store.keys())[:5]}...")
     while True:
         try:
             key   = CACHE.get_val("_kite_key") or ""
             token = CACHE.get_val("_kite_token") or ""
             if not key or not token:
-                print("[StockOI] No credentials yet — waiting...")
+                print(f"[StockOI] No credentials yet — waiting... [DIAG pid={os.getpid()} CACHE id={id(CACHE)} store_size={len(CACHE._store)}]")
                 time.sleep(60); continue
             prices = CACHE.get_val("all_prices") or {}
             fetched = 0; auth_failed = 0
