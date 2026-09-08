@@ -31,7 +31,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests, time, threading, re, os, hmac
+import requests, time, threading, re, os, hmac, json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pywebpush import webpush, WebPushException
@@ -2714,6 +2714,24 @@ def calc_cpr(candles_daily):
         "px_vs_pivot": round(today_px - pivot, 2)
     }
 
+def read_oi_disk_cache(sym):
+    """Standalone version of the disk-read logic nested inside get_oi()'s
+    own best_effort_cache/load_disk — that version is a closure, only
+    callable from within get_oi() itself. This exists so /market's OI
+    merge can also fall back to it: /tmp/oi_cache is genuinely shared
+    across all processes in the same container (unlike CACHE, which is
+    process-local — confirmed via direct PID evidence this session), so
+    it's a real, working cross-process channel that just wasn't wired
+    into the one place that actually needed it."""
+    try:
+        with open(f"/tmp/oi_cache/{sym}.json") as f:
+            c = json.load(f)
+            age_min = int((time.time() - c["ts"]) / 60)
+            d = dict(c["data"]); d["cached"] = True; d["cache_age_min"] = age_min
+            return d
+    except Exception:
+        return None
+
 def get_oi(sym, key, token, spot=0):
     """
     Fetch OI from Zerodha for ATM ±10 strikes only.
@@ -4116,6 +4134,20 @@ def market():
             # Merge cached stock OI — liquid stocks (5-min) AND extended stocks (15-min)
             if sym in OI_STOCKS or sym in OI_STOCKS_EXT:
                 oi_data = CACHE.get_val(f"oi_{sym}")
+                from_disk = False
+                if not oi_data:
+                    # FIX: confirmed via direct PID evidence this session —
+                    # the background OI threads run in a different process
+                    # than this route, so a value they cached in CACHE.set()
+                    # is invisible here even when the fetch genuinely
+                    # succeeded. /tmp/oi_cache is a real, working
+                    # cross-process channel (same container, shared
+                    # filesystem) that was already being written to via
+                    # save_disk() inside get_oi() — it just was never read
+                    # from here. This is the actual fix, not a new
+                    # mechanism grafted on top of an unrelated one.
+                    oi_data = read_oi_disk_cache(sym)
+                    from_disk = True
                 if oi_data:
                     # FIX: this used to hardcode "cached":True unconditionally,
                     # with NO age information at all. The client's own
@@ -4132,8 +4164,11 @@ def market():
                     # from a cache, which is always true architecturally)
                     # and "stale" (this data is actually too old to trust)
                     # are no longer the same thing.
-                    age_sec = CACHE.age(f"oi_{sym}")
-                    age_min = round(age_sec / 60, 1) if age_sec is not None else 999
+                    if from_disk:
+                        age_min = oi_data.get("cache_age_min", 999)
+                    else:
+                        age_sec = CACHE.age(f"oi_{sym}")
+                        age_min = round(age_sec / 60, 1) if age_sec is not None else 999
                     d["oi"] = {
                         "pcr":       oi_data.get("pcr",0),
                         "max_pain":  oi_data.get("max_pain",0),
