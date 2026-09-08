@@ -19,6 +19,20 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pywebpush import webpush, WebPushException
 
+# FIX: version mismatch between what's actually deployed and what's being
+# analyzed/edited has been a repeated, documented problem for this exact
+# project — several past sessions found the deployed file was silently an
+# older version than assumed. This prints unconditionally, first thing,
+# before any other startup code, imports, or credential checks — so it
+# fires even if something later in startup fails. Search Render's logs
+# for "BUILD_MARKER" to confirm instantly whether a given deploy is what
+# you think it is, instead of inferring it indirectly from other log lines.
+print("=" * 60)
+print("[BUILD_MARKER] server.py — build 2026-09-08-v1")
+print("[BUILD_MARKER] If you don't see this at the top of a fresh")
+print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
+print("=" * 60)
+
 # ═══════════════════════════════════════════════════════════════
 # LAYER 0 — SETUP & CONSTANTS
 # ═══════════════════════════════════════════════════════════════
