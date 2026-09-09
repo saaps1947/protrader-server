@@ -535,7 +535,52 @@ def option_premium():
     opt_type = request.args.get("type", "").upper()
     if opt_type not in ("CE", "PE"):
         return jsonify({"ok": False, "error": "invalid type"})
-    return jsonify(get_option_premium(sym, strike, opt_type, key, token))
+
+    # FIX: confirmed — this route had zero caching anywhere, server-side.
+    # Every call, from every client (phone AND the always-on worker),
+    # hit Zerodha live every single time, with nothing shared between
+    # them. The worker fetches fresh premiums for every open position
+    # continuously via its own checkSignalLevels() loop — but that result
+    # only ever lived in the worker's own in-browser JS variable, never
+    # reaching the server. When the phone opened fresh, it had no way to
+    # know the worker had "just" fetched the same thing seconds earlier,
+    # so it always started from zero, showing "fetching..." even though
+    # the data effectively already existed. Same class of gap as the
+    # stock OI cross-process bug, same proven fix — CACHE for the fast,
+    # same-process path, disk for genuinely cross-process sharing (this
+    # server runs in more than one OS process, confirmed via direct PID
+    # evidence this session). TTL kept short (15s) — unlike OI, option
+    # premiums move fast enough that a longer cache risks a genuinely
+    # stale price influencing a real trading decision.
+    cache_key = f"premium_{sym}_{int(strike)}_{opt_type}"
+    PREMIUM_TTL = 15
+    cached = CACHE.get_val(cache_key)
+    age = CACHE.age(cache_key)
+    if cached and age is not None and age < PREMIUM_TTL:
+        return jsonify(dict(cached, cached=True, cache_age_sec=round(age, 1)))
+
+    disk_path = f"/tmp/premium_cache/{cache_key}.json"
+    try:
+        with open(disk_path) as f:
+            d = json.load(f)
+            disk_age = time.time() - d["ts"]
+            if disk_age < PREMIUM_TTL:
+                result = d["data"]
+                CACHE.set(cache_key, result)  # warm same-process cache too
+                return jsonify(dict(result, cached=True, cache_age_sec=round(disk_age, 1)))
+    except Exception:
+        pass
+
+    result = get_option_premium(sym, strike, opt_type, key, token)
+    if result.get("ok"):
+        CACHE.set(cache_key, result)
+        try:
+            os.makedirs("/tmp/premium_cache", exist_ok=True)
+            with open(disk_path, "w") as f:
+                json.dump({"data": result, "ts": time.time()}, f)
+        except Exception as e:
+            print(f"[Premium] could not persist {cache_key} to disk: {e}")
+    return jsonify(result)
 
 
 def upsert_journal_entry(entry: dict):
