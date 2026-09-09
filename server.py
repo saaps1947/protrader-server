@@ -1031,7 +1031,20 @@ def supabase_health():
 # convenience, NOT a security boundary — any non-browser client ignores it.
 # The real protection on the order route is the credential + secret check below.
 _ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-CORS(app, origins=_ALLOWED_ORIGINS)
+# FIX: confirmed via direct log evidence — every /option_premium request from
+# an iPhone showed only the OPTIONS preflight (200, 0 bytes), never followed
+# by the actual GET, across a 2+ minute window with dozens of attempts. The
+# worker (Chromium/Linux) never had this problem — only Safari did. This is
+# a well-documented Safari-specific CORS gap: a wildcard origin ("*") combined
+# with a non-simple Content-Type (application/json, used here) or a custom
+# header (X-PT-Secret) can pass the OPTIONS preflight itself but still get the
+# real request silently blocked by the browser afterward, because the
+# preflight response never explicitly confirmed those specific headers were
+# allowed. Chrome is more permissive here; Safari isn't. Explicit allow_headers
+# removes the ambiguity entirely rather than depending on a default that
+# different browsers interpret differently.
+CORS(app, origins=_ALLOWED_ORIGINS,
+     allow_headers=["Content-Type", "X-PT-Secret", "X-Kite-Key", "X-Kite-Token"])
 
 # ── TIER-0 SECURITY: order-route authentication ───────────────────────────────
 # Optional shared secret. If PROTRADER_API_SECRET is set in the environment,
