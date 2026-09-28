@@ -514,6 +514,8 @@ def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: 
         q = qdata.get(kite_sym, {})
         premium = q.get("last_price")
         if not premium or premium <= 0:
+            if _quote_in_cooldown():
+                return {"ok": False, "error": "Zerodha quote rate limit (429) — cooling down, retry shortly"}
             return {"ok": False, "error": "no valid premium in quote response"}
 
         return {
@@ -1280,16 +1282,37 @@ CACHE = Cache()
 # proven reliable elsewhere this session (push_dedup, oi_regime_state) —
 # Supabase as the genuinely cross-process store, CACHE kept only as a
 # same-process fast path.
+# FIX: this used to do TWO synchronous Supabase upserts on EVERY request that
+# carried credentials (/market, /zerodha_oi, /smc/<sym> — dozens per scan
+# cycle, from both the phone and the worker), adding a network round trip to
+# each one for no benefit: the credentials almost never change. Now it only
+# writes when the key/token actually changed, or as a 10-minute refresh, and
+# does the write on a background thread so it never sits in a request path.
+_creds_persist_state = {"key": None, "token": None, "ts": 0.0}
+_creds_persist_lock = threading.Lock()
+
 def _persist_kite_creds(key, token):
     CACHE.set("_kite_key", key)
     CACHE.set("_kite_token", token)
-    if SB:
+    if not SB:
+        return
+    now_ts = time.time()
+    with _creds_persist_lock:
+        st = _creds_persist_state
+        if st["key"] == key and st["token"] == token and now_ts - st["ts"] < 600:
+            return
+        st["key"], st["token"], st["ts"] = key, token, now_ts
+
+    def _write():
         try:
             now = datetime.now(timezone.utc).isoformat()
             SB.table("server_kv").upsert({"key": "kite_key",   "value": key,   "updated_at": now}).execute()
             SB.table("server_kv").upsert({"key": "kite_token", "value": token, "updated_at": now}).execute()
         except Exception as e:
             print(f"[KiteCreds] could not persist to Supabase: {e}")
+            with _creds_persist_lock:
+                _creds_persist_state["ts"] = 0.0   # failed — allow an immediate retry
+    threading.Thread(target=_write, daemon=True).start()
 
 def _get_kite_creds():
     """Prefer the fast in-memory CACHE (works when caller is in the same
@@ -1332,9 +1355,27 @@ TTL = {
 def _kite_headers(key, token):
     return {"X-Kite-Version":"3","Authorization":f"token {key}:{token}","User-Agent":"Mozilla/5.0"}
 
+# ── Zerodha quote-endpoint rate limit circuit breaker ───────────────────────
+# Zerodha limits /quote to ~1 request/second and answers 429 when exceeded.
+# Per Zerodha staff, a 429 starts a ~10s cooldown that gets EXTENDED by any
+# request sent during it — so hammering through a 429 keeps the endpoint
+# blocked. Nothing in this file used to handle 429 at all (OI's batch quote
+# even swallowed non-200 statuses silently). Now: after a real 429, every
+# quote caller backs off for 10s instead of extending the block. Purely a
+# reaction to an observed 429 — with no 429s, behavior is unchanged.
+_QUOTE_COOLDOWN_UNTIL = 0.0
+def _quote_in_cooldown():
+    return time.time() < _QUOTE_COOLDOWN_UNTIL
+def _quote_start_cooldown(seconds=10):
+    global _QUOTE_COOLDOWN_UNTIL
+    _QUOTE_COOLDOWN_UNTIL = time.time() + seconds
+    print(f"[Kite] 429 rate limit hit on /quote — pausing quote calls for {seconds}s")
+
 def fetch_kite_quotes(key, token, kite_syms):
     """Fetch bulk quotes from Zerodha. Uses params= for proper URL encoding."""
     if not key or not token or not kite_syms: return {}
+    if _quote_in_cooldown():
+        return {}   # same empty result callers already handle for a failed quote
     try:
         # Use params= so requests handles URL encoding correctly
         # e.g. "NSE:NIFTY 50" → "NSE%3ANIFTY+50"
@@ -1347,6 +1388,9 @@ def fetch_kite_quotes(key, token, kite_syms):
             return {"_token_expired": True}
         if r.status_code == 200:
             return r.json().get("data", {})
+        if r.status_code == 429:
+            _quote_start_cooldown()
+            return {}
         print(f"[Kite] Quote error status: {r.status_code} — {r.text[:200]}")
     except Exception as e:
         print(f"[Kite] Quote error: {e}")
@@ -2828,6 +2872,10 @@ def get_oi(sym, key, token, spot=0):
         score correctly and the user sees something rather than a frozen strip."""
         disk = load_disk()
         if disk:
+            # FIX: this used to return silently — the reason only got logged
+            # on the in-memory path below, so OI could sit stale for up to 30
+            # minutes with nothing in the logs explaining why.
+            print(f"[OI] {sym}: serving disk cache ({disk.get('cache_age_min')}min old). Reason: {reason}")
             return disk
         stale = CACHE.get_val(cache_key)
         if stale:
@@ -2848,6 +2896,8 @@ def get_oi(sym, key, token, spot=0):
 
     try:
         hdrs = _kite_headers(key, token)
+        if _quote_in_cooldown():
+            return best_effort_cache("Zerodha quote cooldown (recent 429)")
 
         # Step 1 — spot price
         if not spot:
@@ -2876,6 +2926,9 @@ def get_oi(sym, key, token, spot=0):
                 if r.status_code in [401,403]:
                     print(f"[OI] Auth failed for {sym} — token expired?")
                     return best_effort_cache("token expired/invalid (401/403)")
+                if r.status_code == 429:
+                    _quote_start_cooldown()
+                    return best_effort_cache("quote rate-limited (429) on spot fetch")
                 if r.status_code == 200:
                     for v in (r.json().get("data") or {}).values():
                         spot = v.get("last_price",0); break
@@ -3047,8 +3100,14 @@ def get_oi(sym, key, token, spot=0):
                     params=[("i",s) for s in batch], headers=hdrs, timeout=15)
                 if rb.status_code in [401,403]:
                     return best_effort_cache("auth failed 401/403 on batch quote")
+                if rb.status_code == 429:
+                    _quote_start_cooldown()
+                    print(f"[OI] {sym}: option-chain batch quote got 429 (rate limited)")
+                    return best_effort_cache("quote rate-limited (429) on option chain")
                 if rb.status_code == 200:
                     qdata.update(rb.json().get("data",{}))
+                else:
+                    print(f"[OI] {sym}: option-chain batch quote HTTP {rb.status_code} — {rb.text[:150]}")
             except Exception as be:
                 print(f"[OI] batch GET error: {be}")
         strikes_used = [i['strike'] for i in instruments]
