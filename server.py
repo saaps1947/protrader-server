@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-05-v1")
+print("[BUILD_MARKER] server.py — build 2026-10-06-v1")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -657,6 +657,22 @@ def upsert_journal_entry(entry: dict):
                       f"(a different instance sent {entry.get('id')}) — not creating a second live row")
                 return
 
+        # Phantom-row guard (audit): a status update (SL/T1/T2/EOD/VOID/MANUAL)
+        # for an id the journal has never stored means its OPEN row was
+        # refused as a duplicate (e.g. the worker re-logged a signal after a
+        # restart wiped its memory). Upserting it would INSERT a brand-new
+        # closed trade with a late entry price — a phantom that inflates trade
+        # counts and corrupts win rate. Ignore it instead.
+        if entry.get("status") != "OPEN":
+            try:
+                _ex = SB.table("journal").select("id").eq("id", entry.get("id")).execute()
+                if not (_ex.data or []):
+                    print(f"[Supabase] Ignored {entry.get('status')} for unknown trade {entry.get('id')} "
+                          f"({entry.get('sym')} {entry.get('bias')}) — its OPEN row was never stored")
+                    return
+            except Exception as _pe:
+                print(f"[Supabase] phantom check failed for {entry.get('id')}, writing anyway: {_pe}")
+
         # FIX: confirmed via direct code trace — checkSignalLevels() already
         # correctly detects and PERSISTS every SL/T1/T2 transition via this
         # exact function, on every market update, from both the phone and
@@ -700,7 +716,7 @@ def upsert_journal_entry(entry: dict):
                 else:
                     print(f"[Push] SKIPPED exit notification for {sym} — not on PUSH_ALLOWED_SYMBOLS")
 
-        SB.table("journal").upsert({
+        _payload = {
             "id": entry.get("id"), "sym": entry.get("sym"), "bias": entry.get("bias"),
             "trade": entry.get("trade"), "strategy": entry.get("strategy"),
             "setup_key": entry.get("setupKey"), "time_bucket": entry.get("timeBucket"),
@@ -721,7 +737,34 @@ def upsert_journal_entry(entry: dict):
             "outcome": entry.get("outcome"), "exit_time": exit_time_iso,
             "notes": entry.get("notes"), "source": entry.get("source"),
             "updated_at": datetime.now(IST).isoformat(),
-        }).execute()
+        }
+        # Layer-exit shadow test data (audit). Needs `shadow jsonb` on the
+        # journal table; if that column hasn't been added yet, the write is
+        # retried without it so journaling itself can never break over this.
+        if entry.get("shadow") is not None:
+            # Merge instead of overwrite: the phone and the worker can each
+            # record different thresholds for the same trade; keep every key,
+            # and for a key both recorded, keep the EARLIEST observation.
+            _sh = dict(entry.get("shadow") or {})
+            try:
+                _prev = SB.table("journal").select("shadow").eq("id", entry.get("id")).execute()
+                _old = (((_prev.data or [{}])[0]) or {}).get("shadow") or {}
+                for _k, _v in _old.items():
+                    _new = _sh.get(_k)
+                    if not _new or str((_v or {}).get("at", "")) < str((_new or {}).get("at", "~")):
+                        _sh[_k] = _v
+            except Exception:
+                pass   # e.g. column not added yet — the fallback below handles it
+            _payload["shadow"] = _sh
+        try:
+            SB.table("journal").upsert(_payload).execute()
+        except Exception as e1:
+            if "shadow" in str(e1) and "shadow" in _payload:
+                print("[Supabase] journal.shadow column missing — run shadow_schema.sql; saved row without it")
+                _payload.pop("shadow")
+                SB.table("journal").upsert(_payload).execute()
+            else:
+                raise
     except Exception as e:
         print(f"[Supabase] upsert_journal_entry failed for {entry.get('id')}: {e}")
 
@@ -906,6 +949,22 @@ def ingest_signal():
             return jsonify({"ok": False, "error": "missing sym or bias"}), 400
         source = sig.pop("_source", "worker")
         write_signal(sig, fired=True, source=source)
+        # Push from ONE source (audit): when the phone opens, its own scan
+        # re-sends every active signal and used to trigger pushes to itself.
+        # While the worker has reported within the last 10 minutes, only the
+        # worker's signals push. If the worker goes quiet, the phone's signals
+        # push again as a fallback. Shared via /tmp because this server runs
+        # in more than one process (confirmed earlier via PIDs).
+        _wk = "/tmp/pt_last_worker_signal"
+        if source == "worker":
+            try:
+                with open(_wk, "w") as _f: _f.write(str(time.time()))
+            except Exception: pass
+        _worker_alive = False
+        try:
+            with open(_wk) as _f: _worker_alive = (time.time() - float(_f.read().strip())) < 600
+        except Exception: pass
+        _push_allowed_from_source = (source == "worker") or not _worker_alive
         # Was completely silent on success — meant no real-time confirmation
         # anywhere that a signal write actually happened, only discoverable
         # later via a separate SQL query. Now visible immediately in
@@ -918,7 +977,7 @@ def ingest_signal():
         # Runs in a background thread: a real network call to Apple's push
         # service must never delay the response to whichever client (phone
         # or the always-on worker) is mid-scan waiting on this endpoint.
-        if sig.get("urgency") == "HIGH" and sig.get("sym", "").upper() in PUSH_ALLOWED_SYMBOLS:
+        if _push_allowed_from_source and sig.get("urgency") == "HIGH" and sig.get("sym", "").upper() in PUSH_ALLOWED_SYMBOLS:
             # FIX: flagged in an independent review, confirmed real — there
             # was zero dedup here. The client calls this endpoint for
             # EVERY signal currently in the feed, every scan cycle, not
@@ -1003,6 +1062,29 @@ def ingest_signal():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+
+@app.route("/journal", methods=["GET"])
+def journal_list():
+    """The shared journal, read back. Before this, nothing could read journal
+    rows back out of Supabase, so the phone only ever showed trades IT had
+    logged while open — everything the always-on worker found was invisible
+    in the app. ?days=N (default 30, max 120); newest first; max 1000 rows."""
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
+    if not SB:
+        return jsonify({"ok": False, "error": "Supabase not configured", "rows": []})
+    try:
+        days = max(1, min(120, int(request.args.get("days", "30"))))
+    except ValueError:
+        days = 30
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        r = (SB.table("journal").select("*").gte("created_at", since)
+             .order("created_at", desc=True).limit(1000).execute())
+        return jsonify({"ok": True, "rows": r.data or []})
+    except Exception as e:
+        print(f"[Journal] read-back failed: {e}")
+        return jsonify({"ok": False, "error": str(e), "rows": []}), 500
 
 @app.route("/ingest_journal", methods=["POST"])
 def ingest_journal():
