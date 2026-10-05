@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-09-08-v2")
+print("[BUILD_MARKER] server.py — build 2026-10-05-v1")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -585,6 +585,12 @@ def option_premium():
     return jsonify(result)
 
 
+def _ist_session_start_iso():
+    """Today's 00:00 IST as an ISO timestamp. Positions are intraday (MIS), so
+    'is this symbol+bias already open?' must only look at TODAY's rows."""
+    now = datetime.now(IST)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
 def upsert_journal_entry(entry: dict):
     """
     Insert or update one journal/trade entry, keyed by its existing client-
@@ -633,11 +639,16 @@ def upsert_journal_entry(entry: dict):
     if not SB: return
     try:
         if entry.get("status") == "OPEN":
+            # FIX (audit): no time limit used to exist here — a trade stuck
+            # OPEN in Supabase from weeks ago (nothing ever closed trades at
+            # end of day) blocked every NEW journal row for that symbol+bias
+            # forever. Only today's session can hold a live intraday position.
             existing = (SB.table("journal")
                         .select("id,status")
                         .eq("sym", entry.get("sym"))
                         .eq("bias", entry.get("bias"))
                         .in_("status", ["OPEN", "T1_HIT"])
+                        .gte("created_at", _ist_session_start_iso())
                         .execute())
             dupes = [r for r in (existing.data or []) if r.get("id") != entry.get("id")]
             if dupes:
@@ -660,7 +671,7 @@ def upsert_journal_entry(entry: dict):
         # old-status query returns the new value on any subsequent post of
         # the same status, so a duplicate re-send from a second instance
         # (phone + worker both detecting the same exit) can never re-push.
-        exit_statuses = ("SL_HIT", "T1_HIT", "T2_HIT")
+        exit_statuses = ("SL_HIT", "T1_HIT", "T2_HIT", "TIME_EXIT")
         new_status = entry.get("status")
         if new_status in exit_statuses:
             try:
@@ -675,8 +686,8 @@ def upsert_journal_entry(entry: dict):
                 if sym.upper() in PUSH_ALLOWED_SYMBOLS:
                     outcome = entry.get("outcome", "")
                     pnl = entry.get("pnl")
-                    icon = {"SL_HIT": "🔴", "T1_HIT": "✅", "T2_HIT": "🏆"}.get(new_status, "")
-                    label = {"SL_HIT": "SL Hit", "T1_HIT": "T1 Hit", "T2_HIT": "T2 Hit"}.get(new_status, new_status)
+                    icon = {"SL_HIT": "🔴", "T1_HIT": "✅", "T2_HIT": "🏆", "TIME_EXIT": "⏰"}.get(new_status, "")
+                    label = {"SL_HIT": "SL Hit", "T1_HIT": "T1 Hit", "T2_HIT": "T2 Hit", "TIME_EXIT": "EOD Exit"}.get(new_status, new_status)
                     pnl_str = f" | P&L: ₹{pnl}" if pnl is not None else ""
                     title = f"{icon} {label} — {sym}"
                     body = f"{entry.get('trade','')}{pnl_str}" if outcome != "BREAKEVEN" else f"{entry.get('trade','')} | Breakeven stop{pnl_str}"
@@ -966,6 +977,7 @@ def ingest_signal():
                                     .eq("sym", sig.get("sym"))
                                     .eq("bias", sig.get("bias"))
                                     .in_("status", ["OPEN", "T1_HIT"])
+                                    .gte("created_at", _ist_session_start_iso())   # audit fix: see upsert_journal_entry
                                     .execute())
                         is_repeat_alert = bool(existing.data)
                     except Exception as e:
@@ -2834,6 +2846,36 @@ def read_oi_disk_cache(sym):
     except Exception:
         return None
 
+def classify_oi_regime(ce_chg, pe_chg, ce_oi, pe_oi, px_chg_pct,
+                       oi_pct_min=3.0, px_pct_min=0.10):
+    """15-minute OI regime for alerts, using the standard definitions, which
+    REQUIRE price direction:
+        price UP   + call OI falling -> SHORT_COVERING  (call writers exiting, bullish)
+        price UP   + put  OI rising  -> LONG_BUILDUP    (put writers adding, bullish)
+        price DOWN + put  OI falling -> LONG_UNWINDING  (put writers exiting, bearish)
+        price DOWN + call OI rising  -> SHORT_BUILDUP   (call writers adding, bearish)
+    FIX (audit): the previous version ignored price entirely and used a flat
+    0.20 Cr threshold. Real totals differ ~800x between indices (NIFTY ~12 Cr
+    per side vs FINNIFTY ~0.016 Cr), so FINNIFTY could never alert while NIFTY
+    flipped on a ~1.6% wiggle. Thresholds are now RELATIVE: an OI side must
+    move >= oi_pct_min % of its own total, and price >= px_pct_min %. Both are
+    starting values, not tuned results. A flat price, or OI moving against the
+    price direction (no matching rule), returns UNKNOWN, which never alerts."""
+    if px_chg_pct is None or abs(px_chg_pct) < px_pct_min:
+        return "UNKNOWN"
+    ce_rel = (ce_chg / ce_oi * 100) if ce_oi else 0.0
+    pe_rel = (pe_chg / pe_oi * 100) if pe_oi else 0.0
+    cands = []
+    if px_chg_pct > 0:
+        if ce_rel <= -oi_pct_min: cands.append((abs(ce_rel), "SHORT_COVERING"))
+        if pe_rel >=  oi_pct_min: cands.append((abs(pe_rel), "LONG_BUILDUP"))
+    else:
+        if pe_rel <= -oi_pct_min: cands.append((abs(pe_rel), "LONG_UNWINDING"))
+        if ce_rel >=  oi_pct_min: cands.append((abs(ce_rel), "SHORT_BUILDUP"))
+    if not cands:
+        return "UNKNOWN"
+    return max(cands)[1]
+
 def get_oi(sym, key, token, spot=0):
     """
     Fetch OI from Zerodha for ATM ±10 strikes only.
@@ -3169,47 +3211,45 @@ def get_oi(sym, key, token, spot=0):
         hist_key = f"oi_hist_{sym}_{best_exp}"
         oi_hist = CACHE.get_val(hist_key) or []
         now_ts = time.time()
-        oi_hist.append({"t": now_ts, "ce": ce_oi, "pe": pe_oi})
+        # Per-strike OI is kept too, so the 15-min change compares the SAME
+        # strikes (see below) rather than a window that re-centers on ATM.
+        oi_hist.append({"t": now_ts, "ce": ce_oi, "pe": pe_oi, "px": spot or 0,
+                        "k": {str(k): [v.get("ce", 0), v.get("pe", 0)] for k, v in strikes_data.items()}})
         oi_hist = [h for h in oi_hist if now_ts - h["t"] <= 2400]
         CACHE.set(hist_key, oi_hist)
 
         ce_chg_15m = 0; pe_chg_15m = 0; oi_15m_available = False
+        px_chg_15m_pct = None
+        ce_base_15m = pe_base_15m = 0
         target_ts = now_ts - 900
         if len(oi_hist) >= 2:
             closest = min(oi_hist[:-1], key=lambda h: abs(h["t"]-target_ts))
             if abs(closest["t"]-target_ts) <= 300:
-                ce_chg_15m = ce_oi - closest["ce"]
-                pe_chg_15m = pe_oi - closest["pe"]
+                # FIX (audit): the ±10-strike window re-centers on ATM every
+                # fetch, so after a price move strikes drop out at one end and
+                # enter at the other — comparing raw totals mixed real OI change
+                # with that composition shift (a 0.4% NIFTY fall read as put
+                # unwinding in testing). Now compares only strikes present in
+                # BOTH snapshots. Older samples without per-strike data fall
+                # back to the previous totals comparison.
+                _then = closest.get("k")
+                if _then:
+                    _common = [k for k in strikes_data if str(k) in _then]
+                    _ce0 = sum(_then[str(k)][0] for k in _common); _pe0 = sum(_then[str(k)][1] for k in _common)
+                    _ce1 = sum(strikes_data[k].get("ce", 0) for k in _common); _pe1 = sum(strikes_data[k].get("pe", 0) for k in _common)
+                    ce_chg_15m = _ce1 - _ce0; pe_chg_15m = _pe1 - _pe0
+                    ce_base_15m, pe_base_15m = _ce0, _pe0
+                else:
+                    ce_chg_15m = ce_oi - closest["ce"]
+                    pe_chg_15m = pe_oi - closest["pe"]
+                    ce_base_15m, pe_base_15m = closest["ce"], closest["pe"]
                 oi_15m_available = True
+                _px0 = closest.get("px") or 0
+                px_chg_15m_pct = ((spot - _px0) / _px0 * 100) if (_px0 and spot) else None
 
-        # FIX: the existing `buildup` classification below is computed from
-        # ce_chg/pe_chg — the raw fetch-to-fetch delta, ~2 minutes apart,
-        # which the comment on that exact variable already calls "mostly
-        # noise." Using it to trigger a notification would flip-flop
-        # constantly. This is a genuinely separate classification, built
-        # the same way but fed the 15-minute deltas instead — the
-        # meaningfully-smoothed basis actually worth alerting on. A 0.20 Cr
-        # minimum magnitude gate on the dominant side filters out the small,
-        # directionless noise that flat/quiet periods would otherwise
-        # misclassify as a "buildup." This threshold is a considered
-        # starting point, not a proven-optimal number — worth revisiting
-        # once there's a real day of index alerts to look back on.
-        regime_15m = "UNKNOWN"
-        if oi_15m_available:
-            _min_delta = 2_000_000  # 0.20 Cr
-            if abs(ce_chg_15m) >= _min_delta or abs(pe_chg_15m) >= _min_delta:
-                if ce_chg_15m > 0 and pe_chg_15m > 0:
-                    regime_15m = "LONG_BUILDUP" if pe_chg_15m > ce_chg_15m else "SHORT_BUILDUP"
-                elif ce_chg_15m < 0 and pe_chg_15m < 0:
-                    regime_15m = "SHORT_COVERING" if ce_chg_15m < pe_chg_15m else "LONG_UNWINDING"
-                elif ce_chg_15m > 0:
-                    regime_15m = "SHORT_BUILDUP"
-                elif pe_chg_15m > 0:
-                    regime_15m = "LONG_BUILDUP"
-                elif ce_chg_15m < 0:
-                    regime_15m = "SHORT_COVERING"
-                elif pe_chg_15m < 0:
-                    regime_15m = "LONG_UNWINDING"
+        # 15-min OI regime — see classify_oi_regime() for the rules and why.
+        regime_15m = classify_oi_regime(ce_chg_15m, pe_chg_15m, ce_base_15m, pe_base_15m,
+                                        px_chg_15m_pct) if oi_15m_available else "UNKNOWN"
 
         if not ce_oi and not pe_oi:
             return best_effort_cache("option chain response error")
@@ -3305,7 +3345,7 @@ def get_oi(sym, key, token, spot=0):
         result = {
             "ce_oi":ce_oi,"pe_oi":pe_oi,"ce_chg":ce_chg,"pe_chg":pe_chg,
             "ce_chg_15m":ce_chg_15m,"pe_chg_15m":pe_chg_15m,"oi_15m_available":oi_15m_available,
-            "regime_15m":regime_15m,
+            "regime_15m":regime_15m, "px_chg_15m_pct":px_chg_15m_pct,
             "pcr":pcr,"max_pain":int(mp),"iv":iv_est,
             "ce_wall":int(ce_wall),"pe_wall":int(pe_wall),
             "spot":round(spot,1),"buildup":buildup,"pcr_interp":pcr_interp,
@@ -3333,11 +3373,13 @@ def get_oi(sym, key, token, spot=0):
         # classify" is itself a notification-worthy event.
         if sym in OI_INDICES and sym in PUSH_ALLOWED_SYMBOLS and regime_15m != "UNKNOWN" and SB:
             try:
-                prior = SB.table("oi_regime_state").select("regime").eq("sym", sym).execute()
+                prior = SB.table("oi_regime_state").select("regime,updated_at").eq("sym", sym).execute()
                 last_regime = prior.data[0]["regime"] if prior.data else None
+                _last_upd = prior.data[0].get("updated_at") if prior.data else None
             except Exception as e:
                 print(f"[OI Regime] could not read prior regime for {sym}, skipping to avoid a duplicate: {e}")
                 last_regime = regime_15m  # fail safe: treat as unchanged, skip rather than risk a dupe
+                _last_upd = None
 
             if last_regime != regime_15m:
                 try:
@@ -3346,23 +3388,37 @@ def get_oi(sym, key, token, spot=0):
                 except Exception as e:
                     print(f"[OI Regime] could not persist new regime for {sym}: {e}")
 
+                # Anti-flicker: the new regime is always recorded, but at most one
+                # alert per index per 10 minutes, so two near-equal regimes
+                # trading places can't spam the lock screen.
+                _recent = False
+                try:
+                    if _last_upd:
+                        _age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(_last_upd).replace("Z", "+00:00"))).total_seconds()
+                        _recent = _age < 600
+                except Exception:
+                    _recent = False
                 labels = {
-                    "LONG_BUILDUP":   ("🟢", "Long Buildup",   "Fresh longs adding — bullish, strengthening"),
-                    "SHORT_BUILDUP":  ("🔴", "Short Buildup",  "Fresh shorts adding — bearish, strengthening"),
-                    "SHORT_COVERING": ("🟡", "Short Covering", "Shorts closing out — bullish, could reverse"),
-                    "LONG_UNWINDING": ("🟠", "Long Unwinding", "Longs closing out — bearish, could reverse"),
+                    "LONG_BUILDUP":   ("🟢", "Long Buildup",   "Price up + put writers adding — bullish"),
+                    "SHORT_BUILDUP":  ("🔴", "Short Buildup",  "Price down + call writers adding — bearish"),
+                    "SHORT_COVERING": ("🟡", "Short Covering", "Price up + call writers exiting — bullish, can be sharp"),
+                    "LONG_UNWINDING": ("🟠", "Long Unwinding", "Price down + put writers exiting — bearish"),
                 }
                 icon, label, desc = labels.get(regime_15m, ("📊", regime_15m, ""))
                 ce_str = f"{ce_chg_15m/1e7:+.2f}Cr"
                 pe_str = f"{pe_chg_15m/1e7:+.2f}Cr"
                 title = f"{icon} {sym} — {label}"
-                body = f"{desc} | CE {ce_str} · PE {pe_str} (15min)"
+                px_str = f" · Px {px_chg_15m_pct:+.2f}%" if px_chg_15m_pct is not None else ""
+                body = f"{desc} | CE {ce_str} · PE {pe_str}{px_str} (15min)"
                 print(f"[OI Regime] {sym} transitioned {last_regime} -> {regime_15m}")
-                threading.Thread(
-                    target=send_push_to_all,
-                    args=(title, body, "/", f"protrader-oiregime-{sym}"),
-                    daemon=True
-                ).start()
+                if _recent:
+                    print(f"[OI Regime] {sym}: alert suppressed — previous change < 10 min ago")
+                else:
+                    threading.Thread(
+                        target=send_push_to_all,
+                        args=(title, body, "/", f"protrader-oiregime-{sym}"),
+                        daemon=True
+                    ).start()
 
         return result
 
