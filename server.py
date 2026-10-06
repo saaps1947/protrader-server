@@ -1086,6 +1086,42 @@ def journal_list():
         print(f"[Journal] read-back failed: {e}")
         return jsonify({"ok": False, "error": str(e), "rows": []}), 500
 
+@app.route("/signals_recent", methods=["GET"])
+def signals_recent():
+    """HIGH signals the always-on WORKER found recently, one entry per
+    symbol+direction (the table gets a row every scan, so raw rows repeat).
+    Lets the phone show what a push notification was about even when its own
+    fresh scan no longer reproduces the signal. ?minutes=N (default 60)."""
+    auth_err = _check_order_auth()
+    if auth_err: return auth_err
+    if not SB:
+        return jsonify({"ok": False, "error": "Supabase not configured", "signals": []})
+    try:
+        minutes = max(5, min(240, int(request.args.get("minutes", "60"))))
+    except ValueError:
+        minutes = 60
+    try:
+        since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+        r = (SB.table("signals")
+             .select("sym,bias,confidence,urgency,entry_px,sl_px,t1_px,t2_px,rr,why,layers,has_oi,regime,source,created_at")
+             .eq("source", "worker").eq("urgency", "HIGH").gte("created_at", since)
+             .order("created_at", desc=True).limit(1000).execute())
+        groups = {}
+        for row in (r.data or []):          # newest first -> first row per key = latest values
+            k = f'{row.get("sym")}|{row.get("bias")}'
+            g = groups.get(k)
+            if g is None:
+                g = dict(row); g["first_seen"] = g["last_seen"] = row.get("created_at"); g["scans"] = 0
+                groups[k] = g
+            g["scans"] += 1
+            if str(row.get("created_at")) < str(g["first_seen"]):
+                g["first_seen"] = row.get("created_at")
+        out = sorted(groups.values(), key=lambda g: str(g["last_seen"]), reverse=True)
+        return jsonify({"ok": True, "signals": out})
+    except Exception as e:
+        print(f"[Signals] recent read failed: {e}")
+        return jsonify({"ok": False, "error": str(e), "signals": []}), 500
+
 @app.route("/ingest_journal", methods=["POST"])
 def ingest_journal():
     """
