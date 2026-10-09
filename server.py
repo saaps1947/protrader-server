@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-06-v1")
+print("[BUILD_MARKER] server.py — build 2026-10-09-v1")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -4423,58 +4423,71 @@ def market():
                 d["smc"] = {k:v for k,v in _smc.items()
                             if k not in ("orderBlocks","fvgZones")}
             # Merge cached stock OI — liquid stocks (5-min) AND extended stocks (15-min)
-            if sym in OI_STOCKS or sym in OI_STOCKS_EXT:
-                oi_data = CACHE.get_val(f"oi_{sym}")
-                from_disk = False
-                if not oi_data:
-                    # FIX: confirmed via direct PID evidence this session —
-                    # the background OI threads run in a different process
-                    # than this route, so a value they cached in CACHE.set()
-                    # is invisible here even when the fetch genuinely
-                    # succeeded. /tmp/oi_cache is a real, working
-                    # cross-process channel (same container, shared
-                    # filesystem) that was already being written to via
-                    # save_disk() inside get_oi() — it just was never read
-                    # from here. This is the actual fix, not a new
-                    # mechanism grafted on top of an unrelated one.
-                    oi_data = read_oi_disk_cache(sym)
-                    from_disk = True
-                if oi_data:
-                    # FIX: this used to hardcode "cached":True unconditionally,
-                    # with NO age information at all. The client's own
-                    # staleness check does `oiServerStale = stale || cached`
-                    # — since cached was always True here, EVERY stock's OI
-                    # was being treated as stale regardless of how fresh it
-                    # actually was. Confirmed directly: 70% of signals from
-                    # properly OI-tracked stocks showed "OI not fresh" —
-                    # identical rate across both the 5-min and 15-min
-                    # refresh tiers, which only makes sense if staleness was
-                    # never actually being measured by age at all. Now
-                    # computes the REAL age from when the background thread
-                    # last wrote this cache entry — "cached" (this data came
-                    # from a cache, which is always true architecturally)
-                    # and "stale" (this data is actually too old to trust)
-                    # are no longer the same thing.
-                    if from_disk:
-                        age_min = oi_data.get("cache_age_min", 999)
-                    else:
-                        age_sec = CACHE.age(f"oi_{sym}")
-                        age_min = round(age_sec / 60, 1) if age_sec is not None else 999
-                    d["oi"] = {
-                        "pcr":       oi_data.get("pcr",0),
-                        "max_pain":  oi_data.get("max_pain",0),
-                        "ce_wall":   oi_data.get("ce_wall",0),
-                        "pe_wall":   oi_data.get("pe_wall",0),
-                        "ce_oi":     oi_data.get("ce_oi",0),
-                        "pe_oi":     oi_data.get("pe_oi",0),
-                        "buildup":   oi_data.get("buildup","UNKNOWN"),
-                        "pcr_interp":oi_data.get("pcr_interp","NEUTRAL"),
-                        "expiry":    oi_data.get("expiry",""),
-                        "atm":       oi_data.get("atm",0),
-                        "cached":    True,
-                        "cache_age_min": age_min,
-                        "refresh":   "5min" if sym in OI_STOCKS else "15min",
-                    }
+        # FIX (Oct 8): this merge used to sit inside `if tech:`, so a stock whose
+        # technicals weren't cached at that moment silently lost its OI too.
+        if sym in OI_STOCKS or sym in OI_STOCKS_EXT:
+            oi_data = CACHE.get_val(f"oi_{sym}")
+            from_disk = False
+            # FIX (Oct 8): the disk copy (written by the background OI
+            # thread, which runs in another process) used to be read only
+            # when memory was EMPTY. Once memory held any old copy, its
+            # age just kept growing and the fresh disk copy was ignored —
+            # stock OI went "stale" and stopped counting. Use whichever
+            # copy is fresher.
+            if oi_data:
+                _mem_age = CACHE.age(f"oi_{sym}")
+                _disk = read_oi_disk_cache(sym)
+                if _disk and _mem_age is not None and _disk.get("cache_age_min", 999) * 60 < _mem_age:
+                    oi_data = _disk; from_disk = True
+            if not oi_data:
+                # FIX: confirmed via direct PID evidence this session —
+                # the background OI threads run in a different process
+                # than this route, so a value they cached in CACHE.set()
+                # is invisible here even when the fetch genuinely
+                # succeeded. /tmp/oi_cache is a real, working
+                # cross-process channel (same container, shared
+                # filesystem) that was already being written to via
+                # save_disk() inside get_oi() — it just was never read
+                # from here. This is the actual fix, not a new
+                # mechanism grafted on top of an unrelated one.
+                oi_data = read_oi_disk_cache(sym)
+                from_disk = True
+            if oi_data:
+                # FIX: this used to hardcode "cached":True unconditionally,
+                # with NO age information at all. The client's own
+                # staleness check does `oiServerStale = stale || cached`
+                # — since cached was always True here, EVERY stock's OI
+                # was being treated as stale regardless of how fresh it
+                # actually was. Confirmed directly: 70% of signals from
+                # properly OI-tracked stocks showed "OI not fresh" —
+                # identical rate across both the 5-min and 15-min
+                # refresh tiers, which only makes sense if staleness was
+                # never actually being measured by age at all. Now
+                # computes the REAL age from when the background thread
+                # last wrote this cache entry — "cached" (this data came
+                # from a cache, which is always true architecturally)
+                # and "stale" (this data is actually too old to trust)
+                # are no longer the same thing.
+                if from_disk:
+                    age_min = oi_data.get("cache_age_min", 999)
+                else:
+                    age_sec = CACHE.age(f"oi_{sym}")
+                    age_min = round(age_sec / 60, 1) if age_sec is not None else 999
+                d["oi"] = {
+                    "pcr":       oi_data.get("pcr",0),
+                    "max_pain":  oi_data.get("max_pain",0),
+                    "ce_wall":   oi_data.get("ce_wall",0),
+                    "pe_wall":   oi_data.get("pe_wall",0),
+                    "ce_oi":     oi_data.get("ce_oi",0),
+                    "pe_oi":     oi_data.get("pe_oi",0),
+                    "buildup":   oi_data.get("buildup","UNKNOWN"),
+                    "pcr_interp":oi_data.get("pcr_interp","NEUTRAL"),
+                    "expiry":    oi_data.get("expiry",""),
+                    "atm":       oi_data.get("atm",0),
+                    "cached":    True,
+                    "cache_age_min": age_min,
+                    "refresh":   "5min" if sym in OI_STOCKS else "15min",
+                }
         result[sym] = d
 
     vix = get_vix()
