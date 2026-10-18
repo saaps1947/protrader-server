@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-09-v1")
+print("[BUILD_MARKER] server.py — build 2026-10-18-v1")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -2928,23 +2928,45 @@ def get_all_prices(key, token):
 # Smart ATM ±10 fetching via Zerodha
 # ═══════════════════════════════════════════════════════════════
 
+def cpr_from_hlc(h, l, c, live_px=None):
+    """Central Pivot Range from one session's high/low/close.
+    FIX (Oct 18): (H+L)/2 is the standard BC, and 2P-BC is TC, but they are
+    only in that order when the close was in the lower half of the range.
+    The old code always called (H+L)/2 "tc", so on every day that closed in
+    the upper half (most up days) TC and BC were swapped: "price above TC"
+    fired while price was still INSIDE the CPR, and inside the CPR both the
+    bull and bear CPR points fired together. Top/bottom are now max/min."""
+    if not (h and l and c): return None
+    pivot = (h + l + c) / 3
+    a = (h + l) / 2
+    b = 2 * pivot - a
+    tc, bc = max(a, b), min(a, b)
+    width_pct = (tc - bc) / pivot * 100 if pivot else 0
+    ref = live_px if live_px else c
+    # Camarilla (Oct 18): R3/S3 are the classic reversal levels. S3 falls
+    # INSIDE the CPR whenever the previous day closed in roughly the top 20%
+    # of its range (R3 when it closed in the bottom 20%). That puts two
+    # independent support/resistance methods on the same price band, so it
+    # is flagged as a reversal zone. Known before the open, fixed all day.
+    rng = h - l
+    cam = {"r3": round(c + rng * 1.1 / 4, 2), "s3": round(c - rng * 1.1 / 4, 2),
+           "r4": round(c + rng * 1.1 / 2, 2), "s4": round(c - rng * 1.1 / 2, 2)}
+    cam_in_cpr = [k.upper() for k in ("s3", "r3") if bc <= cam[k] <= tc]
+    return {
+        "pivot": round(pivot, 2), "tc": round(tc, 2), "bc": round(bc, 2),
+        "width": round(tc - bc, 2), "width_pct": round(width_pct, 3),
+        "type": "NARROW" if width_pct < 0.3 else "WIDE",
+        "bias": "BULLISH" if ref > pivot else "BEARISH",
+        "px_vs_pivot": round(ref - pivot, 2),
+        "cam": cam,
+        "cam_in_cpr": cam_in_cpr,   # [] | ["S3"] (support zone) | ["R3"] (resistance zone)
+    }
+
 def calc_cpr(candles_daily):
     """Central Pivot Range from previous day's candle."""
     if not candles_daily or len(candles_daily) < 2: return None
     prev = candles_daily[-2]
-    h,l,c = prev["h"], prev["l"], prev["c"]
-    pivot = (h+l+c)/3
-    tc    = (h+l)/2
-    bc    = 2*pivot - tc
-    width_pct = abs(tc-bc)/pivot*100
-    today_px = candles_daily[-1]["c"]
-    return {
-        "pivot": round(pivot,2), "tc": round(tc,2), "bc": round(bc,2),
-        "width": round(abs(tc-bc),2), "width_pct": round(width_pct,3),
-        "type": "NARROW" if width_pct < 0.3 else "WIDE",
-        "bias": "BULLISH" if today_px > pivot else "BEARISH",
-        "px_vs_pivot": round(today_px - pivot, 2)
-    }
+    return cpr_from_hlc(prev["h"], prev["l"], prev["c"], candles_daily[-1]["c"])
 
 def read_oi_disk_cache(sym):
     """Standalone version of the disk-read logic nested inside get_oi()'s
@@ -4387,16 +4409,8 @@ def market():
             pdl = tech.get("prev_day_low",0)
             pdc = tech.get("prev_close",0)
             if pdh and pdl and pdc:
-                pivot = (pdh+pdl+pdc)/3
-                tc    = (pdh+pdl)/2
-                bc    = 2*pivot - tc
-                width = round(abs(tc-bc)/pivot*100,3) if pivot else 0
-                d["cpr"] = {
-                    "pivot": round(pivot,2), "tc": round(tc,2), "bc": round(bc,2),
-                    "type": "NARROW" if width<0.3 else "WIDE",
-                    "width_pct": width,
-                    "bias": "BULLISH" if pdc>pivot else "BEARISH"
-                }
+                _cpr = cpr_from_hlc(pdh, pdl, pdc, d.get("px") or None)
+                if _cpr: d["cpr"] = _cpr
             px  = d.get("px",0) or 0
             # FIX: MCX price entries use short keys "h"/"l" (see the MCX fetch
             # loop above) and never carry "open" at all — only NSE/BSE entries
