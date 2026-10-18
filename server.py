@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-18-v1")
+print("[BUILD_MARKER] server.py — build 2026-10-18-v2")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -1448,9 +1448,17 @@ def _get_kite_creds():
     """Prefer the fast in-memory CACHE (works when caller is in the same
     process as request handlers); fall back to Supabase (works regardless
     of process topology, which is what background threads actually need)."""
+    # FIX (Oct 18): this used to trust ANY token already in CACHE, forever.
+    # In the background-thread process, CACHE is only ever filled from
+    # Supabase, so the thread kept the token from deploy day and never saw
+    # the next day's login. Zerodha tokens expire every morning, so stock OI
+    # silently died the day after every deploy (Supabase oi_chain: 57 symbols
+    # on deploy days, then only the 4 client-fed indices). Now CACHE is
+    # trusted for 60s only; after that Supabase (where every client login is
+    # persisted) is re-read, and the CACHE is re-warmed with whatever is newest.
     key = CACHE.get_val("_kite_key")
     token = CACHE.get_val("_kite_token")
-    if key and token:
+    if key and token and CACHE.fresh("_kite_token", 60):
         return key, token
     if SB:
         try:
@@ -1458,10 +1466,14 @@ def _get_kite_creds():
             vals = {r["key"]: r["value"] for r in (rows.data or [])}
             k, t = vals.get("kite_key"), vals.get("kite_token")
             if k and t:
+                if t != token:
+                    print("[KiteCreds] picked up a newer Zerodha token from Supabase")
                 CACHE.set("_kite_key", k); CACHE.set("_kite_token", t)  # warm local cache too
                 return k, t
         except Exception as e:
             print(f"[KiteCreds] could not read from Supabase: {e}")
+    if key and token:
+        return key, token   # Supabase unreachable: use what we have
     return None, None
 
 # Cache TTLs (seconds)
@@ -5165,6 +5177,10 @@ def _bg_stock_oi():
             if not key or not token:
                 print("[StockOI] No credentials yet (checked CACHE + Supabase) — waiting...")
                 time.sleep(60); continue
+            # No NSE/MCX session on weekends (MCX is closed Saturdays too):
+            # skip instead of re-fetching dead chains all weekend.
+            if datetime.now(IST).weekday() >= 5:
+                time.sleep(900); continue
             prices = CACHE.get_val("all_prices") or {}
             fetched = 0; auth_failed = 0
             for sym in sorted(OI_STOCKS | OI_MCX):
