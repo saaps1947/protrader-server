@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-18-v2")
+print("[BUILD_MARKER] server.py — build 2026-10-19-v1")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -964,7 +964,13 @@ def ingest_signal():
         try:
             with open(_wk) as _f: _worker_alive = (time.time() - float(_f.read().strip())) < 600
         except Exception: pass
-        _push_allowed_from_source = (source == "worker") or not _worker_alive
+        # FIX (Oct 19): this used to allow pushes ONLY from the worker while it
+        # was alive. On Oct 19 the phone produced 36 HIGH signals and the
+        # worker 0, so no HIGH push went out at all. The push_dedup check
+        # below (same sym+bias, 1 hour, stored in Supabase so it is shared by
+        # phone and worker) already prevents a duplicate, so any source may
+        # push now; whichever device spots the signal first sends it.
+        _push_allowed_from_source = True
         # Was completely silent on success — meant no real-time confirmation
         # anywhere that a signal write actually happened, only discoverable
         # later via a separate SQL query. Now visible immediately in
