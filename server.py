@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-19-v1")
+print("[BUILD_MARKER] server.py — build 2026-10-19-v2")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -1228,8 +1228,18 @@ def _creds(data=None):
     if data:
         key = key or data.get("key", "") or ""
         tok = tok or data.get("token", "") or ""
-    key = key or request.args.get("key", "") or CACHE.get_val("_kite_key") or ""
-    tok = tok or request.args.get("token", "") or CACHE.get_val("_kite_token") or ""
+    key = key or request.args.get("key", "") or ""
+    tok = tok or request.args.get("token", "") or ""
+    if not (key and tok):
+        # FIX (Oct 19): fell back to raw CACHE, which in a process the phone
+        # never hit still held a previous day's token. The worker never
+        # sends its own token, so its /market calls failed the price fetch
+        # and got the early "cache_stale" reply WITHOUT stock OI. Every
+        # worker stock signal then read OI as stale and was capped at 79.
+        # _get_kite_creds() re-reads the latest login from Supabase.
+        _k, _t = _get_kite_creds()
+        key = key or _k or ""
+        tok = tok or _t or ""
     return key, tok
 
 def _creds_strict(data):
@@ -2641,8 +2651,7 @@ def get_vix():
     if CACHE.fresh("vix", TTL["vix"]):
         return CACHE.get_val("vix")
     # 1) Kite — the authoritative source now that we standardize on Zerodha.
-    key   = CACHE.get_val("_kite_key")
-    token = CACHE.get_val("_kite_token")
+    key, token = _get_kite_creds()   # Oct 19: was raw CACHE (could hold yesterday's token)
     if key and token:
         try:
             data = fetch_kite_quotes(key, token, ["NSE:INDIA VIX"])
@@ -2695,8 +2704,8 @@ def get_technicals(sym):
 
     inst = INSTRUMENTS.get(sym, {})
 
-    kite_key   = CACHE.get_val("_kite_key")   or ""
-    kite_token = CACHE.get_val("_kite_token") or ""
+    kite_key, kite_token = _get_kite_creds()   # Oct 19: was raw CACHE (could hold yesterday's token)
+    kite_key = kite_key or ""; kite_token = kite_token or ""
 
     d = None
 
@@ -3931,8 +3940,8 @@ def get_smc_cpr(sym, oi_data=None):
     inst   = INSTRUMENTS.get(sym,{})
     ticker = inst.get("yahoo","")
 
-    kite_key   = CACHE.get_val("_kite_key")   or ""
-    kite_token = CACHE.get_val("_kite_token") or ""
+    kite_key, kite_token = _get_kite_creds()   # Oct 19: was raw CACHE (could hold yesterday's token)
+    kite_key = kite_key or ""; kite_token = kite_token or ""
     use_kite   = bool(kite_key and kite_token and not inst.get("mcx"))
 
     result = {}
@@ -4358,16 +4367,16 @@ def market():
 
 
     prices = get_all_prices(key, token)
+    _prices_stale = False
     if not prices:
-        # Before giving up — return stale cache if available (after-hours, weekend)
         stale = CACHE.get_val("all_prices")
-        if stale:
-            vix = get_vix()
-            return jsonify({"ok":True,"data":stale,"vix":vix,
-                            "source":"cache_stale","stale":True,
-                            "time":now_ist().strftime("%H:%M:%S"),
-                            "cached_age_s": int(CACHE.age("all_prices") or 0)})
-        return jsonify({"ok":False,"error":"No market data available"}),503
+        if not stale:
+            return jsonify({"ok":False,"error":"No market data available"}),503
+        # FIX (Oct 19): this used to return the raw cached prices right
+        # here, skipping the technicals/CPR/stock-OI merge below, so one
+        # failed price fetch also stripped every stock's OI from the reply.
+        # Continue with the cached prices and flag the reply stale instead.
+        prices = stale; _prices_stale = True
 
     # Merge technicals + stock OI from cache
     result = {}
@@ -4535,10 +4544,13 @@ def market():
                 except: pass
         threading.Thread(target=_bg_tech, daemon=True).start()
 
-    return jsonify({"ok":True,"data":result,"vix":vix,
-                    "source":"zerodha" if "zerodha" in sources else "yahoo",
-                    "time":now_ist().strftime("%H:%M:%S"),
-                    "cached_age_s": int(CACHE.age("all_prices") or 0)})
+    _resp = {"ok":True,"data":result,"vix":vix,
+             "source":"zerodha" if "zerodha" in sources else "yahoo",
+             "time":now_ist().strftime("%H:%M:%S"),
+             "cached_age_s": int(CACHE.age("all_prices") or 0)}
+    if _prices_stale:
+        _resp["source"] = "cache_stale"; _resp["stale"] = True
+    return jsonify(_resp)
 
 def _poll_fill_price(order_id, hdrs, tries=6, delay=0.7):
     """
