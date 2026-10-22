@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-19-v2")
+print("[BUILD_MARKER] server.py — build 2026-10-22-v1")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -4351,6 +4351,8 @@ def prices_only():
     vix = get_vix()
     return jsonify({"ok":True,"data":prices,"vix":vix,"time":now_ist().strftime("%H:%M:%S")})
 
+_bg_tech_lock = threading.Lock()
+
 @app.route("/market")
 def market():
     """
@@ -4366,6 +4368,7 @@ def market():
         _persist_kite_creds(key, token)  # FIX: was CACHE-only, invisible to background threads in a different process — see helper definition
 
 
+    _t0_market = time.time()
     prices = get_all_prices(key, token)
     _prices_stale = False
     if not prices:
@@ -4537,11 +4540,17 @@ def market():
     # Trigger background technical refresh for uncached symbols
     uncached = [sym for sym in result if not CACHE.fresh(f"tech_{sym}", TTL["technicals"])
                 and not INSTRUMENTS.get(sym,{}).get("mcx")]
-    if uncached:
+    # FIX (Oct 22): every /market call (phone AND worker, every 30s) used to
+    # start its own refresh thread, so they piled up and competed with the
+    # request itself. Now at most one runs at a time.
+    if uncached and _bg_tech_lock.acquire(blocking=False):
         def _bg_tech():
-            for sym in uncached[:10]:  # limit to 10 per cycle
-                try: get_technicals(sym)
-                except: pass
+            try:
+                for sym in uncached[:10]:  # limit to 10 per cycle
+                    try: get_technicals(sym)
+                    except: pass
+            finally:
+                _bg_tech_lock.release()
         threading.Thread(target=_bg_tech, daemon=True).start()
 
     _resp = {"ok":True,"data":result,"vix":vix,
@@ -4550,6 +4559,9 @@ def market():
              "cached_age_s": int(CACHE.age("all_prices") or 0)}
     if _prices_stale:
         _resp["source"] = "cache_stale"; _resp["stale"] = True
+    _dt = time.time() - _t0_market
+    if _dt > 5:
+        print(f"[MARKET-SLOW] /market took {_dt:.1f}s ({len(result)} symbols)")
     return jsonify(_resp)
 
 def _poll_fill_price(order_id, hdrs, tries=6, delay=0.7):
