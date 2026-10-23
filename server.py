@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-23-v3"
+SERVER_BUILD = "2026-10-23-v4"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -4117,7 +4117,8 @@ def home():
 _HEALTH_CACHE = {"body": None, "ts": 0.0}
 
 @app.route("/health")
-def health():
+@app.route("/health/<path:_nocache>")   # distinct URL per check, defeats fetch-tool caches
+def health(_nocache=None):
     """One-page status for checking the whole system remotely (read-only,
     aggregate numbers only; never returns tokens, keys or subscriptions)."""
     if _HEALTH_CACHE["body"] is not None and time.time() - _HEALTH_CACHE["ts"] < 20:
@@ -4176,6 +4177,12 @@ def health():
                 .ilike("why", "%premium unavailable%"))
             sig["HIGH_on_notify_symbols"] = _cnt(SB.table("signals").select("id", count="exact")
                 .gte("created_at", start).eq("urgency", "HIGH").in_("sym", sorted(PUSH_ALLOWED_SYMBOLS)))
+            _since30 = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+            sig["last30m_worker_HIGH"] = _cnt(SB.table("signals").select("id", count="exact")
+                .gte("created_at", _since30).eq("source", "worker").eq("urgency", "HIGH"))
+            sig["last30m_worker_HIGH_no_premium"] = _cnt(SB.table("signals").select("id", count="exact")
+                .gte("created_at", _since30).eq("source", "worker").eq("urgency", "HIGH")
+                .ilike("why", "%premium unavailable%"))
             db["signals_today"] = sig
             db["journal_today"] = _cnt(SB.table("journal").select("id", count="exact").gte("created_at", start))
             db["snapshots_today"] = _cnt(SB.table("snapshots").select("id", count="exact").gte("ts", start))
