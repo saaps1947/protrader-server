@@ -35,6 +35,27 @@ import requests, time, threading, re, os, hmac, json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pywebpush import webpush, WebPushException
+import builtins as _builtins, collections as _collections
+
+# /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
+# memory so /health can show them without anyone digging through Render logs.
+# Only lines with these markers are kept; no tokens are ever printed by them.
+SERVER_BUILD = "2026-10-23-v3"
+_SERVER_STARTED = time.time()
+_LOG_RING = _collections.deque(maxlen=300)
+_LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
+             "Duplicate", "Auth failed", "token expired", "[StockOI] Cycle", "[ExtOI] Cycle")
+_HEALTH = {"market_build_sec": None, "market_built_at": None, "signals_in": 0}
+def print(*args, **kwargs):
+    _builtins.print(*args, **kwargs)
+    try:
+        msg = " ".join(str(a) for a in args)
+        if "[Signal \u2705]" in msg:
+            _HEALTH["signals_in"] += 1
+        elif any(k in msg for k in _LOG_KEYS):
+            _LOG_RING.append(time.strftime("%H:%M:%S", time.gmtime(time.time() + 19800)) + " " + msg[:300])
+    except Exception:
+        pass
 
 # FIX: version mismatch between what's actually deployed and what's being
 # analyzed/edited has been a repeated, documented problem for this exact
@@ -45,7 +66,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-23-v2")
+print(f"[BUILD_MARKER] server.py — build {SERVER_BUILD}")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -4093,6 +4114,95 @@ def home():
                     "time":now_ist().strftime("%d %b %Y %H:%M IST"),
                     "ok":True})
 
+_HEALTH_CACHE = {"body": None, "ts": 0.0}
+
+@app.route("/health")
+def health():
+    """One-page status for checking the whole system remotely (read-only,
+    aggregate numbers only; never returns tokens, keys or subscriptions)."""
+    if _HEALTH_CACHE["body"] is not None and time.time() - _HEALTH_CACHE["ts"] < 20:
+        return app.response_class(_HEALTH_CACHE["body"], mimetype="application/json")
+    now = time.time()
+    out = {"ok": True, "build": SERVER_BUILD, "time_ist": ist_str(),
+           "process": {"pid": os.getpid(), "uptime_min": round((now - _SERVER_STARTED) / 60, 1),
+                       "threads": threading.active_count()}}
+    # Zerodha token (age only)
+    tok_age = CACHE.age("_kite_token")
+    out["kite"] = {"token_in_memory": CACHE.get_val("_kite_token") is not None,
+                   "token_memory_age_sec": round(tok_age) if tok_age is not None else None}
+    # Market build + shared cache
+    mb = _HEALTH.get("market_built_at")
+    out["market"] = {"last_build_sec": _HEALTH.get("market_build_sec"),
+                     "last_build_ago_sec": round(now - mb) if mb else None,
+                     "shared_copy_age_sec": round(now - _MARKET_CACHE["ts"]) if _MARKET_CACHE["body"] else None}
+    # Stock OI disk cache ages
+    ages = {}
+    try:
+        for fn in os.listdir("/tmp/oi_cache"):
+            if fn.endswith(".json"):
+                try:
+                    with open(f"/tmp/oi_cache/{fn}") as f:
+                        ages[fn[:-5]] = round((now - json.load(f)["ts"]) / 60, 1)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    vals = sorted(ages.values())
+    out["oi"] = {"symbols_cached": len(vals),
+                 "age_min": {"min": vals[0], "median": vals[len(vals)//2], "max": vals[-1]} if vals else None,
+                 "older_than_15min": sorted(k for k, v in ages.items() if v > 15)}
+    # Worker heartbeat (last signal it sent)
+    try:
+        with open("/tmp/pt_last_worker_signal") as f:
+            out["worker"] = {"last_signal_sec_ago": round(now - float(f.read().strip()))}
+    except Exception:
+        out["worker"] = {"last_signal_sec_ago": None}
+    out["signals_received_since_start"] = _HEALTH.get("signals_in", 0)
+    # Supabase: today's counts
+    db = {}
+    if SB:
+        start = _ist_session_start_iso()
+        def _cnt(q):
+            try: return q.limit(1).execute().count
+            except Exception as e: return f"error: {str(e)[:80]}"
+        try:
+            sig = {}
+            for src in ("worker", "client"):
+                for urg in ("HIGH", "MEDIUM", "LOW"):
+                    sig[f"{src}_{urg}"] = _cnt(SB.table("signals").select("id", count="exact")
+                                               .gte("created_at", start).eq("source", src).eq("urgency", urg))
+            sig["worker_HIGH_no_premium"] = _cnt(SB.table("signals").select("id", count="exact")
+                .gte("created_at", start).eq("source", "worker").eq("urgency", "HIGH")
+                .ilike("why", "%premium unavailable%"))
+            sig["HIGH_on_notify_symbols"] = _cnt(SB.table("signals").select("id", count="exact")
+                .gte("created_at", start).eq("urgency", "HIGH").in_("sym", sorted(PUSH_ALLOWED_SYMBOLS)))
+            db["signals_today"] = sig
+            db["journal_today"] = _cnt(SB.table("journal").select("id", count="exact").gte("created_at", start))
+            db["snapshots_today"] = _cnt(SB.table("snapshots").select("id", count="exact").gte("ts", start))
+            db["push_subscriptions_active"] = _cnt(SB.table("push_subscriptions").select("id", count="exact").eq("active", True))
+            try:
+                pd = (SB.table("push_dedup").select("dedup_key,last_sent_at")
+                      .gte("last_sent_at", start).order("last_sent_at", desc=True).limit(20).execute()).data or []
+                db["pushes_delivered_today"] = [
+                    {"key": r["dedup_key"],
+                     "at_ist": datetime.fromisoformat(r["last_sent_at"]).astimezone(IST).strftime("%H:%M")}
+                    for r in pd]
+            except Exception as e:
+                db["pushes_delivered_today"] = f"error: {str(e)[:80]}"
+            try:
+                kv = (SB.table("server_kv").select("key,updated_at").eq("key", "kite_token").execute()).data or []
+                if kv and kv[0].get("updated_at"):
+                    db["kite_token_saved_at_ist"] = datetime.fromisoformat(kv[0]["updated_at"]).astimezone(IST).strftime("%d %b %H:%M")
+            except Exception:
+                pass
+        except Exception as e:
+            db["error"] = str(e)[:120]
+    out["supabase"] = db
+    out["recent_log"] = list(_LOG_RING)[-60:]
+    body = json.dumps(out, default=str)
+    _HEALTH_CACHE["body"] = body; _HEALTH_CACHE["ts"] = time.time()
+    return app.response_class(body, mimetype="application/json")
+
 @app.route("/ping")
 def ping():
     """Keepalive endpoint — called every 10 min by frontend to prevent Render free-tier sleep."""
@@ -4628,6 +4738,7 @@ def _market_build():
     if _prices_stale:
         _resp["source"] = "cache_stale"; _resp["stale"] = True
     _dt = time.time() - _t0_market
+    _HEALTH["market_build_sec"] = round(_dt, 1); _HEALTH["market_built_at"] = time.time()
     if _dt > 5:
         print(f"[MARKET-SLOW] /market took {_dt:.1f}s ({len(result)} symbols)")
     return jsonify(_resp)
