@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-23-v4"
+SERVER_BUILD = "2026-10-23-v5"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -132,6 +132,29 @@ if SUPABASE_URL and SUPABASE_SECRET_KEY:
     try:
         SB = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
         print("[Supabase] Connected — signals/journal persistence active")
+        # FIX (Oct 23): supabase-py shares ONE httpx client over HTTP/2 across
+        # every thread, and that is not thread-safe: concurrent writes failed
+        # with "[Errno 11] Resource temporarily unavailable" (dozens of lost
+        # signals every 5 min on /health). Switch it to a normal HTTP/1.1
+        # connection pool, which handles many threads at once.
+        try:
+            import httpx as _httpx
+            _sess = SB.postgrest.session
+            _sess._transport = _httpx.HTTPTransport(
+                retries=2, limits=_httpx.Limits(max_connections=40, max_keepalive_connections=20))
+            print("[Supabase] HTTP/1.1 connection pool enabled (thread-safe)")
+        except Exception as _te:
+            print(f"[Supabase] could not swap transport, serialising calls instead: {_te}")
+            try:
+                _sess = SB.postgrest.session
+                _orig_send = _sess.send
+                _sb_lock = threading.Lock()
+                def _locked_send(*a, **k):
+                    with _sb_lock:
+                        return _orig_send(*a, **k)
+                _sess.send = _locked_send
+            except Exception as _le:
+                print(f"[Supabase] could not serialise calls either: {_le}")
     except Exception as _sbe:
         print(f"[Supabase] Failed to connect: {_sbe}")
 else:
@@ -4183,6 +4206,15 @@ def health(_nocache=None):
             sig["last30m_worker_HIGH_no_premium"] = _cnt(SB.table("signals").select("id", count="exact")
                 .gte("created_at", _since30).eq("source", "worker").eq("urgency", "HIGH")
                 .ilike("why", "%premium unavailable%"))
+            try:
+                _rows = (SB.table("signals").select("why,created_at")
+                         .gte("created_at", _since30).eq("source", "worker").eq("urgency", "HIGH")
+                         .ilike("why", "%premium unavailable%").order("created_at", desc=True)
+                         .limit(10).execute()).data or []
+                sig["last30m_no_premium_reasons"] = [
+                    (r.get("why") or "")[(r.get("why") or "").find("premium unavailable"):][:90] for r in _rows]
+            except Exception as e:
+                sig["last30m_no_premium_reasons"] = f"error: {str(e)[:80]}"
             db["signals_today"] = sig
             db["journal_today"] = _cnt(SB.table("journal").select("id", count="exact").gte("created_at", start))
             db["snapshots_today"] = _cnt(SB.table("snapshots").select("id", count="exact").gte("ts", start))
