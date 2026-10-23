@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-23-v1")
+print("[BUILD_MARKER] server.py — build 2026-10-23-v2")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -4378,8 +4378,51 @@ def prices_only():
 
 _bg_tech_lock = threading.Lock()
 
+# FIX (Oct 23): /market rebuilt the whole 61-symbol response for EVERY caller
+# (phone and worker, every 30s each), so the worker's request often queued
+# behind a rebuild and hit its 60s timeout (worker log: repeated
+# "fetchFromServer failed: signal timed out" while the phone got data).
+# Now one build is shared for 20s, and while a rebuild runs, callers get the
+# last good copy at once instead of waiting.
+_MARKET_CACHE = {"body": None, "ts": 0.0}
+_market_build_lock = threading.Lock()
+_MARKET_FRESH_SEC = 20
+
 @app.route("/market")
 def market():
+    # Persist any credentials this caller sent, even when serving from cache,
+    # so the phone's fresh login still reaches Supabase for the worker.
+    try:
+        _k, _t = _creds()
+        if _k and _t and request.headers.get("X-Kite-Token"):
+            _persist_kite_creds(_k, _t)
+    except Exception:
+        pass
+    c = _MARKET_CACHE
+    if c["body"] is not None and time.time() - c["ts"] < _MARKET_FRESH_SEC:
+        return app.response_class(c["body"], mimetype="application/json")
+    have_copy = c["body"] is not None
+    got = _market_build_lock.acquire(blocking=not have_copy, timeout=-1 if have_copy else 90)
+    if not got:
+        if have_copy:
+            return app.response_class(c["body"], mimetype="application/json")
+        return _market_build()   # waited 90s with no copy at all: build anyway
+    try:
+        # Another caller may have rebuilt while we waited for the lock.
+        if c["body"] is not None and time.time() - c["ts"] < _MARKET_FRESH_SEC:
+            return app.response_class(c["body"], mimetype="application/json")
+        resp = _market_build()
+        try:
+            if getattr(resp, "status_code", 200) == 200:
+                c["body"] = resp.get_data(); c["ts"] = time.time()
+        except Exception:
+            pass
+        return resp
+    finally:
+        _market_build_lock.release()
+
+
+def _market_build():
     """
     Fast market snapshot: prices (Zerodha, one bulk call) + cached technicals.
     Never blocks on Yahoo — uses cached technicals if available, skips if not.
