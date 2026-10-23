@@ -45,7 +45,7 @@ from pywebpush import webpush, WebPushException
 # for "BUILD_MARKER" to confirm instantly whether a given deploy is what
 # you think it is, instead of inferring it indirectly from other log lines.
 print("=" * 60)
-print("[BUILD_MARKER] server.py — build 2026-10-22-v1")
+print("[BUILD_MARKER] server.py — build 2026-10-23-v1")
 print("[BUILD_MARKER] If you don't see this at the top of a fresh")
 print("[BUILD_MARKER] deploy's logs, the deploy did not pick up this file.")
 print("=" * 60)
@@ -871,6 +871,22 @@ def write_oi_chain(sym: str, expiry: str, atm: int, spot: float, strikes_data: d
         print(f"[Supabase] write_oi_chain failed for {sym}: {e}")
 
 
+def write_snapshots_batch(rows, source: str = "client"):
+    """One Supabase insert for a whole 5-minute capture (all symbols)."""
+    if not SB or not rows:
+        return
+    payloads = []
+    for row in rows:
+        p = dict(row); p["source"] = source; p.pop("id", None)
+        payloads.append(_scrub_placeholders(p))
+    try:
+        SB.table("snapshots").insert(payloads).execute()
+    except Exception as e:
+        print(f"[Supabase] batch snapshot insert failed ({len(payloads)} rows), writing one by one: {e}")
+        for p in payloads:
+            try: SB.table("snapshots").insert(p).execute()
+            except Exception as e2: print(f"[Supabase] write_snapshot failed for {p.get('sym')}: {e2}")
+
 def write_snapshot(row: dict, source: str = "client"):
     """
     Persist one per-symbol snapshot row — mirrors captureSnapshot() in
@@ -911,7 +927,16 @@ def snapshot_ingest():
     auth_err = _check_order_auth()
     if auth_err: return auth_err
     try:
-        row = request.get_json(force=True) or {}
+        body = request.get_json(force=True) or {}
+        # FIX (Oct 23): the app used to send ONE request per symbol (~60 at
+        # once every 5 min, from phone and worker). That burst filled the
+        # server's threads and made Supabase refuse writes ("[Errno 11]").
+        # The app now sends {"rows": [...]} once; single rows still work.
+        if isinstance(body, dict) and isinstance(body.get("rows"), list):
+            rows = [r for r in body["rows"] if isinstance(r, dict) and r.get("sym")]
+            write_snapshots_batch(rows, source="client")
+            return jsonify({"ok": True, "n": len(rows)})
+        row = body
         if not row.get("sym"):
             return jsonify({"ok": False, "error": "missing sym"}), 400
         write_snapshot(row, source="client")
