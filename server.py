@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-23-v5"
+SERVER_BUILD = "2026-10-24-v3"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -76,6 +76,16 @@ print("=" * 60)
 # ═══════════════════════════════════════════════════════════════
 
 IST = timezone(timedelta(hours=5, minutes=30))
+def _is_contract_for(tradingsymbol, sym):
+    """True only if tradingsymbol is an F&O contract OF sym itself.
+    FIX (Oct 23 audit): plain startswith(sym) also matched other underlyings
+    sharing the prefix (ITC -> ITCHOTELS, LT -> LTTS/LTM, NTPC -> NTPCGREEN,
+    SILVER -> SILVERM). In the simulation, ITC 2870 CE resolved to
+    ITCHOTELS26OCT2870CE, so premiums AND order placement could hit the wrong
+    stock. Contract names continue with the expiry's digits right after sym."""
+    ts = tradingsymbol or ""
+    return ts.startswith(sym) and len(ts) > len(sym) and ts[len(sym)].isdigit()
+
 def now_ist(): return datetime.now(IST)
 def ist_str(): return now_ist().strftime("%H:%M:%S IST")
 
@@ -525,7 +535,7 @@ def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: 
         for line in lines[1:]:
             cols = line.split(",")
             if len(cols) < 10: continue
-            if not cols[2].startswith(sym): continue
+            if not _is_contract_for(cols[2], sym): continue
             if cols[9] not in ("CE", "PE"): continue
             try:
                 exp = datetime.strptime(cols[5], "%Y-%m-%d").date()
@@ -540,7 +550,7 @@ def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: 
         for line in lines[1:]:
             cols = line.split(",")
             if len(cols) < 10: continue
-            if not cols[2].startswith(sym): continue
+            if not _is_contract_for(cols[2], sym): continue
             if cols[9] != opt_type: continue
             if cols[5] != best_exp: continue
             try:
@@ -707,15 +717,31 @@ def upsert_journal_entry(entry: dict):
         # restart wiped its memory). Upserting it would INSERT a brand-new
         # closed trade with a late entry price — a phantom that inflates trade
         # counts and corrupts win rate. Ignore it instead.
-        if entry.get("status") != "OPEN":
-            try:
-                _ex = SB.table("journal").select("id").eq("id", entry.get("id")).execute()
-                if not (_ex.data or []):
-                    print(f"[Supabase] Ignored {entry.get('status')} for unknown trade {entry.get('id')} "
-                          f"({entry.get('sym')} {entry.get('bias')}) — its OPEN row was never stored")
+        # FIX (Oct 24 simulation): phone and worker both report every exit.
+        # A late report of an EARLIER step (T1 after T2) moved the trade
+        # backwards and re-sent the exit notification, and two final closes
+        # from different devices overwrote each other's P&L (AXISBANK -2 vs
+        # -14). Now a trade never moves backwards, and the FIRST close stands.
+        _RANK = {"OPEN": 0, "T1_HIT": 1, "VOID": 2.5,
+                 "SL_HIT": 3, "T2_HIT": 3, "TIME_EXIT": 3, "MANUAL": 3, "CLOSED": 3}
+        _new_status = entry.get("status")
+        try:
+            _ex = SB.table("journal").select("id,status").eq("id", entry.get("id")).execute()
+            _ex_rows = _ex.data or []
+            if not _ex_rows and _new_status != "OPEN":
+                print(f"[Supabase] Ignored {_new_status} for unknown trade {entry.get('id')} "
+                      f"({entry.get('sym')} {entry.get('bias')}) — its OPEN row was never stored")
+                return
+            if _ex_rows:
+                _old_status = _ex_rows[0].get("status")
+                _ro, _rn = _RANK.get(_old_status, 0), _RANK.get(_new_status, 0)
+                if _ro > _rn or (_ro >= 3 and _rn >= 3):
+                    if _old_status != _new_status or _ro < 3:
+                        print(f"[Supabase] Kept {entry.get('sym')} {entry.get('id')} at {_old_status} "
+                              f"(ignored later report: {_new_status})")
                     return
-            except Exception as _pe:
-                print(f"[Supabase] phantom check failed for {entry.get('id')}, writing anyway: {_pe}")
+        except Exception as _pe:
+            print(f"[Supabase] status check failed for {entry.get('id')}, writing anyway: {_pe}")
 
         # FIX: confirmed via direct code trace — checkSignalLevels() already
         # correctly detects and PERSISTS every SL/T1/T2 transition via this
@@ -989,6 +1015,8 @@ def snapshot_ingest():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+_push_claim_lock = threading.Lock()
+
 @app.route("/ingest_signal", methods=["POST"])
 def ingest_signal():
     """
@@ -1064,6 +1092,19 @@ def ingest_signal():
             # enough that a genuinely new occurrence later in the day
             # still notifies.
             push_dedup_key = f"{sig.get('sym')}_{sig.get('bias')}"
+            # FIX (Oct 24 simulation): phone and worker can report the same HIGH
+            # signal within the same second; both passed the Supabase check
+            # before either push was recorded, so SENSEX was notified twice.
+            # Claim the key in memory first (atomic under a lock); a second
+            # report within 2 minutes is skipped.
+            with _push_claim_lock:
+                _claim_age = CACHE.age(f"push_claim_{push_dedup_key}")
+                _claimed = _claim_age is not None and _claim_age < 120
+                if not _claimed:
+                    CACHE.set(f"push_claim_{push_dedup_key}", True)
+            if _claimed:
+                print(f"[Push] SKIPPED {sig.get('sym')} — same signal already being notified (from another device)")
+                return jsonify({"ok": True})
             # FIX: confirmed real — CACHE is purely in-memory (self._store =
             # {}), tied to the single running process. Every server
             # restart wipes it completely, resetting the "already notified"
@@ -1107,13 +1148,22 @@ def ingest_signal():
                 if SB:
                     try:
                         existing = (SB.table("journal")
-                                    .select("id")
+                                    .select("id,created_at")
                                     .eq("sym", sig.get("sym"))
                                     .eq("bias", sig.get("bias"))
                                     .in_("status", ["OPEN", "T1_HIT"])
                                     .gte("created_at", _ist_session_start_iso())   # audit fix: see upsert_journal_entry
                                     .execute())
-                        is_repeat_alert = bool(existing.data)
+                        # FIX (Oct 24 sim): the app journals a HIGH trade a moment
+                        # BEFORE it reports the signal here, so a brand-new trade
+                        # always found its own fresh row and was announced as
+                        # "STILL ACTIVE … no new journal entry". Only a position
+                        # opened 3+ minutes earlier counts as already existing.
+                        _cut = datetime.now(timezone.utc) - timedelta(minutes=3)
+                        def _older(r):
+                            try: return datetime.fromisoformat(str(r.get("created_at")).replace("Z", "+00:00")) < _cut
+                            except Exception: return False
+                        is_repeat_alert = any(_older(r) for r in (existing.data or []))
                     except Exception as e:
                         print(f"[Push] could not check existing position for {sig.get('sym')} — labeling as new: {e}")
                 label = "STILL ACTIVE" if is_repeat_alert else "NEW"
@@ -4137,6 +4187,181 @@ def home():
                     "time":now_ist().strftime("%d %b %Y %H:%M IST"),
                     "ok":True})
 
+# ═══════════════════════════════════════════════════════════════
+# BACKTEST (Oct 24) — simple win rates from the last N days of real data.
+#  A) Signal replay: every signal recorded in `snapshots` (5-min rows with
+#     the live signal's direction/confidence/strategy/entry/SL/T1 + price)
+#     is replayed against the prices that followed the same day:
+#     T1 hit first = WIN, SL hit first = LOSS, otherwise exit at 15:20
+#     (MCX 23:20) and count it a win if in profit. One trade per
+#     symbol+direction per day (the first time it appears).
+#  B) Journal: the trades the app actually took, with their real P&L.
+# Runs in a background thread, one day at a time, result cached in /tmp.
+# ═══════════════════════════════════════════════════════════════
+_BT = {"status": "idle", "progress": "", "started": 0.0, "result": None, "error": None}
+_BT_FILE = "/tmp/pt_backtest.json"
+_MCX_SET = {"CRUDEOIL", "GOLD", "SILVER", "NATURALGAS"}
+_IDX_SET = {"NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX", "MIDCPNIFTY"}
+
+def _bt_bucket(conf):
+    c = conf or 0
+    return "88+" if c >= 88 else "82-87 (HIGH)" if c >= 82 else "75-81" if c >= 75 else "<75"
+
+def _bt_seg(sym):
+    return "Index" if sym in _IDX_SET else "MCX" if sym in _MCX_SET else "Stock"
+
+def _bt_add(tab, key, win, pnl_pct):
+    t = tab.setdefault(key, {"n": 0, "wins": 0, "pnl_pct_sum": 0.0})
+    t["n"] += 1; t["wins"] += 1 if win else 0; t["pnl_pct_sum"] += pnl_pct
+
+def _bt_finish(tab, min_n=1):
+    out = []
+    for k, t in tab.items():
+        if t["n"] < min_n: continue
+        out.append({"name": k, "trades": t["n"], "win_rate": round(100.0 * t["wins"] / t["n"], 1),
+                    "avg_move_pct": round(t["pnl_pct_sum"] / t["n"], 2)})
+    return sorted(out, key=lambda r: (-r["trades"]))
+
+def _bt_fetch_all(q_builder, page=1000, max_rows=20000):
+    rows, a = [], 0
+    while a < max_rows:
+        chunk = q_builder().range(a, a + page - 1).execute().data or []
+        rows.extend(chunk)
+        if len(chunk) < page: break
+        a += page
+    return rows
+
+def _bt_run(days):
+    try:
+        _BT.update(status="running", started=time.time(), error=None, progress="starting")
+        today = datetime.now(IST).date()
+        allt, by_strat, by_conf, by_seg, by_setup = {}, {}, {}, {}, {}
+        n_days_with_data = 0
+        for i in range(days, 0, -1):
+            d = today - timedelta(days=i)
+            if d.weekday() >= 5: continue
+            _BT["progress"] = f"replaying {d.isoformat()} ({days - i + 1}/{days})"
+            d0 = datetime(d.year, d.month, d.day, 9, 0, tzinfo=IST)
+            d1 = datetime(d.year, d.month, d.day, 23, 45, tzinfo=IST)
+            cols = "ts,sym,px,signal_bias,signal_conf,signal_strategy,signal_setup,sig_entry,sig_sl,sig_t1"
+            try:
+                rows = _bt_fetch_all(lambda: SB.table("snapshots").select(cols)
+                                     .gte("ts", d0.astimezone(timezone.utc).isoformat())
+                                     .lte("ts", d1.astimezone(timezone.utc).isoformat()).order("ts"))
+            except Exception as e:
+                print(f"[Backtest] {d} fetch failed: {e}"); continue
+            if not rows: continue
+            n_days_with_data += 1
+            series = {}
+            for r in rows:
+                try:
+                    t = datetime.fromisoformat(str(r["ts"]).replace("Z", "+00:00")).astimezone(IST)
+                    px = float(r.get("px") or 0)
+                except Exception:
+                    continue
+                if px <= 0: continue
+                series.setdefault(r["sym"], []).append((t, px, r))
+            for sym, pts in series.items():
+                pts.sort(key=lambda x: x[0])
+                cutoff = (23, 20) if sym in _MCX_SET else (15, 20)
+                taken = set()
+                for idx, (t, px, r) in enumerate(pts):
+                    bias = (r.get("signal_bias") or "").upper()
+                    if bias not in ("BULLISH", "BEARISH") or (bias in taken): continue
+                    if sym not in _MCX_SET and (t.hour, t.minute) < (9, 45): continue   # no-trade window
+                    if (t.hour, t.minute) >= cutoff: continue
+                    e, sl, t1 = (float(r.get("sig_entry") or 0), float(r.get("sig_sl") or 0), float(r.get("sig_t1") or 0))
+                    # only underlying-priced levels can be replayed against px
+                    if not (e and sl and t1) or abs(e - px) / px > 0.05: continue
+                    if bias == "BULLISH" and not (sl < e < t1): continue
+                    if bias == "BEARISH" and not (t1 < e < sl): continue
+                    taken.add(bias)
+                    outcome, exit_px = None, None
+                    for (t2, px2, _r2) in pts[idx + 1:]:
+                        if (t2.hour, t2.minute) >= cutoff:
+                            exit_px = px2; outcome = "EOD"; break
+                        if bias == "BULLISH":
+                            if px2 >= t1: outcome, exit_px = "T1", t1; break
+                            if px2 <= sl: outcome, exit_px = "SL", sl; break
+                        else:
+                            if px2 <= t1: outcome, exit_px = "T1", t1; break
+                            if px2 >= sl: outcome, exit_px = "SL", sl; break
+                    if outcome is None:
+                        exit_px = pts[-1][1]; outcome = "EOD"
+                    move = (exit_px - e) / e * 100.0 * (1 if bias == "BULLISH" else -1)
+                    win = outcome == "T1" or (outcome == "EOD" and move > 0)
+                    conf = float(r.get("signal_conf") or 0)
+                    strat = (r.get("signal_strategy") or "Unknown")[:60]
+                    _bt_add(allt, "All signals", win, move)
+                    _bt_add(by_strat, strat, win, move)
+                    _bt_add(by_conf, _bt_bucket(conf), win, move)
+                    _bt_add(by_seg, _bt_seg(sym), win, move)
+                    _bt_add(by_setup, (r.get("signal_setup") or "Unknown")[:60], win, move)
+        # B) journal: trades actually taken
+        jr_all, jr_strat, jr_conf, jr_seg = {}, {}, {}, {}
+        try:
+            since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+            jrows = _bt_fetch_all(lambda: SB.table("journal")
+                                  .select("sym,strategy,confidence,status,pnl,entry_px,exit_px,created_at")
+                                  .gte("created_at", since).order("created_at"))
+            for r in jrows:
+                if r.get("status") not in ("SL_HIT", "T2_HIT", "TIME_EXIT", "MANUAL", "CLOSED"): continue
+                pnl = float(r.get("pnl") or 0); ep = float(r.get("entry_px") or 0)
+                xp = float(r.get("exit_px") or 0)
+                pct = ((xp - ep) / ep * 100.0) if (ep and xp) else 0.0   # option premium % change
+                win = pnl > 0
+                _bt_add(jr_all, "All journal trades", win, pct)
+                _bt_add(jr_strat, (r.get("strategy") or "Unknown")[:60], win, pct)
+                _bt_add(jr_conf, _bt_bucket(float(r.get("confidence") or 0)), win, pct)
+                _bt_add(jr_seg, _bt_seg(r.get("sym") or ""), win, pct)
+        except Exception as e:
+            print(f"[Backtest] journal read failed: {e}")
+        res = {
+            "generated_ist": datetime.now(IST).strftime("%d %b %Y %H:%M"), "days": days,
+            "trading_days_with_data": n_days_with_data,
+            "how": ("Signal replay: first appearance of each symbol+direction per day after 9:45, "
+                    "T1 first = win, SL first = loss, else 15:20 (MCX 23:20) exit, win if in profit. "
+                    "Moves are % of the underlying. Journal: real closed trades, win = P&L > 0."),
+            "signal_replay": {"overall": _bt_finish(allt), "by_strategy": _bt_finish(by_strat, 5),
+                              "by_confidence": _bt_finish(by_conf), "by_segment": _bt_finish(by_seg),
+                              "by_layer_combo": _bt_finish(by_setup, 5)},
+            "journal": {"overall": _bt_finish(jr_all), "by_strategy": _bt_finish(jr_strat, 3),
+                        "by_confidence": _bt_finish(jr_conf), "by_segment": _bt_finish(jr_seg)},
+        }
+        _BT.update(status="done", result=res, progress="done")
+        try:
+            with open(_BT_FILE, "w") as f: json.dump({"ts": time.time(), "result": res}, f)
+        except Exception: pass
+        print(f"[Backtest] done in {time.time() - _BT['started']:.0f}s")
+    except Exception as e:
+        _BT.update(status="error", error=str(e)[:200])
+        print(f"[Backtest] failed: {e}")
+
+@app.route("/backtest")
+@app.route("/backtest/<path:_nocache>")
+def backtest(_nocache=None):
+    """Simple win rates for the last N days (default 60). First call starts the
+    job; call again after a few minutes for the result (cached 6 hours)."""
+    if not SB:
+        return jsonify({"ok": False, "error": "Supabase not configured"})
+    days = max(5, min(120, int(request.args.get("days", "60") or 60)))
+    if _BT["status"] == "running":
+        return jsonify({"ok": True, "status": "running", "progress": _BT["progress"],
+                        "elapsed_sec": round(time.time() - _BT["started"])})
+    cached = _BT.get("result")
+    if cached is None:
+        try:
+            with open(_BT_FILE) as f:
+                c = json.load(f)
+                if time.time() - c["ts"] < 6 * 3600: cached = c["result"]; _BT["result"] = cached
+        except Exception:
+            pass
+    fresh = request.args.get("refresh") == "1"
+    if cached and not fresh and cached.get("days") == days:
+        return jsonify({"ok": True, "status": "done", "result": cached})
+    threading.Thread(target=_bt_run, args=(days,), daemon=True).start()
+    return jsonify({"ok": True, "status": "started", "note": "check again in a few minutes"})
+
 _HEALTH_CACHE = {"body": None, "ts": 0.0}
 
 @app.route("/health")
@@ -4876,7 +5101,7 @@ def exit_order():
         best_exp = None; best_days = 999
         for line in csv.strip().split("\n")[1:]:
             cols = line.split(",")
-            if len(cols)<10 or not cols[2].startswith(sym): continue
+            if len(cols)<10 or not _is_contract_for(cols[2], sym): continue
             if cols[9] not in ["CE","PE"]: continue
             try:
                 d2 = (datetime.strptime(cols[5],"%Y-%m-%d").date()-today_n).days
@@ -4886,7 +5111,7 @@ def exit_order():
         tradingsymbol = None
         for line in csv.strip().split("\n")[1:]:
             cols = line.split(",")
-            if len(cols)<10 or not cols[2].startswith(sym): continue
+            if len(cols)<10 or not _is_contract_for(cols[2], sym): continue
             if cols[9]!=opt or cols[5]!=best_exp: continue
             try:
                 if int(float(cols[6]))==strike:
@@ -5001,7 +5226,7 @@ def place_order():
         for line in csv.strip().split("\n")[1:]:
             cols = line.split(",")
             if len(cols)<10: continue
-            if not cols[2].startswith(sym): continue
+            if not _is_contract_for(cols[2], sym): continue
             if cols[9] not in ["CE","PE"]: continue
             try:
                 exp = datetime.strptime(cols[5],"%Y-%m-%d").date()
@@ -5017,7 +5242,7 @@ def place_order():
         for line in csv.strip().split("\n")[1:]:
             cols = line.split(",")
             if len(cols)<10: continue
-            if not cols[2].startswith(sym): continue
+            if not _is_contract_for(cols[2], sym): continue
             if cols[9] != opt: continue
             if cols[5] != best_exp: continue
             try:
