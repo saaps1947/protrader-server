@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-25-v1"
+SERVER_BUILD = "2026-10-25-v2"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -4408,6 +4408,7 @@ def _fl_load(days):
             "pdh,pdl,cpr_type,cpr_position,trend15,hh_hl,lh_ll,smc_structure,ob_bull,ob_bear,fvg_bull,fvg_bear,"
             "pcr,ce_chg,pe_chg,buildup,avg_range_pct,signal_bias,signal_conf,signal_strategy")
     today = datetime.now(IST).date()
+    nifty_ret = {}
     rows_out = []          # (day_idx, sym, minute, seg, votes(tuple), R_long, R_short, vol_ratio, narrow, sig_bias, sig_conf, sig_strat)
     day_list = []
     for i in range(days, 0, -1):
@@ -4438,6 +4439,8 @@ def _fl_load(days):
             ser[key[1]] = (m, px, r)
         for sym, buckets in series.items():
             pts = [buckets[k] for k in sorted(buckets)]
+            if sym == "NIFTY" and len(pts) > 2:
+                nifty_ret[di] = (pts[-1][1] - pts[0][1]) / pts[0][1] * 100.0
             mcx = sym in _MCX_SET
             seg = "MCX" if mcx else "Index" if sym in _IDX_SET else "Stock"
             cutoff = 23 * 60 + 20 if mcx else 15 * 60 + 20
@@ -4472,9 +4475,9 @@ def _fl_load(days):
                 rows_out.append((di, sym, m, seg, tuple(_fl_votes(r, px)), rl, rs, vr,
                                  (r.get("cpr_type") or "") == "NARROW",
                                  (r.get("signal_bias") or "").upper(), sc, (r.get("signal_strategy") or "")[:50]))
-    return {"rows": rows_out, "days": day_list}
+    return {"rows": rows_out, "days": day_list, "nifty_ret": nifty_ret}
 
-def _fl_eval(data, cfg, day_from=0, day_to=10**9):
+def _fl_eval(data, cfg, day_from=0, day_to=10**9, day_set=None):
     """cfg: {"weights": {factor: w}, "threshold": t, "require": [factor..], "min_vol": x,
              "segments": [...], "narrow_cpr": bool, "direction": "both|long|short"}"""
     w = [float((cfg.get("weights") or {}).get(n, 0)) for n in _FL_FACTORS]
@@ -4484,6 +4487,7 @@ def _fl_eval(data, cfg, day_from=0, day_to=10**9):
     taken = set(); n = wins = 0; tot = 0.0; gw = gl = 0.0
     for (di, sym, m, seg, votes, rl, rs, vr, narrow, _sb, _sc, _ss) in data["rows"]:
         if di < day_from or di >= day_to or seg not in segs: continue
+        if day_set is not None and di not in day_set: continue
         if minv and vr < minv: continue
         if cfg.get("narrow_cpr") and not narrow: continue
         sc = 0.0
@@ -4503,10 +4507,11 @@ def _fl_eval(data, cfg, day_from=0, day_to=10**9):
             "avg_R": round(tot / n, 3) if n else 0, "total_R": round(tot, 1),
             "profit_factor": round(gw / gl, 2) if gl else None}
 
-def _fl_eval_engine(data, min_conf, day_from=0, day_to=10**9, strat=None):
+def _fl_eval_engine(data, min_conf, day_from=0, day_to=10**9, strat=None, day_set=None):
     taken = set(); n = wins = 0; tot = 0.0; gw = gl = 0.0
     for (di, sym, m, seg, votes, rl, rs, vr, narrow, sb, sc, ss) in data["rows"]:
         if di < day_from or di >= day_to or sb not in ("BULLISH", "BEARISH") or sc < min_conf: continue
+        if day_set is not None and di not in day_set: continue
         if strat and ss != strat: continue
         side = 1 if sb == "BULLISH" else -1; key = (di, sym, side)
         if key in taken: continue
@@ -4593,6 +4598,76 @@ def factor_lab(_nocache=None):
     days = max(10, min(90, int(request.args.get("days", "60") or 60)))
     threading.Thread(target=_fl_run, args=(days,), daemon=True).start()
     return jsonify({"ok": True, "status": "started", "note": "takes a few minutes; call again"})
+
+_FL_CODES = {"S20": "SMA20", "ST": "SMA trend 20>50", "VW": "VWAP", "ORB": "ORB", "ORBV": "ORB + volume",
+             "RSI": "RSI momentum", "T15": "15m trend", "HH": "HH/HL structure", "SMC": "SMC structure",
+             "OB": "Order block", "FVG": "FVG", "PD": "PDH/PDL break", "CPR": "CPR position", "PCR": "PCR",
+             "OIF": "OI flow (chg)", "OIB": "OI buildup", "DAY": "Day momentum"}
+
+def _fl_parse_model(txt):
+    """'VW2,PCR2,OB1~4~S~stock' -> cfg. parts: weights ~ threshold ~ L|S|B ~ stock|index|mcx|all ~ req code"""
+    parts = txt.split("~")
+    w = {}
+    for tok in (parts[0].split(",") if parts[0] else []):
+        code = "".join(ch for ch in tok if not ch.isdigit() and ch != ".")
+        num = tok[len(code):] or "1"
+        if code in _FL_CODES: w[_FL_CODES[code]] = float(num)
+    cfg = {"weights": w, "threshold": float(parts[1]) if len(parts) > 1 and parts[1] else 1,
+           "direction": {"L": "long", "S": "short"}.get(parts[2].upper() if len(parts) > 2 else "B", "both")}
+    if len(parts) > 3 and parts[3]:
+        cfg["segments"] = {"stock": ["Stock"], "index": ["Index"], "mcx": ["MCX"], "nomcx": ["Stock", "Index"]}.get(parts[3].lower(), ["Stock", "Index", "MCX"])
+    if len(parts) > 4 and parts[4] in _FL_CODES: cfg["require"] = [_FL_CODES[parts[4]]]
+    return cfg
+
+def _fl_regime_sets(data):
+    up = {d for d, r in data.get("nifty_ret", {}).items() if r > 0.15}
+    dn = {d for d, r in data.get("nifty_ret", {}).items() if r < -0.15}
+    return up, dn
+
+@app.route("/factor_lab_eval/p/<preset>")
+def factor_lab_preset(preset):
+    data = _FL.get("data")
+    if not data: return jsonify({"ok": False, "error": "run /factor_lab first"})
+    up, dn = _fl_regime_sets(data)
+    def tri(cfg):
+        a = _fl_eval(data, cfg); u = _fl_eval(data, cfg, day_set=up); d = _fl_eval(data, cfg, day_set=dn)
+        return {"all": [a["trades"], a["win_rate"], a["avg_R"]], "up_days": [u["trades"], u["win_rate"], u["avg_R"]],
+                "down_days": [d["trades"], d["win_rate"], d["avg_R"]]}
+    out = {"ok": True, "format": "[trades, win_rate, avg_R]", "nifty_up_days": len(up), "nifty_down_days": len(dn),
+           "flat_days": len(data["days"]) - len(up) - len(dn)}
+    if preset in ("summary", "factors"):
+        base = {"long": tri({"weights": {}, "threshold": 0, "direction": "long"}),
+                "short": tri({"weights": {}, "threshold": 0, "direction": "short"})}
+        out["baseline_no_indicator"] = base
+        fac = []
+        for code, name in _FL_CODES.items():
+            for side in ("long", "short"):
+                t = tri({"weights": {name: 1}, "threshold": 1, "direction": side})
+                b = base[side]
+                t["edge_vs_baseline_R"] = {k: round(t[k][2] - b[k][2], 3) for k in ("all", "up_days", "down_days")}
+                fac.append(dict(t, factor=name, side=side))
+        out["factors"] = sorted(fac, key=lambda x: -(x["edge_vs_baseline_R"]["up_days"] + x["edge_vs_baseline_R"]["down_days"]))
+        eng = {}
+        for c in (75, 82, 88):
+            a = _fl_eval_engine(data, c); u = _fl_eval_engine(data, c, day_set=up); d = _fl_eval_engine(data, c, day_set=dn)
+            eng[f"conf>={c}"] = {"all": [a["trades"], a["win_rate"], a["avg_R"]], "up_days": [u["trades"], u["win_rate"], u["avg_R"]],
+                                 "down_days": [d["trades"], d["win_rate"], d["avg_R"]]}
+        out["current_engine"] = eng
+    return jsonify(out)
+
+@app.route("/factor_lab_eval/m/<path:models>")
+def factor_lab_models(models):
+    """Test models written as e.g. /factor_lab_eval/m/VW2,PCR2,OB1~4~B;ORB1,SMC1~2~L"""
+    data = _FL.get("data")
+    if not data: return jsonify({"ok": False, "error": "run /factor_lab first"})
+    up, dn = _fl_regime_sets(data)
+    nd = len(data["days"]); split = max(1, int(nd * 2 / 3)); res = []
+    for m in models.split(";")[:20]:
+        cfg = _fl_parse_model(m)
+        f = lambda **k: (lambda r: [r["trades"], r["win_rate"], r["avg_R"]])(_fl_eval(data, cfg, **k))
+        res.append({"model": m, "all": f(), "train": f(day_from=0, day_to=split), "test": f(day_from=split),
+                    "up_days": f(day_set=up), "down_days": f(day_set=dn)})
+    return jsonify({"ok": True, "format": "[trades, win_rate, avg_R]", "codes": _FL_CODES, "results": res})
 
 @app.route("/factor_lab_eval/<path:_nocache>")
 def factor_lab_eval(_nocache=None):
