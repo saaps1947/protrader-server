@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-24-v3"
+SERVER_BUILD = "2026-10-25-v1"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -4361,6 +4361,251 @@ def backtest(_nocache=None):
         return jsonify({"ok": True, "status": "done", "result": cached})
     threading.Thread(target=_bt_run, args=(days,), daemon=True).start()
     return jsonify({"ok": True, "status": "started", "note": "check again in a few minutes"})
+
+# ═══════════════════════════════════════════════════════════════
+# FACTOR LAB (Oct 25) — test any scoring model on the recorded snapshots.
+# Loads N days of 5-min snapshots once (cached in memory), turns each row
+# into ±1/0 votes per indicator, and precomputes what a long and a short
+# entered at that row would have earned (SL 0.4×ADR, target 0.6×ADR = 1.5R,
+# else exit 15:20 / MCX 23:20). Any weighting can then be scored in seconds.
+# ═══════════════════════════════════════════════════════════════
+_FL = {"status": "idle", "progress": "", "data": None, "report": None, "error": None, "started": 0.0}
+_FL_FACTORS = ["SMA20", "SMA trend 20>50", "VWAP", "ORB", "ORB + volume", "RSI momentum", "15m trend",
+               "HH/HL structure", "SMC structure", "Order block", "FVG", "PDH/PDL break", "CPR position",
+               "PCR", "OI flow (chg)", "OI buildup", "Day momentum"]
+
+def _fl_votes(r, px):
+    def f(x, d=0.0):
+        try: return float(x or 0)
+        except Exception: return d
+    v = []
+    v.append(1 if f(r.get("above_sma20")) else (-1 if f(r.get("sma20")) else 0))
+    st = (r.get("sma_trend") or "").upper(); v.append(1 if st == "BULLISH" else -1 if st == "BEARISH" else 0)
+    v.append((1 if f(r.get("above_vwap")) else -1) if f(r.get("vwap")) else 0)
+    o = (r.get("orb_state") or "")
+    v.append(1 if o in ("breakout", "bear_failed") else -1 if o in ("breakdown", "bull_failed") else 0)
+    vo = f(r.get("orb_vol_ok"))
+    v.append(1 if (o == "breakout" and vo) else -1 if (o == "breakdown" and vo) else 0)
+    rsi = f(r.get("rsi")); v.append(0 if not rsi else 1 if rsi >= 55 else -1 if rsi <= 45 else 0)
+    t15 = (r.get("trend15") or "").upper(); v.append(1 if "BULL" in t15 else -1 if "BEAR" in t15 else 0)
+    v.append(1 if f(r.get("hh_hl")) else -1 if f(r.get("lh_ll")) else 0)
+    sm = (r.get("smc_structure") or "").upper(); v.append(1 if sm == "BULLISH" else -1 if sm == "BEARISH" else 0)
+    ob, obr = f(r.get("ob_bull")), f(r.get("ob_bear"))
+    v.append(1 if (ob and 0 <= (px - ob) / px <= 0.005) else -1 if (obr and 0 <= (obr - px) / px <= 0.005) else 0)
+    fb, fr = f(r.get("fvg_bull")), f(r.get("fvg_bear")); v.append(1 if fb > fr else -1 if fr > fb else 0)
+    pdh, pdl = f(r.get("pdh")), f(r.get("pdl")); v.append(1 if (pdh and px > pdh) else -1 if (pdl and px < pdl) else 0)
+    cp = r.get("cpr_position") or ""; v.append(1 if cp == "above_tc" else -1 if cp == "below_bc" else 0)
+    pcr = f(r.get("pcr")); v.append(0 if not pcr else 1 if pcr >= 1.2 else -1 if pcr <= 0.7 else 0)
+    ce, pe = f(r.get("ce_chg")), f(r.get("pe_chg"))
+    v.append(1 if (pe > 0 and ce <= 0) else -1 if (ce > 0 and pe <= 0) else 0)
+    bu = (r.get("buildup") or "").upper()
+    v.append(1 if bu in ("LONG_BUILDUP", "SHORT_COVERING") else -1 if bu in ("SHORT_BUILDUP", "LONG_UNWINDING") else 0)
+    pct = f(r.get("pct")); v.append(1 if pct >= 0.3 else -1 if pct <= -0.3 else 0)
+    return v
+
+def _fl_load(days):
+    cols = ("ts,sym,px,pct,sma20,above_sma20,sma_trend,rsi,vwap,above_vwap,vol_ratio,orb_state,orb_vol_ok,"
+            "pdh,pdl,cpr_type,cpr_position,trend15,hh_hl,lh_ll,smc_structure,ob_bull,ob_bear,fvg_bull,fvg_bear,"
+            "pcr,ce_chg,pe_chg,buildup,avg_range_pct,signal_bias,signal_conf,signal_strategy")
+    today = datetime.now(IST).date()
+    rows_out = []          # (day_idx, sym, minute, seg, votes(tuple), R_long, R_short, vol_ratio, narrow, sig_bias, sig_conf, sig_strat)
+    day_list = []
+    for i in range(days, 0, -1):
+        d = today - timedelta(days=i)
+        if d.weekday() >= 5: continue
+        _FL["progress"] = f"loading {d.isoformat()}"
+        d0 = datetime(d.year, d.month, d.day, 9, 0, tzinfo=IST).astimezone(timezone.utc).isoformat()
+        d1 = datetime(d.year, d.month, d.day, 23, 45, tzinfo=IST).astimezone(timezone.utc).isoformat()
+        try:
+            raw = _bt_fetch_all(lambda: SB.table("snapshots").select(cols).gte("ts", d0).lte("ts", d1).order("ts"),
+                                max_rows=30000)
+        except Exception as e:
+            print(f"[FactorLab] {d} load failed: {e}"); continue
+        if not raw: continue
+        di = len(day_list); day_list.append(d.isoformat())
+        series = {}
+        for r in raw:
+            try:
+                t = datetime.fromisoformat(str(r["ts"]).replace("Z", "+00:00")).astimezone(IST)
+                px = float(r.get("px") or 0)
+            except Exception:
+                continue
+            if px <= 0: continue
+            m = t.hour * 60 + t.minute
+            key = (r["sym"], m // 5)
+            ser = series.setdefault(r["sym"], {})
+            if key[1] in ser: continue            # phone + worker both write: keep one per 5 min
+            ser[key[1]] = (m, px, r)
+        for sym, buckets in series.items():
+            pts = [buckets[k] for k in sorted(buckets)]
+            mcx = sym in _MCX_SET
+            seg = "MCX" if mcx else "Index" if sym in _IDX_SET else "Stock"
+            cutoff = 23 * 60 + 20 if mcx else 15 * 60 + 20
+            lo_m, hi_m = (9 * 60 + 30, 22 * 60 + 30) if mcx else (9 * 60 + 45, 14 * 60 + 45)
+            for idx, (m, px, r) in enumerate(pts):
+                if m < lo_m or m > hi_m: continue
+                try: adr = float(r.get("avg_range_pct") or 0)
+                except Exception: adr = 0
+                if adr <= 0 or adr > 8: adr = 1.5 if mcx else 0.8 if seg == "Index" else 1.2
+                sl = 0.4 * adr / 100.0; tg = 0.6 * adr / 100.0
+                rl = rs = None
+                for (m2, px2, _r2) in pts[idx + 1:]:
+                    mv = (px2 - px) / px
+                    if m2 >= cutoff:
+                        if rl is None: rl = max(-1.0, min(1.5, mv / sl))
+                        if rs is None: rs = max(-1.0, min(1.5, -mv / sl))
+                        break
+                    if rl is None:
+                        if mv >= tg: rl = 1.5
+                        elif mv <= -sl: rl = -1.0
+                    if rs is None:
+                        if -mv >= tg: rs = 1.5
+                        elif -mv <= -sl: rs = -1.0
+                    if rl is not None and rs is not None: break
+                last_mv = (pts[-1][1] - px) / px
+                if rl is None: rl = max(-1.0, min(1.5, last_mv / sl))
+                if rs is None: rs = max(-1.0, min(1.5, -last_mv / sl))
+                try: vr = float(r.get("vol_ratio") or 0)
+                except Exception: vr = 0
+                try: sc = float(r.get("signal_conf") or 0)
+                except Exception: sc = 0
+                rows_out.append((di, sym, m, seg, tuple(_fl_votes(r, px)), rl, rs, vr,
+                                 (r.get("cpr_type") or "") == "NARROW",
+                                 (r.get("signal_bias") or "").upper(), sc, (r.get("signal_strategy") or "")[:50]))
+    return {"rows": rows_out, "days": day_list}
+
+def _fl_eval(data, cfg, day_from=0, day_to=10**9):
+    """cfg: {"weights": {factor: w}, "threshold": t, "require": [factor..], "min_vol": x,
+             "segments": [...], "narrow_cpr": bool, "direction": "both|long|short"}"""
+    w = [float((cfg.get("weights") or {}).get(n, 0)) for n in _FL_FACTORS]
+    req = [i for i, n in enumerate(_FL_FACTORS) if n in (cfg.get("require") or [])]
+    thr = float(cfg.get("threshold", 3)); minv = float(cfg.get("min_vol", 0))
+    segs = set(cfg.get("segments") or ["Stock", "Index", "MCX"]); dirn = cfg.get("direction", "both")
+    taken = set(); n = wins = 0; tot = 0.0; gw = gl = 0.0
+    for (di, sym, m, seg, votes, rl, rs, vr, narrow, _sb, _sc, _ss) in data["rows"]:
+        if di < day_from or di >= day_to or seg not in segs: continue
+        if minv and vr < minv: continue
+        if cfg.get("narrow_cpr") and not narrow: continue
+        sc = 0.0
+        for k in range(len(w)):
+            if w[k]: sc += w[k] * votes[k]
+        for side, R in ((1, rl), (-1, rs)):
+            if dirn == "long" and side < 0: continue
+            if dirn == "short" and side > 0: continue
+            if sc * side < thr: continue
+            if any(votes[k] != side for k in req): continue
+            key = (di, sym, side)
+            if key in taken: continue
+            taken.add(key); n += 1; tot += R
+            if R > 0: wins += 1; gw += R
+            else: gl += -R
+    return {"trades": n, "win_rate": round(100.0 * wins / n, 1) if n else 0,
+            "avg_R": round(tot / n, 3) if n else 0, "total_R": round(tot, 1),
+            "profit_factor": round(gw / gl, 2) if gl else None}
+
+def _fl_eval_engine(data, min_conf, day_from=0, day_to=10**9, strat=None):
+    taken = set(); n = wins = 0; tot = 0.0; gw = gl = 0.0
+    for (di, sym, m, seg, votes, rl, rs, vr, narrow, sb, sc, ss) in data["rows"]:
+        if di < day_from or di >= day_to or sb not in ("BULLISH", "BEARISH") or sc < min_conf: continue
+        if strat and ss != strat: continue
+        side = 1 if sb == "BULLISH" else -1; key = (di, sym, side)
+        if key in taken: continue
+        taken.add(key); R = rl if side > 0 else rs; n += 1; tot += R
+        if R > 0: wins += 1; gw += R
+        else: gl += -R
+    return {"trades": n, "win_rate": round(100.0 * wins / n, 1) if n else 0,
+            "avg_R": round(tot / n, 3) if n else 0, "total_R": round(tot, 1),
+            "profit_factor": round(gw / gl, 2) if gl else None}
+
+def _fl_run(days):
+    import random as _rnd
+    try:
+        _FL.update(status="running", started=time.time(), error=None)
+        data = _fl_load(days); _FL["data"] = data
+        nd = len(data["days"]); split = max(1, int(nd * 2 / 3))
+        _FL["progress"] = "testing models"
+        rep = {"generated_ist": datetime.now(IST).strftime("%d %b %Y %H:%M"), "days_loaded": nd,
+               "rows": len(data["rows"]), "train_days": data["days"][:split], "test_days": data["days"][split:],
+               "rules": "Entry = first time the model fires per symbol+direction per day (9:45-14:45; MCX 9:30-22:30). "
+                        "SL 0.4xADR, target 0.6xADR (1.5R), else exit 15:20 (MCX 23:20). avg_R = average profit per "
+                        "trade in units of the stop-loss (above 0 = makes money before costs)."}
+        # 1) the current engine, as recorded
+        rep["current_engine"] = {f"conf>={c}": _fl_eval_engine(data, c) for c in (60, 75, 82, 88)}
+        # 2) every indicator on its own
+        single = []
+        for name in _FL_FACTORS:
+            for dname, dirn in (("long", "long"), ("short", "short")):
+                r = _fl_eval(data, {"weights": {name: 1}, "threshold": 1, "direction": dirn})
+                r.update(factor=name, side=dname); single.append(r)
+        rep["single_factor"] = sorted(single, key=lambda r: -r["avg_R"])
+        # 3) simple "k indicators agree" models
+        allw = {n: 1 for n in _FL_FACTORS}
+        rep["k_agree"] = [dict(_fl_eval(data, {"weights": allw, "threshold": k}), k=k) for k in range(3, 12)]
+        # 4) random search on TRAIN days, then check on unseen TEST days
+        rng = _rnd.Random(42); cands = []
+        for it in range(700):
+            if it % 50 == 0: _FL["progress"] = f"searching models {it}/700"
+            wts = {n: rng.choice([0, 0, 0, 1, 1, 2]) for n in _FL_FACTORS}
+            if not any(wts.values()): continue
+            cfg = {"weights": wts, "threshold": rng.choice([2, 3, 4, 5, 6, 7]),
+                   "min_vol": rng.choice([0, 0, 1.2, 1.5]),
+                   "segments": rng.choice([["Stock", "Index"], ["Stock", "Index", "MCX"], ["Stock"], ["Index"]]),
+                   "require": rng.choice([[], [], ["OI flow (chg)"], ["VWAP"], ["SMC structure"], ["15m trend"]])}
+            tr = _fl_eval(data, cfg, 0, split)
+            if tr["trades"] >= 120: cands.append((tr["avg_R"], cfg, tr))
+        cands.sort(key=lambda x: -x[0])
+        best = []
+        for score, cfg, tr in cands[:12]:
+            te = _fl_eval(data, cfg, split, 10**9)
+            best.append({"weights": {k: v for k, v in cfg["weights"].items() if v}, "threshold": cfg["threshold"],
+                         "min_vol": cfg["min_vol"], "segments": cfg["segments"], "require": cfg["require"],
+                         "train": tr, "test": te})
+        rep["best_models_train_vs_test"] = best
+        # 5) which indicators matter inside the best TEST-confirmed model (drop one at a time)
+        good = [b for b in best if b["test"]["trades"] >= 40]
+        if good:
+            top = max(good, key=lambda b: b["test"]["avg_R"])
+            cfg = {"weights": dict(top["weights"]), "threshold": top["threshold"], "min_vol": top["min_vol"],
+                   "segments": top["segments"], "require": top["require"]}
+            base = _fl_eval(data, cfg)
+            imp = []
+            for k in list(cfg["weights"].keys()):
+                c2 = json.loads(json.dumps(cfg)); c2["weights"].pop(k, None)
+                if k in c2["require"]: c2["require"].remove(k)
+                r = _fl_eval(data, c2); imp.append({"drop": k, "avg_R": r["avg_R"], "trades": r["trades"],
+                                                     "change_R": round(r["avg_R"] - base["avg_R"], 3)})
+            rep["importance_in_best_model"] = {"model_all_days": base, "drop_one": sorted(imp, key=lambda x: x["change_R"])}
+        _FL.update(status="done", report=rep, progress="done")
+        print(f"[FactorLab] done in {time.time() - _FL['started']:.0f}s — {len(data['rows'])} rows, {nd} days")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        _FL.update(status="error", error=str(e)[:200])
+
+@app.route("/factor_lab")
+@app.route("/factor_lab/<path:_nocache>")
+def factor_lab(_nocache=None):
+    if not SB: return jsonify({"ok": False, "error": "Supabase not configured"})
+    if _FL["status"] == "running":
+        return jsonify({"ok": True, "status": "running", "progress": _FL["progress"],
+                        "elapsed_sec": round(time.time() - _FL["started"])})
+    if _FL["report"] and request.args.get("refresh") != "1":
+        return jsonify({"ok": True, "status": "done", "report": _FL["report"]})
+    days = max(10, min(90, int(request.args.get("days", "60") or 60)))
+    threading.Thread(target=_fl_run, args=(days,), daemon=True).start()
+    return jsonify({"ok": True, "status": "started", "note": "takes a few minutes; call again"})
+
+@app.route("/factor_lab_eval/<path:_nocache>")
+def factor_lab_eval(_nocache=None):
+    """Score custom models on the loaded data. ?cfg=<JSON list of configs>"""
+    data = _FL.get("data")
+    if not data: return jsonify({"ok": False, "error": "run /factor_lab first"})
+    try: cfgs = json.loads(request.args.get("cfg", "[]"))
+    except Exception as e: return jsonify({"ok": False, "error": f"bad cfg: {e}"})
+    nd = len(data["days"]); split = max(1, int(nd * 2 / 3)); out = []
+    for c in cfgs[:40]:
+        out.append({"name": c.get("name", ""), "all": _fl_eval(data, c), "train": _fl_eval(data, c, 0, split),
+                    "test": _fl_eval(data, c, split, 10**9)})
+    return jsonify({"ok": True, "results": out, "factors": _FL_FACTORS})
 
 _HEALTH_CACHE = {"body": None, "ts": 0.0}
 
