@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-25-v2"
+SERVER_BUILD = "2026-10-25-v3"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -4681,6 +4681,61 @@ def factor_lab_eval(_nocache=None):
         out.append({"name": c.get("name", ""), "all": _fl_eval(data, c), "train": _fl_eval(data, c, 0, split),
                     "test": _fl_eval(data, c, split, 10**9)})
     return jsonify({"ok": True, "results": out, "factors": _FL_FACTORS})
+
+# ═══════════════════════════════════════════════════════════════
+# CANDLE EXPORT (Oct 25) — one downloadable file of raw Zerodha candles for
+# offline research: 5-minute bars for the last N days + daily bars for ~150
+# days, for every index and stock in INSTRUMENTS (MCX skipped: no continuous
+# contract history). Built in the background, then served as a .csv.gz file.
+# ═══════════════════════════════════════════════════════════════
+_EXP = {"status": "idle", "progress": "", "file": None, "started": 0.0, "error": None, "rows": 0}
+
+def _export_run(days):
+    import gzip
+    try:
+        _EXP.update(status="running", started=time.time(), error=None, rows=0)
+        key, token = _get_kite_creds()
+        if not (key and token):
+            _EXP.update(status="error", error="no Zerodha login on the server — log in from the app first"); return
+        syms = [s for s, i in INSTRUMENTS.items() if not i.get("mcx")]
+        path = f"/tmp/protrader_candles_{days}d.csv.gz"
+        n = 0
+        with gzip.open(path, "wt") as f:
+            f.write("sym,interval,ts_ist,open,high,low,close,volume\n")
+            for i, sym in enumerate(syms):
+                for itv, d in (("5m", days), ("1d", 150)):
+                    _EXP["progress"] = f"{sym} {itv} ({i + 1}/{len(syms)})"
+                    try:
+                        bars = fetch_kite_live_candles(sym, key, token, itv, d) or []
+                    except Exception as e:
+                        print(f"[Export] {sym} {itv} failed: {e}"); bars = []
+                    for b in bars:
+                        t = datetime.fromtimestamp(b["t"], IST).strftime("%Y-%m-%d %H:%M")
+                        f.write(f"{sym},{itv},{t},{b['o']},{b['h']},{b['l']},{b['c']},{b.get('v', 0)}\n"); n += 1
+                    time.sleep(0.4)          # Zerodha historical API: max 3 requests/second
+        _EXP.update(status="done", file=path, rows=n, progress="done")
+        print(f"[Export] done: {n} candles in {time.time() - _EXP['started']:.0f}s -> {path}")
+    except Exception as e:
+        _EXP.update(status="error", error=str(e)[:200])
+
+@app.route("/export/candles")
+@app.route("/export/candles/<path:_nocache>")
+def export_candles_bg(_nocache=None):
+    """Open once to start; open again when done to download the file."""
+    from flask import send_file
+    days = max(5, min(95, int(request.args.get("days", "60") or 60)))
+    if _EXP["status"] == "done" and _EXP.get("file") and os.path.exists(_EXP["file"]) and request.args.get("refresh") != "1":
+        return send_file(_EXP["file"], as_attachment=True, download_name=os.path.basename(_EXP["file"]),
+                         mimetype="application/gzip")
+    if _EXP["status"] == "running":
+        return jsonify({"ok": True, "status": "running", "progress": _EXP["progress"],
+                        "elapsed_sec": round(time.time() - _EXP["started"]),
+                        "note": "open this link again in a minute"})
+    if _EXP["status"] == "error" and request.args.get("refresh") != "1":
+        msg = _EXP["error"]; _EXP["status"] = "idle"
+        return jsonify({"ok": False, "status": "error", "error": msg, "note": "open the link again to retry"})
+    threading.Thread(target=_export_run, args=(days,), daemon=True).start()
+    return jsonify({"ok": True, "status": "started", "note": "takes about 2-3 minutes; open this link again to download"})
 
 _HEALTH_CACHE = {"body": None, "ts": 0.0}
 
