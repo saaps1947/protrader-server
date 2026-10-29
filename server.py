@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-25-v3"
+SERVER_BUILD = "2026-10-29-v1"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -4717,6 +4717,88 @@ def _export_run(days):
         print(f"[Export] done: {n} candles in {time.time() - _EXP['started']:.0f}s -> {path}")
     except Exception as e:
         _EXP.update(status="error", error=str(e)[:200])
+
+# ── 3-year INDEX history (Oct 29): 5-min candles fetched in 95-day chunks
+# (Zerodha allows max 100 days of 5-minute data per request) + daily candles.
+_EXP3 = {"status": "idle", "progress": "", "file": None, "started": 0.0, "error": None, "rows": 0, "log": []}
+_EXP3_SYMS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
+
+def _kite_hist_raw(instr_token, interval, d_from, d_to, key, token):
+    url = (f"https://api.kite.trade/instruments/historical/{instr_token}/{interval}"
+           f"?from={d_from:%Y-%m-%d} 09:00:00&to={d_to:%Y-%m-%d} 15:35:00")
+    for attempt in range(3):
+        r = KITE_SESSION.get(url, headers=_kite_headers(key, token), timeout=30)
+        if r.status_code == 429:
+            time.sleep(2 + attempt * 2); continue
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:120]}")
+        return (r.json().get("data") or {}).get("candles") or []
+    raise RuntimeError("rate-limited 3 times")
+
+def _export_index_history(years):
+    import gzip
+    try:
+        _EXP3.update(rows=0)
+        key, token = _get_kite_creds()
+        if not (key and token):
+            _EXP3.update(status="error", error="no Zerodha login on the server — log in from the app first"); return
+        end = datetime.now(IST).date(); start = end - timedelta(days=int(365.25 * years))
+        path = f"/tmp/protrader_index_{years}y.csv.gz"; n = 0
+        with gzip.open(path, "wt") as f:
+            f.write("sym,interval,ts_ist,open,high,low,close,volume\n")
+            for sym in _EXP3_SYMS:
+                tok = _get_kite_instr_token(sym, key, token)
+                if not tok:
+                    _EXP3["log"].append(f"{sym}: no instrument token"); continue
+                first = None; chunks = empties = 0
+                c0 = start
+                while c0 <= end:
+                    c1 = min(c0 + timedelta(days=94), end)
+                    _EXP3["progress"] = f"{sym} 5m {c0}..{c1}"
+                    try:
+                        bars = _kite_hist_raw(tok, "5minute", c0, c1, key, token)
+                    except Exception as e:
+                        _EXP3["log"].append(f"{sym} 5m {c0}..{c1}: {e}"); bars = []
+                    chunks += 1
+                    if not bars: empties += 1
+                    for b in bars:
+                        ts = str(b[0])[:16].replace("T", " ")
+                        if first is None: first = ts
+                        f.write(f"{sym},5m,{ts},{b[1]},{b[2]},{b[3]},{b[4]},{b[5] if len(b) > 5 else 0}\n"); n += 1
+                    c0 = c1 + timedelta(days=1)
+                    time.sleep(0.4)                      # stay under 3 requests/second
+                try:
+                    _EXP3["progress"] = f"{sym} daily"
+                    dbars = _kite_hist_raw(tok, "day", start - timedelta(days=120), end, key, token)
+                    for b in dbars:
+                        f.write(f"{sym},1d,{str(b[0])[:10]} 09:15,{b[1]},{b[2]},{b[3]},{b[4]},{b[5] if len(b) > 5 else 0}\n"); n += 1
+                except Exception as e:
+                    _EXP3["log"].append(f"{sym} daily: {e}")
+                _EXP3["log"].append(f"{sym}: first 5m bar {first}, {chunks} chunks, {empties} empty")
+                time.sleep(0.4)
+        _EXP3.update(status="done", file=path, rows=n, progress="done")
+        print(f"[Export3y] done: {n} rows in {time.time() - _EXP3['started']:.0f}s -> {path} | " + " | ".join(_EXP3["log"]))
+    except Exception as e:
+        _EXP3.update(status="error", error=str(e)[:200])
+
+@app.route("/export/index_history")
+@app.route("/export/index_history/<path:_nocache>")
+def export_index_history(_nocache=None):
+    """Open once to start; open again when done to download (status shows per-index coverage)."""
+    from flask import send_file
+    years = max(1, min(5, int(request.args.get("years", "3") or 3)))
+    if _EXP3["status"] == "done" and _EXP3.get("file") and os.path.exists(_EXP3["file"]) and request.args.get("refresh") != "1":
+        return send_file(_EXP3["file"], as_attachment=True, download_name=os.path.basename(_EXP3["file"]),
+                         mimetype="application/gzip")
+    if _EXP3["status"] == "running":
+        return jsonify({"ok": True, "status": "running", "progress": _EXP3["progress"], "log": _EXP3["log"],
+                        "elapsed_sec": round(time.time() - _EXP3["started"]), "note": "open this link again in a minute"})
+    if _EXP3["status"] == "error" and request.args.get("refresh") != "1":
+        msg = _EXP3["error"]; _EXP3["status"] = "idle"
+        return jsonify({"ok": False, "status": "error", "error": msg, "note": "open the link again to retry"})
+    _EXP3.update(status="running", started=time.time(), progress="starting", error=None, log=[])
+    threading.Thread(target=_export_index_history, args=(years,), daemon=True).start()
+    return jsonify({"ok": True, "status": "started", "note": "about 1-2 minutes; open this link again to download"})
 
 @app.route("/export/candles")
 @app.route("/export/candles/<path:_nocache>")
