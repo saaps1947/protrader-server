@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-29-v6"
+SERVER_BUILD = "2026-10-29-v7"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -4835,6 +4835,7 @@ def _export_run(days):
 # (Zerodha allows max 100 days of 5-minute data per request) + daily candles.
 _EXP3 = {"status": "idle", "progress": "", "file": None, "started": 0.0, "error": None, "rows": 0, "log": []}
 _EXP3_SYMS = ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
+_EXP3_EXTRA_TOKENS = {"INDIAVIX": 264969}     # NSE:INDIA VIX — implied volatility history for option-selling tests
 
 def _kite_hist_raw(instr_token, interval, d_from, d_to, key, token):
     url = (f"https://api.kite.trade/instruments/historical/{instr_token}/{interval}"
@@ -4848,7 +4849,7 @@ def _kite_hist_raw(instr_token, interval, d_from, d_to, key, token):
         return (r.json().get("data") or {}).get("candles") or []
     raise RuntimeError("rate-limited 3 times")
 
-def _export_index_history(years):
+def _export_index_history(years, syms=None):
     import gzip
     try:
         _EXP3.update(rows=0)
@@ -4856,11 +4857,13 @@ def _export_index_history(years):
         if not (key and token):
             _EXP3.update(status="error", error="no Zerodha login on the server — log in from the app first"); return
         end = datetime.now(IST).date(); start = end - timedelta(days=int(365.25 * years))
-        path = f"/tmp/protrader_index_{years}y.csv.gz"; n = 0
+        syms = syms or _EXP3_SYMS
+        tag = "" if syms == _EXP3_SYMS else "_" + "_".join(s_.lower() for s_ in syms)
+        path = f"/tmp/protrader_index_{years}y{tag}.csv.gz"; n = 0
         with gzip.open(path, "wt") as f:
             f.write("sym,interval,ts_ist,open,high,low,close,volume\n")
-            for sym in _EXP3_SYMS:
-                tok = _get_kite_instr_token(sym, key, token)
+            for sym in syms:
+                tok = _EXP3_EXTRA_TOKENS.get(sym) or _get_kite_instr_token(sym, key, token)
                 if not tok:
                     _EXP3["log"].append(f"{sym}: no instrument token"); continue
                 first = None; chunks = empties = 0
@@ -5088,6 +5091,10 @@ def export_index_history(_nocache=None):
     """Open once to start; open again when done to download (status shows per-index coverage)."""
     from flask import send_file
     years = max(1, min(5, int(request.args.get("years", "3") or 3)))
+    want = [x.strip().upper() for x in (request.args.get("syms") or "").split(",") if x.strip()]
+    want = [x for x in want if x in _EXP3_SYMS or x in _EXP3_EXTRA_TOKENS] or None
+    if want and _EXP3.get("syms") != want:      # a different symbol set than the file on disk -> new job
+        _EXP3.update(status="idle", file=None)
     if _EXP3["status"] == "done" and _EXP3.get("file") and os.path.exists(_EXP3["file"]) and request.args.get("refresh") != "1":
         return send_file(_EXP3["file"], as_attachment=True, download_name=os.path.basename(_EXP3["file"]),
                          mimetype="application/gzip")
@@ -5097,8 +5104,8 @@ def export_index_history(_nocache=None):
     if _EXP3["status"] == "error" and request.args.get("refresh") != "1":
         msg = _EXP3["error"]; _EXP3["status"] = "idle"
         return jsonify({"ok": False, "status": "error", "error": msg, "note": "open the link again to retry"})
-    _EXP3.update(status="running", started=time.time(), progress="starting", error=None, log=[])
-    threading.Thread(target=_export_index_history, args=(years,), daemon=True).start()
+    _EXP3.update(status="running", started=time.time(), progress="starting", error=None, log=[], syms=want)
+    threading.Thread(target=_export_index_history, args=(years, want), daemon=True).start()
     return jsonify({"ok": True, "status": "started", "note": "about 1-2 minutes; open this link again to download"})
 
 @app.route("/export/candles")
