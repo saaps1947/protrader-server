@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-29-v1"
+SERVER_BUILD = "2026-10-29-v2"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -705,6 +705,16 @@ def upsert_journal_entry(entry: dict):
                         .gte("created_at", _ist_session_start_iso())
                         .execute())
             dupes = [r for r in (existing.data or []) if r.get("id") != entry.get("id")]
+            # Risk gate: a NEW auto-logged trade (id not stored yet) on a gated symbol.
+            # Manual Execute taps are the trader's own decision and are always stored.
+            if (not dupes and RISK_GATE_ON and entry.get("source", "auto") != "manual"
+                    and str(entry.get("sym", "")).upper() in PUSH_ALLOWED_SYMBOLS):
+                _known = (SB.table("journal").select("id").eq("id", entry.get("id")).execute()).data
+                if not _known:
+                    _ok, _why, _ = _risk_check(entry.get("sym"), _risk_state(exclude_id=entry.get("id")))
+                    if not _ok:
+                        print(f"[RiskGate] BLOCK journal {entry.get('sym')} {entry.get('bias')} {entry.get('id')}: {'; '.join(_why)}")
+                        return
             if dupes:
                 print(f"[Supabase] Duplicate journal entry blocked: {entry.get('sym')} "
                       f"{entry.get('bias')} already open as {dupes[0]['id']} "
@@ -1017,6 +1027,108 @@ def snapshot_ingest():
 
 _push_claim_lock = threading.Lock()
 
+# ── RISK GATE (Oct 29) ─────────────────────────────────────────────────────
+# The 3-year backtest found no setup with a reliable edge, so the biggest lever
+# on losses is how much is traded. One shared gate for every device, applied to
+# the symbols that push (indices + MCX): it stops NEW auto-journaled trades and
+# NEW-trade push notifications once a daily limit is hit. Exits, "still active"
+# alerts and manual Execute taps are never blocked. All limits are env vars.
+def _env_int(k, d):
+    try: return int(os.environ.get(k, d))
+    except Exception: return d
+RISK_GATE_ON       = os.environ.get("RISK_GATE_ON", "1") != "0"
+RISK_MAX_TRADES    = _env_int("RISK_MAX_TRADES", 3)      # new trades per day
+RISK_MAX_LOSSES    = _env_int("RISK_MAX_LOSSES", 2)      # losing trades per day, then stop
+RISK_MAX_OPEN      = _env_int("RISK_MAX_OPEN", 2)        # positions open at the same time
+RISK_COOLDOWN_MIN  = _env_int("RISK_COOLDOWN_MIN", 30)   # pause after a stop-loss
+RISK_DAILY_LOSS_RS = _env_int("RISK_DAILY_LOSS_RS", 0)   # 0 = off (journal P&L is per lot, futures-equivalent)
+RISK_WINDOW_NSE    = os.environ.get("RISK_WINDOW_NSE", "09:30-14:30")
+RISK_WINDOW_MCX    = os.environ.get("RISK_WINDOW_MCX", "09:30-22:30")
+
+def _hm(txt):
+    h, m = txt.strip().split(":"); return int(h) * 60 + int(m)
+
+def _in_window(sym, now_ist=None):
+    now_ist = now_ist or datetime.now(IST)
+    w = RISK_WINDOW_MCX if sym and sym.upper() in _MCX_SET else RISK_WINDOW_NSE
+    try:
+        a, b = (_hm(x) for x in w.split("-"))
+    except Exception:
+        return True, w
+    m = now_ist.hour * 60 + now_ist.minute
+    return a <= m <= b, w
+
+def _risk_state(exclude_id=None, exclude_fresh=None):
+    """Today's gated-symbol trades from the shared journal. exclude_id: a row that is the
+    trade being decided. exclude_fresh=(sym,bias): ignore that pair's row if created <3 min ago
+    (the app journals a trade a moment before it reports the signal)."""
+    st = {"trades": 0, "losses": 0, "open": 0, "day_pnl": 0, "last_sl_at": None, "ok": True}
+    if not SB:
+        st["ok"] = False; return st
+    try:
+        rows = (SB.table("journal").select("id,sym,bias,status,outcome,pnl,exit_time,updated_at,created_at")
+                .gte("created_at", _ist_session_start_iso()).execute()).data or []
+    except Exception as e:
+        print(f"[RiskGate] journal read failed — gate open: {e}")
+        st["ok"] = False; return st
+    cut = datetime.now(timezone.utc) - timedelta(minutes=3)
+    def _ts(x):
+        try: return datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+        except Exception: return None
+    for r in rows:
+        if str(r.get("sym", "")).upper() not in PUSH_ALLOWED_SYMBOLS: continue
+        if r.get("status") == "VOID" or r.get("id") == exclude_id: continue
+        if exclude_fresh and r.get("sym") == exclude_fresh[0] and r.get("bias") == exclude_fresh[1]:
+            c = _ts(r.get("created_at"))
+            if c and c >= cut: continue
+        st["trades"] += 1
+        if r.get("status") in ("OPEN", "T1_HIT"): st["open"] += 1
+        pnl = r.get("pnl")
+        try: pnl = float(pnl) if pnl is not None else None
+        except Exception: pnl = None
+        if r.get("status") in ("SL_HIT", "T2_HIT", "TIME_EXIT", "MANUAL", "CLOSED") and pnl is not None:
+            st["day_pnl"] += pnl
+            if pnl < 0: st["losses"] += 1
+        if r.get("status") == "SL_HIT" and r.get("outcome") != "BREAKEVEN":
+            t = _ts(r.get("exit_time")) or _ts(r.get("updated_at"))
+            if t and (st["last_sl_at"] is None or t > st["last_sl_at"]): st["last_sl_at"] = t
+    return st
+
+def _risk_check(sym, st=None, now_ist=None):
+    """-> (allowed: bool, reasons: [str], state). Window is checked per symbol."""
+    now_ist = now_ist or datetime.now(IST)
+    if not RISK_GATE_ON: return True, [], st or {}
+    st = st if st is not None else _risk_state()
+    why = []
+    inw, w = _in_window(sym, now_ist)
+    if not inw: why.append(f"outside entry window {w}")
+    if st.get("trades", 0) >= RISK_MAX_TRADES: why.append(f"{st['trades']} trades taken today (max {RISK_MAX_TRADES})")
+    if st.get("losses", 0) >= RISK_MAX_LOSSES: why.append(f"{st['losses']} losing trades today — done for the day")
+    if st.get("open", 0) >= RISK_MAX_OPEN: why.append(f"{st['open']} positions already open (max {RISK_MAX_OPEN})")
+    if RISK_DAILY_LOSS_RS > 0 and st.get("day_pnl", 0) <= -RISK_DAILY_LOSS_RS:
+        why.append(f"day P&L ₹{int(st['day_pnl'])} hit the ₹{RISK_DAILY_LOSS_RS} limit")
+    if st.get("last_sl_at") and RISK_COOLDOWN_MIN > 0:
+        until = st["last_sl_at"] + timedelta(minutes=RISK_COOLDOWN_MIN)
+        if datetime.now(timezone.utc) < until:
+            why.append(f"cooldown after stop-loss until {until.astimezone(IST).strftime('%H:%M')}")
+    return (len(why) == 0), why, st
+
+@app.route("/risk_gate")
+@app.route("/risk_gate/<path:_nocache>")
+def risk_gate(_nocache=None):
+    """Aggregate gate status for the app banner (no trade details, no secrets)."""
+    allowed, why, st = _risk_check("NIFTY")
+    allowed_mcx, why_mcx, _ = _risk_check("CRUDEOIL", st)
+    last = st.get("last_sl_at")
+    return jsonify({"ok": True, "on": RISK_GATE_ON, "allowed": allowed, "reasons": why,
+                    "allowed_mcx": allowed_mcx, "reasons_mcx": why_mcx,
+                    "trades": st.get("trades", 0), "losses": st.get("losses", 0), "open": st.get("open", 0),
+                    "last_sl_ist": last.astimezone(IST).strftime("%H:%M") if last else None,
+                    "limits": {"max_trades": RISK_MAX_TRADES, "max_losses": RISK_MAX_LOSSES, "max_open": RISK_MAX_OPEN,
+                               "cooldown_min": RISK_COOLDOWN_MIN, "daily_loss_rs": RISK_DAILY_LOSS_RS,
+                               "window_nse": RISK_WINDOW_NSE, "window_mcx": RISK_WINDOW_MCX},
+                    "symbols": sorted(PUSH_ALLOWED_SYMBOLS), "journal_readable": st.get("ok", False)})
+
 @app.route("/ingest_signal", methods=["POST"])
 def ingest_signal():
     """
@@ -1166,6 +1278,11 @@ def ingest_signal():
                         is_repeat_alert = any(_older(r) for r in (existing.data or []))
                     except Exception as e:
                         print(f"[Push] could not check existing position for {sig.get('sym')} — labeling as new: {e}")
+                if not is_repeat_alert:
+                    _ok, _why, _ = _risk_check(sig.get("sym"), _risk_state(exclude_fresh=(sig.get("sym"), sig.get("bias"))))
+                    if not _ok:
+                        print(f"[RiskGate] BLOCK push {sig.get('sym')} {sig.get('bias')}: {'; '.join(_why)}")
+                        return jsonify({"ok": True, "risk_gate": "blocked", "reasons": _why})
                 label = "STILL ACTIVE" if is_repeat_alert else "NEW"
                 title = f"🔥 {sig.get('sym')} — {label} {sig.get('urgency')} {sig.get('confidence')}%"
                 body = f"{sig.get('trade','')} · {sig.get('strategy','')}" + (
