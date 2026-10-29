@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-29-v2"
+SERVER_BUILD = "2026-10-29-v6"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -705,16 +705,6 @@ def upsert_journal_entry(entry: dict):
                         .gte("created_at", _ist_session_start_iso())
                         .execute())
             dupes = [r for r in (existing.data or []) if r.get("id") != entry.get("id")]
-            # Risk gate: a NEW auto-logged trade (id not stored yet) on a gated symbol.
-            # Manual Execute taps are the trader's own decision and are always stored.
-            if (not dupes and RISK_GATE_ON and entry.get("source", "auto") != "manual"
-                    and str(entry.get("sym", "")).upper() in PUSH_ALLOWED_SYMBOLS):
-                _known = (SB.table("journal").select("id").eq("id", entry.get("id")).execute()).data
-                if not _known:
-                    _ok, _why, _ = _risk_check(entry.get("sym"), _risk_state(exclude_id=entry.get("id")))
-                    if not _ok:
-                        print(f"[RiskGate] BLOCK journal {entry.get('sym')} {entry.get('bias')} {entry.get('id')}: {'; '.join(_why)}")
-                        return
             if dupes:
                 print(f"[Supabase] Duplicate journal entry blocked: {entry.get('sym')} "
                       f"{entry.get('bias')} already open as {dupes[0]['id']} "
@@ -1028,29 +1018,28 @@ def snapshot_ingest():
 _push_claim_lock = threading.Lock()
 
 # ── RISK GATE (Oct 29) ─────────────────────────────────────────────────────
-# The 3-year backtest found no setup with a reliable edge, so the biggest lever
-# on losses is how much is traded. One shared gate for every device, applied to
-# the symbols that push (indices + MCX): it stops NEW auto-journaled trades and
-# NEW-trade push notifications once a daily limit is hit. Exits, "still active"
-# alerts and manual Execute taps are never blocked. All limits are env vars.
+# Used ONLY by the app's Auto tab (automatic order placement). Signals, pushes and
+# the journal are never limited — every HIGH signal is still shown, notified and
+# recorded so the analysis keeps all of its data. The Auto tab sends its own limits
+# as query parameters; the env vars below are just defaults.
 def _env_int(k, d):
     try: return int(os.environ.get(k, d))
     except Exception: return d
 RISK_GATE_ON       = os.environ.get("RISK_GATE_ON", "1") != "0"
 RISK_MAX_TRADES    = _env_int("RISK_MAX_TRADES", 3)      # new trades per day
 RISK_MAX_LOSSES    = _env_int("RISK_MAX_LOSSES", 2)      # losing trades per day, then stop
-RISK_MAX_OPEN      = _env_int("RISK_MAX_OPEN", 2)        # positions open at the same time
+RISK_MAX_OPEN      = _env_int("RISK_MAX_OPEN", 3)        # positions open at the same time
 RISK_COOLDOWN_MIN  = _env_int("RISK_COOLDOWN_MIN", 30)   # pause after a stop-loss
 RISK_DAILY_LOSS_RS = _env_int("RISK_DAILY_LOSS_RS", 0)   # 0 = off (journal P&L is per lot, futures-equivalent)
-RISK_WINDOW_NSE    = os.environ.get("RISK_WINDOW_NSE", "09:30-14:30")
+RISK_WINDOW_NSE    = os.environ.get("RISK_WINDOW_NSE", "09:30-15:00")   # journal: 4 of 13 index trades came 14:44-14:52, all winners
 RISK_WINDOW_MCX    = os.environ.get("RISK_WINDOW_MCX", "09:30-22:30")
 
 def _hm(txt):
     h, m = txt.strip().split(":"); return int(h) * 60 + int(m)
 
-def _in_window(sym, now_ist=None):
+def _in_window(sym, now_ist=None, nse_override=None):
     now_ist = now_ist or datetime.now(IST)
-    w = RISK_WINDOW_MCX if sym and sym.upper() in _MCX_SET else RISK_WINDOW_NSE
+    w = RISK_WINDOW_MCX if sym and sym.upper() in _MCX_SET else (nse_override or RISK_WINDOW_NSE)
     try:
         a, b = (_hm(x) for x in w.split("-"))
     except Exception:
@@ -1089,26 +1078,29 @@ def _risk_state(exclude_id=None, exclude_fresh=None):
         if r.get("status") in ("SL_HIT", "T2_HIT", "TIME_EXIT", "MANUAL", "CLOSED") and pnl is not None:
             st["day_pnl"] += pnl
             if pnl < 0: st["losses"] += 1
-        if r.get("status") == "SL_HIT" and r.get("outcome") != "BREAKEVEN":
+        if r.get("status") == "SL_HIT" and pnl is not None and pnl < 0:   # trailed stops in profit don't count
             t = _ts(r.get("exit_time")) or _ts(r.get("updated_at"))
             if t and (st["last_sl_at"] is None or t > st["last_sl_at"]): st["last_sl_at"] = t
     return st
 
-def _risk_check(sym, st=None, now_ist=None):
-    """-> (allowed: bool, reasons: [str], state). Window is checked per symbol."""
+def _risk_check(sym, st=None, now_ist=None, lim=None):
+    """-> (allowed: bool, reasons: [str], state). lim overrides the default limits.
+    A limit of 0 means 'off'. Trade count is NOT checked here: the Auto tab counts
+    the orders it actually placed itself (Max Trades/Day)."""
     now_ist = now_ist or datetime.now(IST)
+    lim = lim or {}
     if not RISK_GATE_ON: return True, [], st or {}
     st = st if st is not None else _risk_state()
+    max_losses = lim.get("max_losses", RISK_MAX_LOSSES); cool = lim.get("cooldown_min", RISK_COOLDOWN_MIN)
     why = []
-    inw, w = _in_window(sym, now_ist)
+    inw, w = _in_window(sym, now_ist, lim.get("window"))
     if not inw: why.append(f"outside entry window {w}")
-    if st.get("trades", 0) >= RISK_MAX_TRADES: why.append(f"{st['trades']} trades taken today (max {RISK_MAX_TRADES})")
-    if st.get("losses", 0) >= RISK_MAX_LOSSES: why.append(f"{st['losses']} losing trades today — done for the day")
-    if st.get("open", 0) >= RISK_MAX_OPEN: why.append(f"{st['open']} positions already open (max {RISK_MAX_OPEN})")
+    if max_losses and st.get("losses", 0) >= max_losses:
+        why.append(f"signals already lost {st['losses']} times today — bad day, auto paused")
     if RISK_DAILY_LOSS_RS > 0 and st.get("day_pnl", 0) <= -RISK_DAILY_LOSS_RS:
         why.append(f"day P&L ₹{int(st['day_pnl'])} hit the ₹{RISK_DAILY_LOSS_RS} limit")
-    if st.get("last_sl_at") and RISK_COOLDOWN_MIN > 0:
-        until = st["last_sl_at"] + timedelta(minutes=RISK_COOLDOWN_MIN)
+    if st.get("last_sl_at") and cool > 0:
+        until = st["last_sl_at"] + timedelta(minutes=cool)
         if datetime.now(timezone.utc) < until:
             why.append(f"cooldown after stop-loss until {until.astimezone(IST).strftime('%H:%M')}")
     return (len(why) == 0), why, st
@@ -1116,17 +1108,26 @@ def _risk_check(sym, st=None, now_ist=None):
 @app.route("/risk_gate")
 @app.route("/risk_gate/<path:_nocache>")
 def risk_gate(_nocache=None):
-    """Aggregate gate status for the app banner (no trade details, no secrets)."""
-    allowed, why, st = _risk_check("NIFTY")
-    allowed_mcx, why_mcx, _ = _risk_check("CRUDEOIL", st)
+    """Aggregate status for the Auto tab (counts only — no trade details, no secrets).
+    Optional ?max_losses=&cooldown=&window=09:30-15:00 from the Auto tab settings."""
+    lim = {}
+    try:
+        if request.args.get("max_losses") not in (None, ""): lim["max_losses"] = max(0, int(request.args["max_losses"]))
+        if request.args.get("cooldown") not in (None, ""): lim["cooldown_min"] = max(0, int(request.args["cooldown"]))
+        wv = request.args.get("window", "")
+        if re.match(r"^\d{1,2}:\d{2}-\d{1,2}:\d{2}$", wv): lim["window"] = wv
+    except Exception:
+        lim = {}
+    allowed, why, st = _risk_check("NIFTY", lim=lim)
+    allowed_mcx, why_mcx, _ = _risk_check("CRUDEOIL", st, lim=lim)
     last = st.get("last_sl_at")
     return jsonify({"ok": True, "on": RISK_GATE_ON, "allowed": allowed, "reasons": why,
                     "allowed_mcx": allowed_mcx, "reasons_mcx": why_mcx,
                     "trades": st.get("trades", 0), "losses": st.get("losses", 0), "open": st.get("open", 0),
                     "last_sl_ist": last.astimezone(IST).strftime("%H:%M") if last else None,
-                    "limits": {"max_trades": RISK_MAX_TRADES, "max_losses": RISK_MAX_LOSSES, "max_open": RISK_MAX_OPEN,
-                               "cooldown_min": RISK_COOLDOWN_MIN, "daily_loss_rs": RISK_DAILY_LOSS_RS,
-                               "window_nse": RISK_WINDOW_NSE, "window_mcx": RISK_WINDOW_MCX},
+                    "limits": {"max_losses": lim.get("max_losses", RISK_MAX_LOSSES),
+                               "cooldown_min": lim.get("cooldown_min", RISK_COOLDOWN_MIN), "daily_loss_rs": RISK_DAILY_LOSS_RS,
+                               "window_nse": lim.get("window", RISK_WINDOW_NSE), "window_mcx": RISK_WINDOW_MCX},
                     "symbols": sorted(PUSH_ALLOWED_SYMBOLS), "journal_readable": st.get("ok", False)})
 
 @app.route("/ingest_signal", methods=["POST"])
@@ -1278,11 +1279,6 @@ def ingest_signal():
                         is_repeat_alert = any(_older(r) for r in (existing.data or []))
                     except Exception as e:
                         print(f"[Push] could not check existing position for {sig.get('sym')} — labeling as new: {e}")
-                if not is_repeat_alert:
-                    _ok, _why, _ = _risk_check(sig.get("sym"), _risk_state(exclude_fresh=(sig.get("sym"), sig.get("bias"))))
-                    if not _ok:
-                        print(f"[RiskGate] BLOCK push {sig.get('sym')} {sig.get('bias')}: {'; '.join(_why)}")
-                        return jsonify({"ok": True, "risk_gate": "blocked", "reasons": _why})
                 label = "STILL ACTIVE" if is_repeat_alert else "NEW"
                 title = f"🔥 {sig.get('sym')} — {label} {sig.get('urgency')} {sig.get('confidence')}%"
                 body = f"{sig.get('trade','')} · {sig.get('strategy','')}" + (
@@ -4897,6 +4893,194 @@ def _export_index_history(years):
         print(f"[Export3y] done: {n} rows in {time.time() - _EXP3['started']:.0f}s -> {path} | " + " | ".join(_EXP3["log"]))
     except Exception as e:
         _EXP3.update(status="error", error=str(e)[:200])
+
+# ── DUAL TRACK (Oct 29): every journal trade measured twice ────────────────
+# 1) the OPTION result the journal already records, and 2) the SAME trade on the
+# underlying price (spot / futures-like — no option time decay), replayed on Kite
+# 5-min candles three ways: exit at 15:15 / hold until stop or target (max 5
+# sessions, overnight gaps filled at the open) / hold only if in profit at 15:15
+# with the stop moved to entry. Answers "would holding overnight in futures have
+# paid?" on the app's OWN signals.
+_DUAL = {"status": "idle", "report": None, "started": 0.0, "progress": "", "error": None}
+_DUAL_LOT = {"NIFTY": 65, "BANKNIFTY": 35, "FINNIFTY": 65, "SENSEX": 20, "MIDCPNIFTY": 120}
+
+def _dual_bars(sym, d_from, d_to, key, token, cache):
+    k = (sym, str(d_from), str(d_to))
+    if k in cache: return cache[k]
+    out = []
+    try:
+        tok = _get_kite_instr_token(sym, key, token)
+        if tok:
+            for b in _kite_hist_raw(tok, "5minute", d_from, d_to, key, token):
+                dt = datetime.strptime(str(b[0])[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=IST)
+                m = dt.hour * 60 + dt.minute
+                if 555 <= m <= 925: out.append((dt, float(b[1]), float(b[2]), float(b[3]), float(b[4])))
+            time.sleep(0.35)
+    except Exception as e:
+        print(f"[Dual] candles {sym} failed: {e}")
+    cache[k] = out
+    return out
+
+def _dual_sim(bars, i0, side, entry, stop, tgt, mode, max_sessions=5):
+    """-> (exit_px, reason, nights). mode: eod | hold | hold_win."""
+    sessions, nights, moved, decided = 1, 0, False, None
+    for m in range(i0, len(bars)):
+        dt, o, h, l, c = bars[m]
+        if m > i0 and dt.date() != bars[m - 1][0].date():
+            sessions += 1; nights += 1
+            if (side > 0 and o <= stop) or (side < 0 and o >= stop): return o, "GAP_SL", nights
+            if (side > 0 and o >= tgt) or (side < 0 and o <= tgt): return o, "GAP_TGT", nights
+        if side > 0:
+            if l <= stop: return stop, ("BE" if moved else "SL"), nights
+            if h >= tgt: return tgt, "TGT", nights
+        else:
+            if h >= stop: return stop, ("BE" if moved else "SL"), nights
+            if l <= tgt: return tgt, "TGT", nights
+        if dt.hour * 60 + dt.minute >= 915 and decided != dt.date():
+            decided = dt.date()
+            in_profit = (c - entry) * side > 0
+            if mode == "eod" or sessions >= max_sessions: return c, "EOD", nights
+            if mode == "hold_win":
+                if not in_profit: return c, "EOD", nights
+                if not moved: stop = entry; moved = True
+    return (bars[-1][4] if bars else entry), "STILL_OPEN", nights
+
+def _dual_run(days):
+    try:
+        _DUAL.update(status="running", started=time.time(), error=None, progress="reading journal")
+        key, token = _get_kite_creds()
+        if not (key and token):
+            _DUAL.update(status="error", error="no Zerodha login on the server — log in from the app first"); return
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        rows = _bt_fetch_all(lambda: SB.table("journal").select(
+            "id,sym,bias,status,entry_px,sl_px,t1_px,t2_px,exit_px,created_at,shadow").gte("created_at", since)
+            .order("created_at"), max_rows=5000)
+        closed = [r for r in rows if r.get("status") not in ("OPEN", "VOID") and str(r.get("sym", "")).upper() not in _MCX_SET]
+        cache = {}; out = []
+        for n, r in enumerate(closed):
+            _DUAL["progress"] = f"trade {n + 1}/{len(closed)}"
+            try:
+                sym = r["sym"]; side = 1 if r.get("bias") == "BULLISH" else -1
+                t0 = datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00")).astimezone(IST)
+                bars = _dual_bars(sym, t0.date(), min(t0.date() + timedelta(days=9), datetime.now(IST).date()), key, token, cache)
+                i0 = next((i for i, b in enumerate(bars) if b[0] + timedelta(minutes=5) > t0), None)
+                if i0 is None or i0 + 1 >= len(bars): continue
+                und = ((r.get("shadow") or {}).get("und") or {})
+                pe, ps, pt2 = float(r.get("entry_px") or 0), float(r.get("sl_px") or 0), float(r.get("t2_px") or r.get("t1_px") or 0)
+                if und.get("entry") and und.get("sl"):
+                    e = float(und["entry"]); stop = float(und["sl"]); tgt = float(und.get("t2") or und.get("t1") or 0); approx = False
+                else:   # older trades: no underlying levels saved -> option distances / 0.5 delta
+                    if not (pe > 0 and ps > 0): continue
+                    e = bars[i0][4]; stop = e - side * abs(pe - ps) / 0.5
+                    tgt = e + side * (abs(pt2 - pe) / 0.5 if pt2 > 0 else 2.5 * abs(e - stop)); approx = True
+                risk = abs(e - stop)
+                if risk <= 0 or not tgt or (tgt - e) * side <= 0: continue
+                cost = (100.0 / _DUAL_LOT[sym]) if sym in _DUAL_LOT else e * 0.0005
+                res = {}
+                for mode in ("eod", "hold", "hold_win"):
+                    px, why, nights = _dual_sim(bars, i0 + 1, side, e, stop, tgt, mode)
+                    res[mode] = {"R": round(((px - e) * side - cost) / risk, 3), "exit": why, "nights": nights}
+                opt_R = None
+                if r.get("exit_px") is not None and pe > 0 and ps > 0 and abs(pe - ps) > 0:
+                    opt_R = round((float(r["exit_px"]) - pe) / abs(pe - ps), 3)   # premium rising = profit
+                out.append({"sym": sym, "bias": r.get("bias"), "ist": t0.strftime("%d %b %H:%M"), "status": r.get("status"),
+                            "option_R": opt_R, "fut_eod_R": res["eod"]["R"], "fut_hold_R": res["hold"]["R"],
+                            "fut_hold_exit": res["hold"]["exit"], "fut_hold_nights": res["hold"]["nights"],
+                            "fut_hold_win_R": res["hold_win"]["R"], "levels": "approx" if approx else "saved"})
+            except Exception as ex:
+                print(f"[Dual] {r.get('id')}: {ex}")
+        def agg(xs):
+            def m(k):
+                v = [x[k] for x in xs if x.get(k) is not None]
+                return {"n": len(v), "avg_R": round(sum(v) / len(v), 3) if v else None,
+                        "win%": round(100 * sum(1 for t in v if t > 0) / len(v), 1) if v else None,
+                        "worst_R": round(min(v), 2) if v else None, "total_R": round(sum(v), 1) if v else None}
+            return {"option_actual": m("option_R"), "fut_exit_1515": m("fut_eod_R"), "fut_hold_to_sl_or_target": m("fut_hold_R"),
+                    "fut_hold_winners_only": m("fut_hold_win_R"),
+                    "gap_stops": sum(1 for x in xs if x["fut_hold_exit"] == "GAP_SL"),
+                    "held_overnight": sum(1 for x in xs if x["fut_hold_nights"] > 0)}
+        idx = [x for x in out if x["sym"] in _IDX_SET]
+        rep = {"generated_ist": datetime.now(IST).strftime("%d %b %H:%M"), "days": days, "trades": len(out),
+               "notes": "R = profit in units of the trade's own stop distance, after ~Rs100/lot costs (futures) / as recorded (option). "
+                        "fut_* = same trade on the underlying price, no option decay. hold = until stop/target, max 5 sessions, "
+                        "gaps filled at the open. 'approx' = older trade without saved underlying levels (option distance / 0.5 delta).",
+               "indices": agg(idx), "stocks": agg([x for x in out if x["sym"] not in _IDX_SET]), "all": agg(out), "trades_list": out}
+        _DUAL.update(status="done", report=rep, progress="done")
+        print(f"[Dual] done: {len(out)} trades in {time.time() - _DUAL['started']:.0f}s")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        _DUAL.update(status="error", error=str(e)[:200])
+
+@app.route("/dual_track")
+@app.route("/dual_track/<path:_nocache>")
+def dual_track(_nocache=None):
+    """Open once to start (about 1 min), open again for the report. ?days=60 ?refresh=1"""
+    if not SB: return jsonify({"ok": False, "error": "Supabase not configured"})
+    if _DUAL["status"] == "running":
+        return jsonify({"ok": True, "status": "running", "progress": _DUAL["progress"], "elapsed_sec": round(time.time() - _DUAL["started"])})
+    if _DUAL["report"] and request.args.get("refresh") != "1":
+        return jsonify({"ok": True, "status": "done", "report": _DUAL["report"], "note": "add ?refresh=1 to recompute"})
+    if _DUAL["status"] == "error" and request.args.get("refresh") != "1":
+        msg = _DUAL["error"]; _DUAL["status"] = "idle"
+        return jsonify({"ok": False, "status": "error", "error": msg, "note": "open again to retry"})
+    days = max(5, min(120, int(request.args.get("days", "60") or 60)))
+    _DUAL.update(status="running", started=time.time(), progress="starting")
+    threading.Thread(target=_dual_run, args=(days,), daemon=True).start()
+    return jsonify({"ok": True, "status": "started", "note": "about a minute; open this link again"})
+
+# ── SNAPSHOT EXPORT (Oct 29): every saved 5-min snapshot (OI, technicals and the
+# engine's own recorded scores) as one CSV, so the OI layers can be backtested.
+_EXPS = {"status": "idle", "progress": "", "file": None, "started": 0.0, "error": None, "rows": 0}
+
+def _export_snapshots(days):
+    import gzip, csv as _csv
+    try:
+        _EXPS.update(rows=0)
+        today = datetime.now(IST).date(); path = f"/tmp/protrader_snapshots_{days}d.csv.gz"
+        cols = None; n = 0; days_with = 0
+        with gzip.open(path, "wt", newline="") as f:
+            w = None
+            for i in range(days, -1, -1):
+                d = today - timedelta(days=i)
+                if d.weekday() >= 5: continue
+                _EXPS["progress"] = f"{d.isoformat()} ({n} rows so far)"
+                a = datetime(d.year, d.month, d.day, 9, 0, tzinfo=IST).astimezone(timezone.utc).isoformat()
+                b = datetime(d.year, d.month, d.day, 23, 45, tzinfo=IST).astimezone(timezone.utc).isoformat()
+                try:
+                    rows = _bt_fetch_all(lambda: SB.table("snapshots").select("*").gte("ts", a).lte("ts", b).order("ts"),
+                                         max_rows=60000)
+                except Exception as e:
+                    print(f"[ExportSnap] {d} failed: {e}"); continue
+                if not rows: continue
+                days_with += 1
+                if w is None:
+                    cols = sorted({k for r in rows[:500] for k in r.keys()} - {"sweeps"})
+                    w = _csv.DictWriter(f, fieldnames=cols, extrasaction="ignore"); w.writeheader()
+                for r in rows:
+                    w.writerow({k: r.get(k) for k in cols}); n += 1
+        _EXPS.update(status="done", file=path, rows=n, progress=f"done: {n} rows from {days_with} trading days")
+        print(f"[ExportSnap] {n} rows, {days_with} days in {time.time() - _EXPS['started']:.0f}s")
+    except Exception as e:
+        _EXPS.update(status="error", error=str(e)[:200])
+
+@app.route("/export/snapshots")
+@app.route("/export/snapshots/<path:_nocache>")
+def export_snapshots_bg(_nocache=None):
+    """Open once to start; open again to download. ?days=120 (max 180) ?refresh=1"""
+    from flask import send_file
+    if not SB: return jsonify({"ok": False, "error": "Supabase not configured"})
+    days = max(5, min(180, int(request.args.get("days", "120") or 120)))
+    if _EXPS["status"] == "done" and _EXPS.get("file") and os.path.exists(_EXPS["file"]) and request.args.get("refresh") != "1":
+        return send_file(_EXPS["file"], as_attachment=True, download_name=os.path.basename(_EXPS["file"]), mimetype="application/gzip")
+    if _EXPS["status"] == "running":
+        return jsonify({"ok": True, "status": "running", "progress": _EXPS["progress"],
+                        "elapsed_sec": round(time.time() - _EXPS["started"]), "note": "open this link again in a minute"})
+    if _EXPS["status"] == "error" and request.args.get("refresh") != "1":
+        msg = _EXPS["error"]; _EXPS["status"] = "idle"
+        return jsonify({"ok": False, "status": "error", "error": msg, "note": "open again to retry"})
+    _EXPS.update(status="running", started=time.time(), progress="starting", error=None)
+    threading.Thread(target=_export_snapshots, args=(days,), daemon=True).start()
+    return jsonify({"ok": True, "status": "started", "note": "a few minutes; open this link again to download"})
 
 @app.route("/export/index_history")
 @app.route("/export/index_history/<path:_nocache>")
