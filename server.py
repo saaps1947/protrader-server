@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-10-29-v7"
+SERVER_BUILD = "2026-11-16-v1"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -237,6 +237,9 @@ def write_signal(sig: dict, fired: bool, source: str = "worker"):
         print(f"[Supabase] write_signal failed for {sig.get('sym')}: {e}")
 
 
+_PUSH_STATS = {"attempts": 0, "sent_today": 0, "day": None, "last_ok": None, "last_error": None}
+def ist_today(): return datetime.now(IST).strftime("%Y-%m-%d")
+
 def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrader-signal", dedup_key: str = None):
     """
     Sends a Web Push notification to every currently-active subscribed
@@ -268,7 +271,9 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
     real, live bug: a HIGH CRUDEOIL signal fired, but no notification
     ever arrived.
     """
+    _PUSH_STATS["attempts"] += 1
     if not SB or not VAPID_PRIVATE_KEY:
+        _PUSH_STATS["last_error"] = f"{ist_str()} not sent — Supabase {bool(SB)}, VAPID key {bool(VAPID_PRIVATE_KEY)}"
         # FIX: this was a completely silent early-exit — if this ever
         # actually fired, there would be zero trace of it anywhere in
         # Render's logs, making a real failure here indistinguishable from
@@ -286,7 +291,8 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
 
     if not rows:
         print(f"[Push] SKIPPED '{title}' — zero active subscriptions in push_subscriptions table")
-        return
+        _PUSH_STATS["last_error"] = f"{ist_str()} no active device registered — open the app once to re-register"
+        return {"sent": 0, "failed": 0, "deactivated": 0, "devices": 0}
 
     import json as _json
     payload = _json.dumps({"title": title, "body": body, "url": url, "tag": tag})
@@ -308,7 +314,15 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
         except WebPushException as e:
             failed += 1
             status = getattr(e.response, "status_code", None)
-            if status in (404, 410):
+            try: _txt = (e.response.text or "")[:160] if e.response is not None else str(e)[:160]
+            except Exception: _txt = str(e)[:160]
+            _PUSH_STATS["last_error"] = f"{ist_str()} HTTP {status}: {_txt}"
+            print(f"[Push] rejected by push service for subscription {row.get('id')}: HTTP {status} {_txt}")
+            # Nov 16: Apple answers 400 VapidPkHashMismatch for a subscription made with an older
+            # server key — it can never work again, so deactivate it too (the app now re-registers
+            # itself on next open). 403 (BadJwtToken/ExpiredProviderToken) is a SERVER key/clock
+            # problem, not the phone's: keep the device, record the error so /status shows it.
+            if status in (404, 410) or (status == 400 and "VapidPkHashMismatch" in _txt):
                 try:
                     SB.table("push_subscriptions").update({"active": False}).eq("id", row["id"]).execute()
                     deactivated += 1
@@ -319,6 +333,9 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
             print(f"[Push] unexpected error sending to subscription {row.get('id')}: {e}")
 
     print(f"[Push] '{title}' — sent:{sent} failed:{failed} deactivated:{deactivated}")
+    _PUSH_STATS["sent_today"] = (_PUSH_STATS["sent_today"] if _PUSH_STATS["day"] == ist_today() else 0) + sent
+    _PUSH_STATS["day"] = ist_today()
+    if sent: _PUSH_STATS["last_ok"] = f"{ist_str()} {title[:60]}"
 
     if dedup_key and sent > 0:
         # FIX: same persistence fix as the check above — this must write to
@@ -339,6 +356,7 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
             CACHE.set(dedup_key, True)
     elif dedup_key and sent == 0:
         print(f"[Push] NOT marking dedup for '{title}' — zero sends succeeded, next signal for this symbol should retry immediately rather than wait out the hour")
+    return {"sent": sent, "failed": failed, "deactivated": deactivated, "devices": len(rows)}
 
 
 @app.route("/push_vapid_public_key")
@@ -375,6 +393,8 @@ def push_subscribe():
             "endpoint": endpoint, "p256dh": p256dh, "auth": auth,
             "active": True, "last_used_at": datetime.now(timezone.utc).isoformat(),
         }, on_conflict="endpoint").execute()
+        if data.get("_resync"): print("[Push] device re-registered on app open (subscription confirmed active)")
+        else: print("[Push] device subscribed")
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -427,14 +447,15 @@ def push_test():
     if active_count == 0:
         return jsonify({"ok": False, "error": "zero active subscriptions — nothing to send to. Re-enable notifications in Settings first."}), 400
 
-    send_push_to_all(
+    res = send_push_to_all(
         "🧪 PRO Trader — Test Push",
         f"Sent manually at {ist_str()}. If this reached your device, push delivery is confirmed working end-to-end.",
         "/",
         "protrader-test-push"
-    )
-    return jsonify({"ok": True, "active_subscriptions": active_count,
-                     "note": "Push send attempted — check Render logs for '[Push]' to see sent/failed counts, and check your device for the actual notification."})
+    ) or {}
+    return jsonify({"ok": bool(res.get("sent")), "active_subscriptions": active_count, "result": res,
+                    "last_error": _PUSH_STATS.get("last_error"),
+                    "note": "sent>0 means Apple/Google accepted it; check the phone. failed>0 shows the reason in last_error."})
 
 
 
@@ -5227,6 +5248,9 @@ def health(_nocache=None):
         except Exception as e:
             db["error"] = str(e)[:120]
     out["supabase"] = db
+    out["watchdog"] = {"problems": _WD.get("problems"), "state": _WD.get("state"),
+                       "checked_sec_ago": round(now - _WD["checked_at"]) if _WD.get("checked_at") else None}
+    out["push"] = {k: _PUSH_STATS.get(k) for k in ("sent_today", "last_ok", "last_error")}
     out["recent_log"] = list(_LOG_RING)[-60:]
     body = json.dumps(out, default=str)
     _HEALTH_CACHE["body"] = body; _HEALTH_CACHE["ts"] = time.time()
@@ -6608,6 +6632,163 @@ def backfill_status(job_id):
 
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# WATCHDOG (Nov 16) — replaces the old 8:45 "Ready" push, which claimed "server and
+# worker are up" without checking anything. Every 2 minutes it checks the things
+# that silently broke before, keeps a plain-language status for the app's status
+# strip (/status), and pushes an ALERT when something is wrong during market hours:
+#   - Zerodha not logged in today (nothing can be scanned)
+#   - background worker silent (no ping for 12 min)
+#   - no market snapshots saved for 15 min
+# Plus one "all systems" push at 09:25 and a day summary at 15:40.
+# ═══════════════════════════════════════════════════════════════════════════
+_WD = {"state": {}, "checked_at": None, "alerts_sent": {}, "problems": [], "notes": []}
+_WORKER_PING = {"at": None, "info": {}}
+
+@app.route("/worker_ping", methods=["POST", "GET"])
+def worker_ping():
+    """The always-on worker calls this every 5 minutes, whether or not any signal fired."""
+    try: info = request.get_json(force=True, silent=True) or {}
+    except Exception: info = {}
+    _WORKER_PING["at"] = time.time(); _WORKER_PING["info"] = {k: info.get(k) for k in ("signals", "serverOk", "ver", "session_min", "open_trades")}
+    try:
+        with open("/tmp/pt_worker_ping", "w") as f: f.write(str(time.time()))
+    except Exception: pass
+    if SB:
+        try:
+            SB.table("server_kv").upsert({"key": "worker_ping", "value": json.dumps(_WORKER_PING["info"]),
+                                          "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
+        except Exception: pass
+    return jsonify({"ok": True})
+
+def _worker_ping_age():
+    ages = []
+    if _WORKER_PING["at"]: ages.append(time.time() - _WORKER_PING["at"])
+    for fn in ("/tmp/pt_worker_ping", "/tmp/pt_last_worker_signal"):
+        try:
+            with open(fn) as f: ages.append(time.time() - float(f.read().strip()))
+        except Exception: pass
+    if SB and not ages:
+        try:
+            r = (SB.table("server_kv").select("updated_at").eq("key", "worker_ping").execute()).data or []
+            if r: ages.append((datetime.now(timezone.utc) - datetime.fromisoformat(r[0]["updated_at"].replace("Z", "+00:00"))).total_seconds())
+        except Exception: pass
+    return min(ages) if ages else None
+
+def _wd_check():
+    """Collect the facts. Returns (state dict, problems list[str])."""
+    now = datetime.now(IST); st = {"time_ist": now.strftime("%H:%M"), "server_build": SERVER_BUILD}
+    problems = []
+    mins = now.hour * 60 + now.minute
+    st["market_hours"] = now.weekday() < 5 and 555 <= mins <= 930
+    # Zerodha login today?
+    kite_today = False; saved = None
+    if SB:
+        try:
+            kv = (SB.table("server_kv").select("updated_at").eq("key", "kite_token").execute()).data or []
+            if kv and kv[0].get("updated_at"):
+                t = datetime.fromisoformat(kv[0]["updated_at"].replace("Z", "+00:00")).astimezone(IST)
+                saved = t.strftime("%d %b %H:%M"); kite_today = t.date() == now.date() and t.hour * 60 + t.minute >= 6 * 60
+        except Exception as e:
+            st["kite_check_error"] = str(e)[:80]
+    st["zerodha_logged_in_today"] = kite_today; st["zerodha_token_saved"] = saved
+    # Worker
+    age = _worker_ping_age()
+    st["worker_last_seen_min"] = round(age / 60, 1) if age is not None else None
+    st["worker_info"] = _WORKER_PING.get("info") or {}
+    # Data capture + signals today
+    if SB:
+        start = _ist_session_start_iso(); since15 = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        def cnt(q):
+            try: return q.limit(1).execute().count
+            except Exception: return None
+        st["snapshots_today"] = cnt(SB.table("snapshots").select("id", count="exact").gte("ts", start))
+        st["snapshots_last15m"] = cnt(SB.table("snapshots").select("id", count="exact").gte("ts", since15))
+        st["signals_today"] = cnt(SB.table("signals").select("id", count="exact").gte("created_at", start))
+        st["high_today"] = cnt(SB.table("signals").select("id", count="exact").gte("created_at", start).eq("urgency", "HIGH"))
+        st["high_notify_symbols_today"] = cnt(SB.table("signals").select("id", count="exact").gte("created_at", start)
+                                              .eq("urgency", "HIGH").in_("sym", sorted(PUSH_ALLOWED_SYMBOLS)))
+        st["journal_today"] = cnt(SB.table("journal").select("id", count="exact").gte("created_at", start))
+        st["devices_registered"] = cnt(SB.table("push_subscriptions").select("id", count="exact").eq("active", True))
+    else:
+        problems.append("Database (Supabase) is not connected — nothing can be saved")
+    st["pushes_sent_today"] = _PUSH_STATS["sent_today"] if _PUSH_STATS["day"] == ist_today() else 0
+    st["last_push_ok"] = _PUSH_STATS.get("last_ok"); st["last_push_error"] = _PUSH_STATS.get("last_error")
+    if not VAPID_PRIVATE_KEY: problems.append("Notifications are not configured on the server (VAPID key missing)")
+    if st.get("devices_registered") == 0: problems.append("No phone is registered for notifications — open the app from the Home Screen icon")
+    if st["market_hours"]:
+        if not kite_today and mins >= 560:
+            problems.append("Zerodha is not logged in today — open PRO Trader and log in; nothing can be scanned until then")
+        if age is None or age > 12 * 60:
+            problems.append("Background scanner (worker) is not running" + (f" — last seen {round(age/60)} min ago" if age else " — never seen since the server started"))
+        if kite_today and mins >= 575 and st.get("snapshots_last15m") == 0:
+            problems.append("No market data saved in the last 15 minutes")
+    return st, problems
+
+def _wd_alert(key, title, body):
+    day = ist_today(); k = f"{day}|{key}"
+    if _WD["alerts_sent"].get(k): return
+    _WD["alerts_sent"][k] = time.time()
+    print(f"[Watchdog] ALERT {key}: {body}")
+    send_push_to_all(title, body, "/", f"protrader-watchdog-{key}")
+
+def _bg_watchdog():
+    time.sleep(45)
+    print("[Watchdog] started — checks every 2 min; alerts during market hours")
+    prev_problems = set()
+    while True:
+        try:
+            st, problems = _wd_check()
+            _WD.update(state=st, problems=problems, checked_at=time.time())
+            now = datetime.now(IST); mins = now.hour * 60 + now.minute; wk = now.weekday() < 5
+            cur = set(problems)
+            if st["market_hours"]:
+                for p in cur - prev_problems:
+                    key = ("zerodha" if "Zerodha" in p else "worker" if "worker" in p else "data" if "market data" in p
+                           else "device" if "phone" in p else "other")
+                    _wd_alert(key, "⚠️ PRO Trader needs attention", p)
+                for p in prev_problems - cur:
+                    print(f"[Watchdog] resolved: {p}")
+            prev_problems = cur
+            if wk and mins >= 565 and mins < 600:       # 09:25 morning status, once a day
+                if not _WD["alerts_sent"].get(f"{ist_today()}|morning"):
+                    _WD["alerts_sent"][f"{ist_today()}|morning"] = time.time()
+                    if problems:
+                        send_push_to_all("⚠️ PRO Trader — not fully running", " · ".join(problems)[:230], "/", "protrader-status")
+                    else:
+                        send_push_to_all("✅ PRO Trader running",
+                                         f"Zerodha ✓ · scanner seen {st.get('worker_last_seen_min')} min ago · "
+                                         f"{st.get('snapshots_last15m')} data rows in last 15 min. If today is a market holiday, ignore.",
+                                         "/", "protrader-status")
+            if wk and mins >= 940 and mins < 990:        # 15:40 day summary
+                if not _WD["alerts_sent"].get(f"{ist_today()}|eod"):
+                    _WD["alerts_sent"][f"{ist_today()}|eod"] = time.time()
+                    send_push_to_all("📊 PRO Trader — today",
+                                     f"{st.get('high_today')} HIGH signals ({st.get('high_notify_symbols_today')} on your alert list), "
+                                     f"{st.get('pushes_sent_today')} notifications sent, {st.get('journal_today')} journal trades, "
+                                     f"{st.get('snapshots_today')} data rows saved.", "/", "protrader-eod")
+            # forget alert keys older than 2 days
+            for k in [k for k, t in _WD["alerts_sent"].items() if time.time() - t > 2 * 86400]:
+                _WD["alerts_sent"].pop(k, None)
+        except Exception as e:
+            print(f"[Watchdog] error (retrying in 2 min): {e}")
+        time.sleep(120)
+
+@app.route("/status")
+@app.route("/status/<path:_nocache>")
+def system_status(_nocache=None):
+    """Plain-language system status for the app's status strip (no secrets)."""
+    if not _WD["checked_at"] or time.time() - _WD["checked_at"] > 300:
+        try:
+            st, problems = _wd_check(); _WD.update(state=st, problems=problems, checked_at=time.time())
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)[:120]})
+    return jsonify({"ok": True, "checked_sec_ago": round(time.time() - _WD["checked_at"]),
+                    "problems": _WD["problems"], "state": _WD["state"]})
+
+_watchdog_thread = threading.Thread(target=_bg_watchdog, daemon=True)
+_watchdog_thread.start()
+
 _last_heartbeat_date = None
 def _bg_daily_heartbeat():
     """
@@ -6649,8 +6830,10 @@ def _bg_daily_heartbeat():
         time.sleep(300)  # check every 5 min — this only needs to fire once a day
 
 
-_heartbeat_thread = threading.Thread(target=_bg_daily_heartbeat, daemon=True)
-_heartbeat_thread.start()
+# Old 8:45 "Ready" push disabled (Nov 16): it said "server and worker are up" without
+# checking either. The watchdog's 09:25 status push reports what it actually checked.
+# _heartbeat_thread = threading.Thread(target=_bg_daily_heartbeat, daemon=True)
+# _heartbeat_thread.start()
 
 
 def _warmup_token_cache():
