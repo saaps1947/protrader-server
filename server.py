@@ -40,10 +40,10 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-17-v1"
+SERVER_BUILD = "2026-11-17-v2"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
-_LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
+_LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ingest", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
              "Duplicate", "Auth failed", "token expired", "[StockOI] Cycle", "[ExtOI] Cycle")
 _HEALTH = {"market_build_sec": None, "market_built_at": None, "signals_in": 0}
 def print(*args, **kwargs):
@@ -603,6 +603,20 @@ def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: 
         return {"ok": False, "error": str(e)}
 
 
+def _premium_lookup(sym, strike, opt_type, key, token):
+    """Cached premium lookup shared by /option_premium and /ingest_signal (want_premium)."""
+    cache_key = f"premium_{sym}_{int(strike)}_{opt_type}"
+    cached = CACHE.get_val(cache_key); age = CACHE.age(cache_key)
+    if cached and age is not None and age < 15:
+        return dict(cached, cached=True)
+    t0 = time.time()
+    result = get_option_premium(sym, strike, opt_type, key, token)
+    dt = time.time() - t0
+    if dt > 5:
+        print(f"[Premium-SLOW] {sym} {int(strike)}{opt_type} took {dt:.1f}s — {'ok' if result.get('ok') else result.get('error')}")
+    if result.get("ok"): CACHE.set(cache_key, result)
+    return result
+
 @app.route("/option_premium")
 def option_premium():
     key, token = _creds()
@@ -1159,6 +1173,28 @@ def risk_gate(_nocache=None):
 
 @app.route("/ingest_signal", methods=["POST"])
 def ingest_signal():
+    """Nov 17: if the app could not get an option premium itself (the always-on worker's
+    premium requests time out), it sends want_premium=true here; the server looks the
+    premium up (normally ~1 s) and returns it, so the trade still reaches the journal."""
+    resp = _ingest_signal_core()
+    try:
+        sig = request.get_json(force=True, silent=True) or {}
+        if sig.get("want_premium") and sig.get("strike") and sig.get("optType") in ("CE", "PE"):
+            key, token = _creds(sig)
+            t0 = time.time()
+            prem = _premium_lookup(str(sig.get("sym", "")).upper(), float(sig["strike"]), sig["optType"], key, token)
+            print(f"[Premium] via ingest for {sig.get('sym')} {sig.get('strike')}{sig.get('optType')}: "
+                  f"{'₹' + str(prem.get('premium')) if prem.get('ok') else prem.get('error')} in {time.time() - t0:.1f}s")
+            r = resp[0] if isinstance(resp, tuple) else resp
+            body = r.get_json(silent=True) or {}
+            body["premium"] = prem
+            out = jsonify(body)
+            return (out, resp[1]) if isinstance(resp, tuple) else out
+    except Exception as e:
+        print(f"[Premium] via ingest failed: {e}")
+    return resp
+
+def _ingest_signal_core():
     """
     Any client posts a generated signal here — the phone app, or the
     always-on worker. Fire-and-forget, same pattern as /snapshot: never
