@@ -40,12 +40,30 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-17-v5"
+SERVER_BUILD = "2026-11-17-v6"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
              "Duplicate", "Auth failed", "token expired", "[StockOI] Cycle", "[ExtOI] Cycle")
 _HEALTH = {"market_build_sec": None, "market_built_at": None, "signals_in": 0}
+# Nov 17 (eve): on Render the background loops (watchdog, StockOI…) run in a DIFFERENT process
+# from the one answering /health, so their log lines and push results were invisible (the 15:40
+# day summary could not be confirmed). Both processes now also append to a shared daily file in /tmp.
+def _shared_path(name):
+    return f"/tmp/pt_{name}_{time.strftime('%Y-%m-%d', time.gmtime(time.time() + 19800))}.log"
+def _shared_append(name, line):
+    try:
+        with open(_shared_path(name), "a", encoding="utf-8") as f: f.write(line.replace("\n", " ") + "\n")
+    except Exception: pass
+def _shared_tail(name, n=60):
+    try:
+        with open(_shared_path(name), "rb") as f:
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 65536))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+        return [l for l in lines if l][-n:]
+    except Exception:
+        return None
+
 def print(*args, **kwargs):
     _builtins.print(*args, **kwargs)
     try:
@@ -53,7 +71,9 @@ def print(*args, **kwargs):
         if "[Signal \u2705]" in msg:
             _HEALTH["signals_in"] += 1
         elif any(k in msg for k in _LOG_KEYS):
-            _LOG_RING.append(time.strftime("%H:%M:%S", time.gmtime(time.time() + 19800)) + " " + msg[:300])
+            line = time.strftime("%H:%M:%S", time.gmtime(time.time() + 19800)) + " " + msg[:300]
+            _LOG_RING.append(line)
+            _shared_append("log", line)
     except Exception:
         pass
 
@@ -238,6 +258,19 @@ def write_signal(sig: dict, fired: bool, source: str = "worker"):
 
 
 _PUSH_STATS = {"attempts": 0, "sent_today": 0, "day": None, "last_ok": None, "last_error": None}
+def _push_stats():
+    """Today's push results from ALL server processes (shared file), falling back to this process."""
+    rows = _shared_tail("push", 5000)
+    mine = {k: _PUSH_STATS.get(k) for k in ("sent_today", "last_ok", "last_error")}
+    if _PUSH_STATS.get("day") != ist_today(): mine["sent_today"] = 0
+    if not rows: return mine
+    sent_total, last_ok = 0, None
+    for r in rows:
+        try:
+            a, b, rest = r.split("|", 2); sent_total += int(a)
+            if int(a) > 0: last_ok = rest
+        except Exception: continue
+    return {"sent_today": sent_total, "last_ok": last_ok or mine["last_ok"], "last_error": mine["last_error"]}
 def ist_today(): return datetime.now(IST).strftime("%Y-%m-%d")
 
 def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrader-signal", dedup_key: str = None):
@@ -337,6 +370,7 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
     _PUSH_STATS["sent_today"] = (_PUSH_STATS["sent_today"] if _PUSH_STATS["day"] == ist_today() else 0) + sent
     _PUSH_STATS["day"] = ist_today()
     if sent: _PUSH_STATS["last_ok"] = f"{ist_str()} {title[:60]}"
+    _shared_append("push", f"{sent}|{failed}|{ist_str()} {title[:60]}")
 
     if dedup_key and sent > 0:
         # FIX: same persistence fix as the check above — this must write to
@@ -631,6 +665,49 @@ def _premium_lookup(sym, strike, opt_type, key, token):
         print(f"[Premium-SLOW] {sym} {int(strike)}{opt_type} took {dt:.1f}s — {'ok' if result.get('ok') else result.get('error')}")
     if result.get("ok"): CACHE.set(cache_key, result)
     return result
+
+_STRIKE_STEPS = {"day": None, "steps": {}}
+def _compute_strike_steps(csv):
+    """{underlying: real strike gap} from the NFO contract list, nearest expiry (Nov 17 eve).
+    The app guessed gaps from price (₹1000-10000 → 50), but many stocks list strikes 10/20 apart,
+    so signals named strikes that don't exist (HCLTECH 1350 PE, TECHM 1750 PE…)."""
+    from collections import Counter
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    by = {}
+    for line in csv.split("\n")[1:]:
+        c = line.split(",")
+        if len(c) < 10 or c[9] != "CE" or not c[5] or c[5] < today: continue
+        try: k = float(c[6])
+        except Exception: continue
+        by.setdefault(c[3].strip('"'), {}).setdefault(c[5], set()).add(k)
+    out = {}
+    for name, exps in by.items():
+        ks = sorted(exps[min(exps)])
+        if len(ks) < 4: continue
+        diffs = Counter(round(b - a, 2) for a, b in zip(ks, ks[1:]) if b > a)
+        top = max(diffs.values())
+        step = min(d for d, n in diffs.items() if n == top)
+        out[name] = int(step) if float(step).is_integer() else step
+    return out
+
+@app.route("/strike_steps")
+def strike_steps():
+    """Real strike gap per F&O underlying. Public contract facts only — no account data."""
+    if _STRIKE_STEPS["day"] == ist_today() and _STRIKE_STEPS["steps"]:
+        return jsonify({"ok": True, "steps": _STRIKE_STEPS["steps"], "cached": True})
+    key, token = _creds()
+    if not key or not token:
+        return jsonify({"ok": False, "error": "not connected"})
+    csv = fetch_kite_instruments_nfo(key, token)
+    if not csv:
+        return jsonify({"ok": False, "error": "instruments CSV unavailable"})
+    try:
+        steps = _compute_strike_steps(csv)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:120]})
+    if steps:
+        _STRIKE_STEPS.update(day=ist_today(), steps=steps)
+    return jsonify({"ok": bool(steps), "steps": steps})
 
 @app.route("/option_premium")
 def option_premium():
@@ -5310,8 +5387,8 @@ def health(_nocache=None):
                        "cycles": _WD.get("cycles"), "last_cycle_sec_ago": round(now - _WD["cycle_at"]) if _WD.get("cycle_at") else None,
                        "last_error": _WD.get("cycle_error"),
                        "loop_alive": _watchdog_thread.is_alive() if "_watchdog_thread" in globals() else None}
-    out["push"] = {k: _PUSH_STATS.get(k) for k in ("sent_today", "last_ok", "last_error")}
-    out["recent_log"] = list(_LOG_RING)[-60:]
+    out["push"] = _push_stats()
+    out["recent_log"] = _shared_tail("log", 60) or list(_LOG_RING)[-60:]
     body = json.dumps(out, default=str)
     _HEALTH_CACHE["body"] = body; _HEALTH_CACHE["ts"] = time.time()
     return app.response_class(body, mimetype="application/json")
@@ -6774,8 +6851,9 @@ def _wd_check():
         st["devices_registered"] = cnt(SB.table("push_subscriptions").select("id", count="exact").eq("active", True))
     else:
         problems.append("Database (Supabase) is not connected — nothing can be saved")
-    st["pushes_sent_today"] = _PUSH_STATS["sent_today"] if _PUSH_STATS["day"] == ist_today() else 0
-    st["last_push_ok"] = _PUSH_STATS.get("last_ok"); st["last_push_error"] = _PUSH_STATS.get("last_error")
+    _ps = _push_stats()
+    st["pushes_sent_today"] = _ps["sent_today"]
+    st["last_push_ok"] = _ps.get("last_ok"); st["last_push_error"] = _ps.get("last_error")
     if not VAPID_PRIVATE_KEY: problems.append("Notifications are not configured on the server (VAPID key missing)")
     if st.get("devices_registered") == 0: problems.append("No phone is registered for notifications — open the app from the Home Screen icon")
     if st["market_hours"]:
