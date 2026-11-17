@@ -40,10 +40,10 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-16-v1"
+SERVER_BUILD = "2026-11-17-v1"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
-_LOG_KEYS = ("[Push]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
+_LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
              "Duplicate", "Auth failed", "token expired", "[StockOI] Cycle", "[ExtOI] Cycle")
 _HEALTH = {"market_build_sec": None, "market_built_at": None, "signals_in": 0}
 def print(*args, **kwargs):
@@ -308,7 +308,8 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
                 subscription_info=subscription_info,
                 data=payload,
                 vapid_private_key=VAPID_PRIVATE_KEY,
-                vapid_claims={"sub": VAPID_CLAIMS_SUB}
+                vapid_claims={"sub": VAPID_CLAIMS_SUB},
+                timeout=15,          # Nov 17: a stuck connection can no longer freeze the caller
             )
             sent += 1
         except WebPushException as e:
@@ -510,6 +511,23 @@ def last_session_signals():
 
 
 
+_OPT_INDEX = {}
+def _option_index(csv, sym):
+    """{expiry: {(CE|PE, strike): tradingsymbol}} for one underlying, built once per contract-list download."""
+    k = (len(csv), csv[-300:], sym)
+    hit = _OPT_INDEX.get(k)
+    if hit is not None: return hit
+    out = {}
+    for line in csv.split("\n")[1:]:
+        cols = line.split(",")
+        if len(cols) < 10 or cols[9] not in ("CE", "PE"): continue
+        if not _is_contract_for(cols[2], sym): continue
+        try: out.setdefault(cols[5], {}).setdefault((cols[9], int(float(cols[6]))), cols[2])
+        except Exception: continue
+    if len(_OPT_INDEX) > 40: _OPT_INDEX.clear()
+    _OPT_INDEX[k] = out
+    return out
+
 def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: str):
     """
     Fetches the REAL, live premium for a specific option contract — the
@@ -550,35 +568,19 @@ def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: 
         if not csv:
             return {"ok": False, "error": "instruments CSV unavailable"}
 
-        lines = csv.strip().split("\n")
+        # Nov 17: the 90,000-line contract list used to be scanned twice on EVERY call (and the
+        # app calls this for every open trade, every few seconds). Now indexed once per download.
+        idx = _option_index(csv, sym)
         today_n = datetime.now(IST).date()
         best_exp = None; best_days = 999
-        for line in lines[1:]:
-            cols = line.split(",")
-            if len(cols) < 10: continue
-            if not _is_contract_for(cols[2], sym): continue
-            if cols[9] not in ("CE", "PE"): continue
+        for exp_s in idx:
             try:
-                exp = datetime.strptime(cols[5], "%Y-%m-%d").date()
-                d2 = (exp - today_n).days
-                if 0 <= d2 < best_days:
-                    best_days = d2; best_exp = cols[5]
-            except: continue
+                d2 = (datetime.strptime(exp_s, "%Y-%m-%d").date() - today_n).days
+                if 0 <= d2 < best_days: best_days = d2; best_exp = exp_s
+            except Exception: continue
         if not best_exp:
             return {"ok": False, "error": f"no valid expiry found for {sym}"}
-
-        tradingsymbol = None
-        for line in lines[1:]:
-            cols = line.split(",")
-            if len(cols) < 10: continue
-            if not _is_contract_for(cols[2], sym): continue
-            if cols[9] != opt_type: continue
-            if cols[5] != best_exp: continue
-            try:
-                if int(float(cols[6])) == int(strike):
-                    tradingsymbol = cols[2]
-                    break
-            except: continue
+        tradingsymbol = idx[best_exp].get((opt_type, int(strike)))
         if not tradingsymbol:
             return {"ok": False, "error": f"no contract found for {sym} {strike} {opt_type} exp:{best_exp}"}
 
@@ -648,7 +650,11 @@ def option_premium():
     except Exception:
         pass
 
+    _t0 = time.time()
     result = get_option_premium(sym, strike, opt_type, key, token)
+    _dt = time.time() - _t0
+    if _dt > 5:
+        print(f"[Premium-SLOW] {sym} {int(strike)}{opt_type} took {_dt:.1f}s — {'ok' if result.get('ok') else result.get('error')}")
     if result.get("ok"):
         CACHE.set(cache_key, result)
         try:
@@ -5249,7 +5255,10 @@ def health(_nocache=None):
             db["error"] = str(e)[:120]
     out["supabase"] = db
     out["watchdog"] = {"problems": _WD.get("problems"), "state": _WD.get("state"),
-                       "checked_sec_ago": round(now - _WD["checked_at"]) if _WD.get("checked_at") else None}
+                       "checked_sec_ago": round(now - _WD["checked_at"]) if _WD.get("checked_at") else None,
+                       "cycles": _WD.get("cycles"), "last_cycle_sec_ago": round(now - _WD["cycle_at"]) if _WD.get("cycle_at") else None,
+                       "last_error": _WD.get("cycle_error"),
+                       "loop_alive": _watchdog_thread.is_alive() if "_watchdog_thread" in globals() else None}
     out["push"] = {k: _PUSH_STATS.get(k) for k in ("sent_today", "last_ok", "last_error")}
     out["recent_log"] = list(_LOG_RING)[-60:]
     body = json.dumps(out, default=str)
@@ -6650,7 +6659,8 @@ def worker_ping():
     """The always-on worker calls this every 5 minutes, whether or not any signal fired."""
     try: info = request.get_json(force=True, silent=True) or {}
     except Exception: info = {}
-    _WORKER_PING["at"] = time.time(); _WORKER_PING["info"] = {k: info.get(k) for k in ("signals", "serverOk", "ver", "session_min", "open_trades")}
+    _WORKER_PING["at"] = time.time(); _WORKER_PING["info"] = {k: info.get(k) for k in ("signals", "serverOk", "ver", "session_min", "open_trades", "last_fetch_error", "restarts")}
+    if _wd_overdue(): threading.Thread(target=_wd_cycle, args=("worker ping",), daemon=True).start()
     try:
         with open("/tmp/pt_worker_ping", "w") as f: f.write(str(time.time()))
     except Exception: pass
@@ -6732,59 +6742,81 @@ def _wd_alert(key, title, body):
     print(f"[Watchdog] ALERT {key}: {body}")
     send_push_to_all(title, body, "/", f"protrader-watchdog-{key}")
 
+_WD_LOCK = threading.Lock()
+_WD["prev_problems"] = set(); _WD["cycle_at"] = None; _WD["cycle_error"] = None; _WD["cycles"] = 0
+
+def _wd_cycle(source="loop"):
+    """One full watchdog pass: check, alert on NEW problems, morning status, day summary.
+    Nov 17: the background loop alone was not reliable on Render (no 09:25 status arrived),
+    so the worker's 5-min ping and the app's /status call also run it when it is overdue."""
+    if not _WD_LOCK.acquire(blocking=False):
+        return
+    try:
+        st, problems = _wd_check()
+        _WD.update(state=st, problems=problems, checked_at=time.time())
+        now = datetime.now(IST); mins = now.hour * 60 + now.minute; wk = now.weekday() < 5
+        cur = set(problems); prev = _WD["prev_problems"]
+        if st["market_hours"]:
+            for p in cur - prev:
+                key = ("zerodha" if "Zerodha" in p else "worker" if "worker" in p else "data" if "market data" in p
+                       else "device" if "phone" in p else "other")
+                _wd_alert(key, "⚠️ PRO Trader needs attention", p)
+            for p in prev - cur:
+                print(f"[Watchdog] resolved: {p}")
+        _WD["prev_problems"] = cur
+        if wk and 565 <= mins < 600 and not _WD["alerts_sent"].get(f"{ist_today()}|morning"):
+            _WD["alerts_sent"][f"{ist_today()}|morning"] = time.time()
+            print(f"[Watchdog] 09:25 status ({source}): {'; '.join(problems) or 'all OK'}")
+            if problems:
+                send_push_to_all("⚠️ PRO Trader — not fully running", " · ".join(problems)[:230], "/", "protrader-status")
+            else:
+                send_push_to_all("✅ PRO Trader running",
+                                 f"Zerodha ✓ · scanner seen {st.get('worker_last_seen_min')} min ago · "
+                                 f"{st.get('snapshots_last15m')} data rows in last 15 min. If today is a market holiday, ignore.",
+                                 "/", "protrader-status")
+        if wk and 940 <= mins < 990 and not _WD["alerts_sent"].get(f"{ist_today()}|eod"):
+            _WD["alerts_sent"][f"{ist_today()}|eod"] = time.time()
+            print(f"[Watchdog] day summary sent ({source})")
+            send_push_to_all("📊 PRO Trader — today",
+                             f"{st.get('high_today')} HIGH signals ({st.get('high_notify_symbols_today')} on your alert list), "
+                             f"{st.get('pushes_sent_today')} notifications sent, {st.get('journal_today')} journal trades, "
+                             f"{st.get('snapshots_today')} data rows saved.", "/", "protrader-eod")
+        for k in [k for k, t in _WD["alerts_sent"].items() if time.time() - t > 2 * 86400]:
+            _WD["alerts_sent"].pop(k, None)
+        _WD["cycle_at"] = time.time(); _WD["cycle_error"] = None; _WD["cycles"] += 1
+        if _WD["cycles"] == 1 or _WD["cycles"] % 30 == 0:
+            print(f"[Watchdog] cycle #{_WD['cycles']} ok via {source}; problems: {len(problems)}")
+    except Exception as e:
+        _WD["cycle_error"] = f"{ist_str()} {type(e).__name__}: {str(e)[:150]}"
+        print(f"[Watchdog] cycle failed ({source}): {_WD['cycle_error']}")
+    finally:
+        _WD_LOCK.release()
+
+def _wd_overdue():
+    return not _WD.get("cycle_at") or time.time() - _WD["cycle_at"] > 240
+
 def _bg_watchdog():
     time.sleep(45)
-    print("[Watchdog] started — checks every 2 min; alerts during market hours")
-    prev_problems = set()
+    print("[Watchdog] background loop started (also runs from worker pings and the app)")
     while True:
-        try:
-            st, problems = _wd_check()
-            _WD.update(state=st, problems=problems, checked_at=time.time())
-            now = datetime.now(IST); mins = now.hour * 60 + now.minute; wk = now.weekday() < 5
-            cur = set(problems)
-            if st["market_hours"]:
-                for p in cur - prev_problems:
-                    key = ("zerodha" if "Zerodha" in p else "worker" if "worker" in p else "data" if "market data" in p
-                           else "device" if "phone" in p else "other")
-                    _wd_alert(key, "⚠️ PRO Trader needs attention", p)
-                for p in prev_problems - cur:
-                    print(f"[Watchdog] resolved: {p}")
-            prev_problems = cur
-            if wk and mins >= 565 and mins < 600:       # 09:25 morning status, once a day
-                if not _WD["alerts_sent"].get(f"{ist_today()}|morning"):
-                    _WD["alerts_sent"][f"{ist_today()}|morning"] = time.time()
-                    if problems:
-                        send_push_to_all("⚠️ PRO Trader — not fully running", " · ".join(problems)[:230], "/", "protrader-status")
-                    else:
-                        send_push_to_all("✅ PRO Trader running",
-                                         f"Zerodha ✓ · scanner seen {st.get('worker_last_seen_min')} min ago · "
-                                         f"{st.get('snapshots_last15m')} data rows in last 15 min. If today is a market holiday, ignore.",
-                                         "/", "protrader-status")
-            if wk and mins >= 940 and mins < 990:        # 15:40 day summary
-                if not _WD["alerts_sent"].get(f"{ist_today()}|eod"):
-                    _WD["alerts_sent"][f"{ist_today()}|eod"] = time.time()
-                    send_push_to_all("📊 PRO Trader — today",
-                                     f"{st.get('high_today')} HIGH signals ({st.get('high_notify_symbols_today')} on your alert list), "
-                                     f"{st.get('pushes_sent_today')} notifications sent, {st.get('journal_today')} journal trades, "
-                                     f"{st.get('snapshots_today')} data rows saved.", "/", "protrader-eod")
-            # forget alert keys older than 2 days
-            for k in [k for k, t in _WD["alerts_sent"].items() if time.time() - t > 2 * 86400]:
-                _WD["alerts_sent"].pop(k, None)
-        except Exception as e:
-            print(f"[Watchdog] error (retrying in 2 min): {e}")
+        _wd_cycle("loop")
         time.sleep(120)
 
 @app.route("/status")
 @app.route("/status/<path:_nocache>")
 def system_status(_nocache=None):
     """Plain-language system status for the app's status strip (no secrets)."""
-    if not _WD["checked_at"] or time.time() - _WD["checked_at"] > 300:
+    if _wd_overdue():
+        _wd_cycle("app status")            # runs inline once if the loop is late, so the app gets fresh facts
+    if not _WD.get("checked_at"):
         try:
             st, problems = _wd_check(); _WD.update(state=st, problems=problems, checked_at=time.time())
         except Exception as e:
             return jsonify({"ok": False, "error": str(e)[:120]})
     return jsonify({"ok": True, "checked_sec_ago": round(time.time() - _WD["checked_at"]),
-                    "problems": _WD["problems"], "state": _WD["state"]})
+                    "problems": _WD["problems"], "state": _WD["state"],
+                    "watchdog": {"cycles": _WD.get("cycles"), "last_cycle_sec_ago": round(time.time() - _WD["cycle_at"]) if _WD.get("cycle_at") else None,
+                                 "last_error": _WD.get("cycle_error"), "loop_alive": _watchdog_thread.is_alive()}})
 
 _watchdog_thread = threading.Thread(target=_bg_watchdog, daemon=True)
 _watchdog_thread.start()
