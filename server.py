@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-17-v3"
+SERVER_BUILD = "2026-11-17-v4"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ingest", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -6695,7 +6695,8 @@ def worker_ping():
     """The always-on worker calls this every 5 minutes, whether or not any signal fired."""
     try: info = request.get_json(force=True, silent=True) or {}
     except Exception: info = {}
-    _WORKER_PING["at"] = time.time(); _WORKER_PING["info"] = {k: info.get(k) for k in ("signals", "serverOk", "ver", "session_min", "open_trades", "last_fetch_error", "restarts")}
+    _WORKER_PING["at"] = time.time(); _WORKER_PING["info"] = {k: info.get(k) for k in ("signals", "serverOk", "ver", "session_min", "open_trades", "last_fetch_error", "restarts",
+                                                                                       "open_requests", "max_open_requests", "oldest_open", "slow_requests")}
     if _wd_overdue(): threading.Thread(target=_wd_cycle, args=("worker ping",), daemon=True).start()
     try:
         with open("/tmp/pt_worker_ping", "w") as f: f.write(str(time.time()))
