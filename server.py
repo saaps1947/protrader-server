@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-17-v2"
+SERVER_BUILD = "2026-11-17-v3"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ingest", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -6771,10 +6771,33 @@ def _wd_check():
             problems.append("No market data saved in the last 15 minutes")
     return st, problems
 
+def _wd_claim(key):
+    """Nov 17: on Render the background loop runs in gunicorn's parent process while worker
+    pings and /status run in the request process — two copies of _WD. An atomic file in the
+    shared /tmp makes each alert key sendable ONCE per day across both processes."""
+    path = f"/tmp/pt_wd_{ist_today()}_{key}"
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY); os.write(fd, str(os.getpid()).encode()); os.close(fd)
+        return True
+    except FileExistsError:
+        return False
+    except Exception:
+        return True    # /tmp unusable: fall back to per-process memory below
+
+def _wd_key(p):
+    return ("zerodha" if "Zerodha" in p else "worker" if "worker" in p else "data" if "market data" in p
+            else "device" if "phone" in p else "other")
+
+def _wd_release(key):
+    _WD["alerts_sent"].pop(f"{ist_today()}|{key}", None)
+    try: os.remove(f"/tmp/pt_wd_{ist_today()}_{key}")
+    except Exception: pass
+
 def _wd_alert(key, title, body):
     day = ist_today(); k = f"{day}|{key}"
     if _WD["alerts_sent"].get(k): return
     _WD["alerts_sent"][k] = time.time()
+    if not _wd_claim(key): return
     print(f"[Watchdog] ALERT {key}: {body}")
     send_push_to_all(title, body, "/", f"protrader-watchdog-{key}")
 
@@ -6794,13 +6817,12 @@ def _wd_cycle(source="loop"):
         cur = set(problems); prev = _WD["prev_problems"]
         if st["market_hours"]:
             for p in cur - prev:
-                key = ("zerodha" if "Zerodha" in p else "worker" if "worker" in p else "data" if "market data" in p
-                       else "device" if "phone" in p else "other")
-                _wd_alert(key, "⚠️ PRO Trader needs attention", p)
-            for p in prev - cur:
-                print(f"[Watchdog] resolved: {p}")
+                _wd_alert(_wd_key(p), "⚠️ PRO Trader needs attention", p)
+        for p in prev - cur:
+            print(f"[Watchdog] resolved: {p}")
+            _wd_release(_wd_key(p))      # so a NEW occurrence later the same day alerts again
         _WD["prev_problems"] = cur
-        if wk and 565 <= mins < 600 and not _WD["alerts_sent"].get(f"{ist_today()}|morning"):
+        if wk and 565 <= mins < 600 and not _WD["alerts_sent"].get(f"{ist_today()}|morning") and _wd_claim("morning"):
             _WD["alerts_sent"][f"{ist_today()}|morning"] = time.time()
             print(f"[Watchdog] 09:25 status ({source}): {'; '.join(problems) or 'all OK'}")
             if problems:
@@ -6810,7 +6832,7 @@ def _wd_cycle(source="loop"):
                                  f"Zerodha ✓ · scanner seen {st.get('worker_last_seen_min')} min ago · "
                                  f"{st.get('snapshots_last15m')} data rows in last 15 min. If today is a market holiday, ignore.",
                                  "/", "protrader-status")
-        if wk and 940 <= mins < 990 and not _WD["alerts_sent"].get(f"{ist_today()}|eod"):
+        if wk and 940 <= mins < 990 and not _WD["alerts_sent"].get(f"{ist_today()}|eod") and _wd_claim("eod"):
             _WD["alerts_sent"][f"{ist_today()}|eod"] = time.time()
             print(f"[Watchdog] day summary sent ({source})")
             send_push_to_all("📊 PRO Trader — today",
@@ -6852,7 +6874,8 @@ def system_status(_nocache=None):
     return jsonify({"ok": True, "checked_sec_ago": round(time.time() - _WD["checked_at"]),
                     "problems": _WD["problems"], "state": _WD["state"],
                     "watchdog": {"cycles": _WD.get("cycles"), "last_cycle_sec_ago": round(time.time() - _WD["cycle_at"]) if _WD.get("cycle_at") else None,
-                                 "last_error": _WD.get("cycle_error"), "loop_alive": _watchdog_thread.is_alive()}})
+                                 "last_error": _WD.get("cycle_error"), "loop_alive": _watchdog_thread.is_alive(), "pid": os.getpid(),
+                                 "note": "loop_alive=false is normal if gunicorn runs the background loop in its parent process; cycles still run from worker pings"}})
 
 _watchdog_thread = threading.Thread(target=_bg_watchdog, daemon=True)
 _watchdog_thread.start()
