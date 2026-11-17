@@ -40,10 +40,10 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-17-v4"
+SERVER_BUILD = "2026-11-17-v5"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
-_LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ingest", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
+_LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
              "Duplicate", "Auth failed", "token expired", "[StockOI] Cycle", "[ExtOI] Cycle")
 _HEALTH = {"market_build_sec": None, "market_built_at": None, "signals_in": 0}
 def print(*args, **kwargs):
@@ -580,9 +580,23 @@ def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: 
             except Exception: continue
         if not best_exp:
             return {"ok": False, "error": f"no valid expiry found for {sym}"}
+        strike_req = strike
         tradingsymbol = idx[best_exp].get((opt_type, int(strike)))
         if not tradingsymbol:
+            # Nov 17 (live): the app guesses a stock's strike gap from its price (e.g. 50 for
+            # ₹1000-10000), but many stocks list strikes 10/20 apart, so HCLTECH 1350 PE, TECHM 1750 PE
+            # etc. didn't exist and the signal got no premium. Use the nearest strike that really
+            # trades (within 3%) — premium-only; order placement still requires an exact strike.
+            cands = [k for (t, k) in idx[best_exp] if t == opt_type]
+            if cands:
+                near = min(cands, key=lambda k: abs(k - strike))
+                if abs(near - strike) <= max(0.03 * strike, 1):
+                    strike = near
+                    tradingsymbol = idx[best_exp][(opt_type, near)]
+        if not tradingsymbol:
             return {"ok": False, "error": f"no contract found for {sym} {strike} {opt_type} exp:{best_exp}"}
+        if strike != strike_req:
+            print(f"[Premium] via nearest strike: {sym} {strike_req}{opt_type} not listed — using nearest real strike {strike}")
 
         kite_sym = f"{exchange_prefix}:{tradingsymbol}"
         qdata = fetch_kite_quotes(key, token, [kite_sym])
@@ -598,6 +612,7 @@ def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: 
         return {
             "ok": True, "premium": premium, "tradingsymbol": tradingsymbol,
             "expiry": best_exp, "strike": strike, "opt_type": opt_type,
+            "strike_requested": strike_req,
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -6696,7 +6711,7 @@ def worker_ping():
     try: info = request.get_json(force=True, silent=True) or {}
     except Exception: info = {}
     _WORKER_PING["at"] = time.time(); _WORKER_PING["info"] = {k: info.get(k) for k in ("signals", "serverOk", "ver", "session_min", "open_trades", "last_fetch_error", "restarts",
-                                                                                       "open_requests", "max_open_requests", "oldest_open", "slow_requests")}
+                                                                                       "open_requests", "max_open_requests", "oldest_open", "slow_requests", "worker_build")}
     if _wd_overdue(): threading.Thread(target=_wd_cycle, args=("worker ping",), daemon=True).start()
     try:
         with open("/tmp/pt_worker_ping", "w") as f: f.write(str(time.time()))
