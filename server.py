@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-17-v6"
+SERVER_BUILD = "2026-11-17-v7"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -370,6 +370,7 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
     _PUSH_STATS["sent_today"] = (_PUSH_STATS["sent_today"] if _PUSH_STATS["day"] == ist_today() else 0) + sent
     _PUSH_STATS["day"] = ist_today()
     if sent: _PUSH_STATS["last_ok"] = f"{ist_str()} {title[:60]}"
+    if sent and not failed: _PUSH_STATS["last_error"] = None   # audit: an old problem no longer shows after delivery works
     _shared_append("push", f"{sent}|{failed}|{ist_str()} {title[:60]}")
 
     if dedup_key and sent > 0:
@@ -705,6 +706,14 @@ def strike_steps():
         steps = _compute_strike_steps(csv)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:120]})
+    try:   # MCX option gaps too (GOLD lists 500 apart, the app assumed 100)
+        mcsv = fetch_kite_instruments_mcx(key, token)
+        if mcsv:
+            m = _compute_strike_steps(mcsv)
+            for _s, _i in INSTRUMENTS.items():
+                if _i.get("mcx") and m.get(_s): steps[_s] = m[_s]
+    except Exception as e:
+        print(f"[StrikeSteps] MCX gaps unavailable: {e}")
     if steps:
         _STRIKE_STEPS.update(day=ist_today(), steps=steps)
     return jsonify({"ok": bool(steps), "steps": steps})
@@ -1941,6 +1950,47 @@ def fetch_kite_quotes(key, token, kite_syms):
         print(f"[Kite] Quote error: {e}")
     return {}
 
+# Nov 17 (audit): MCX technicals come from US futures on Yahoo (USD). Only a few fields were
+# converted, with the bare exchange rate — opening-range / order-block / candle levels stayed in
+# USD (GOLD ORB "₹4,214" vs a ₹1,35,000 price) and SMA/PDH/PDL ran 6-10% low for GOLD/SILVER
+# (import duty + local premium). Now EVERYTHING from Yahoo for an MCX symbol is rescaled by the
+# live ratio MCX-price / US-price, so every level is in the same rupees the app trades.
+_MCX_BY_TICKER = {}
+def _mcx_remember_inr(sym, px):
+    CACHE.set(f"mcx_inr_px_{sym}", px)
+    try:
+        with open(f"/tmp/pt_mcx_inr_{sym}", "w") as f: f.write(str(px))
+    except Exception: pass
+def _mcx_inr_px(sym):
+    v = CACHE.get_val(f"mcx_inr_px_{sym}")
+    if v: return v
+    try:
+        with open(f"/tmp/pt_mcx_inr_{sym}") as f:
+            if time.time() - os.path.getmtime(f.name) < 6 * 3600: return float(f.read().strip())
+    except Exception: pass
+    return None
+def _mcx_fx_factor(sym):
+    u = get_usdinr()
+    return {"CRUDEOIL": u, "NATURALGAS": u, "GOLD": u * 10 / 31.1035, "SILVER": u * 1000 / 31.1035}.get(sym, 1.0)
+def _mcx_scale_yahoo(ticker, out):
+    if not _MCX_BY_TICKER:
+        for _s, _i in INSTRUMENTS.items():
+            if _i.get("mcx") and _i.get("yahoo"): _MCX_BY_TICKER[_i["yahoo"]] = _s
+    sym = _MCX_BY_TICKER.get(ticker)
+    if not sym or not out or not out.get("px"): return out
+    inr = _mcx_inr_px(sym); ratio = None
+    if inr:
+        ratio = inr / out["px"]
+        fx = _mcx_fx_factor(sym)
+        if not (0.7 * fx <= ratio <= 1.4 * fx): ratio = None    # stale/odd price → don't trust it
+    if not ratio: ratio = _mcx_fx_factor(sym)
+    for k in ("px", "chg", "high", "low", "open", "prev_close", "sma20", "sma50", "sma200", "prev_day_high", "prev_day_low"):
+        if out.get(k): out[k] = round(out[k] * ratio, 2)
+    out["candles"] = [dict(c, o=round(c["o"] * ratio, 2), h=round(c["h"] * ratio, 2), l=round(c["l"] * ratio, 2),
+                           c=round(c["c"] * ratio, 2)) for c in (out.get("candles") or [])]
+    out["_inr_scaled"] = round(ratio, 4)
+    return out
+
 def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
     """Fetch OHLCV candles from Yahoo Finance. Returns parsed dict or None."""
     try:
@@ -2088,7 +2138,7 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
         except Exception:
             pass
 
-        return {
+        _out = {
             "px":px, "chg":round(px-pc,2),
             "pct":round((px-pc)/pc*100,2) if pc else 0,
             "high":meta.get("regularMarketDayHigh",0),
@@ -2110,6 +2160,7 @@ def fetch_yahoo_candles(ticker, interval="5m", rng="2d"):
             "volume": cur_vol, "avg_volume": avg_vol, "vol_ratio": vol_ratio,
             "candles": candles[-78:],  # ~6.5 hrs of 5min candles
         }
+        return _mcx_scale_yahoo(ticker, _out)
     except Exception as e:
         return None
 
@@ -3112,7 +3163,7 @@ def get_technicals(sym):
         # CRUDEOIL MCX lot = 100 barrels, price per barrel in INR
         # GOLD MCX = per 10g in INR; GC=F is per troy oz (31.1g) in USD
         mcx_scale = 1.0
-        if inst.get("mcx"):
+        if inst.get("mcx") and not d.get("_inr_scaled"):
             usdinr = get_usdinr()
             if sym == "CRUDEOIL":
                 mcx_scale = usdinr          # $/barrel → ₹/barrel
@@ -3307,6 +3358,7 @@ def get_all_prices(key, token):
                         pc  = v.get("ohlc", {}).get("close", px)
                         chg = round(px - pc, 2)
                         pct = round((px - pc) / pc * 100, 2) if pc else 0
+                        if px: _mcx_remember_inr(sym, px)
                         result[sym] = {
                             "px": px, "chg": chg, "pct": pct,
                             "h": v.get("ohlc", {}).get("high", px),
@@ -3547,6 +3599,16 @@ def get_oi(sym, key, token, spot=0):
 
         lines = csv.strip().split("\n")
         step  = INSTRUMENTS.get(sym,{}).get("step",50)
+        # Nov 17 (audit): several hard-coded stock gaps are wrong (HCLTECH 50 vs real 20, APOLLOHOSP 50
+        # vs 100…), so the "ATM ±10 strikes" window wasn't 21 real strikes. Use the exchange's own gap.
+        if sym not in OI_INDICES and not INSTRUMENTS.get(sym, {}).get("mcx"):
+            try:
+                if _STRIKE_STEPS["day"] != ist_today() or not _STRIKE_STEPS["steps"]:
+                    _ss = _compute_strike_steps(csv)
+                    if _ss: _STRIKE_STEPS.update(day=ist_today(), steps=_ss)
+                step = _STRIKE_STEPS["steps"].get(sym) or step
+            except Exception as _e:
+                print(f"[OI] {sym}: real strike gap unavailable ({_e}) — using configured {step}")
         atm   = int(round(spot/step)*step)
         # NO strike range filter — fetch ALL active strikes for this expiry.
         # ATM ±30 still only captures ~52% of full-chain OI (far OTM calls at
@@ -6489,6 +6551,10 @@ def kite_token():
         if d.get("status")=="success" and d.get("data",{}).get("access_token"):
             tok = d["data"]["access_token"]
             print(f"[Kite] Token generated for {d['data'].get('user_name','')}")
+            # Nov 17 (audit): save the new login for the background scanner right away — it used to wait
+            # for the phone's next data request to carry the token over.
+            try: _persist_kite_creds(api_key, tok)
+            except Exception as _e: print(f"[KiteCreds] could not save new login: {_e}")
             return jsonify({
                 "ok":True,
                 "access_token": tok,
@@ -6824,7 +6890,11 @@ def _wd_check():
     kite_today = False; saved = None
     if SB:
         try:
-            kv = (SB.table("server_kv").select("updated_at").eq("key", "kite_token").execute()).data or []
+            kv = (SB.table("server_kv").select("updated_at,value").eq("key", "kite_token").execute()).data or []
+            if kv and kv[0].get("value"):
+                _seen = _WD.setdefault("tok_seen", {})
+                if kv[0]["value"] not in _seen: _seen.clear(); _seen[kv[0]["value"]] = time.time()
+                st["_login_age_min"] = round((time.time() - _seen[kv[0]["value"]]) / 60, 1)
             if kv and kv[0].get("updated_at"):
                 t = datetime.fromisoformat(kv[0]["updated_at"].replace("Z", "+00:00")).astimezone(IST)
                 saved = t.strftime("%d %b %H:%M"); kite_today = t.date() == now.date() and t.hour * 60 + t.minute >= 6 * 60
@@ -6861,7 +6931,8 @@ def _wd_check():
             problems.append("Zerodha is not logged in today — open PRO Trader and log in; nothing can be scanned until then")
         if age is None or age > 12 * 60:
             problems.append("Background scanner (worker) is not running" + (f" — last seen {round(age/60)} min ago" if age else " — never seen since the server started"))
-        if kite_today and mins >= 575 and st.get("snapshots_last15m") == 0:
+        # Nov 17 (audit): not in the first 15 min after a (late) login or a server restart — no data can exist yet
+        if kite_today and mins >= 575 and st.get("_login_age_min", 99) >= 15 and st.get("snapshots_last15m") == 0:
             problems.append("No market data saved in the last 15 minutes")
     return st, problems
 
