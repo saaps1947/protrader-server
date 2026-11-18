@@ -5066,7 +5066,7 @@ def _kite_hist_raw(instr_token, interval, d_from, d_to, key, token):
         return (r.json().get("data") or {}).get("candles") or []
     raise RuntimeError("rate-limited 3 times")
 
-def _export_index_history(years, syms=None):
+def _export_index_history(years, syms=None, interval="5minute"):
     import gzip
     try:
         _EXP3.update(rows=0)
@@ -5075,8 +5075,9 @@ def _export_index_history(years, syms=None):
             _EXP3.update(status="error", error="no Zerodha login on the server — log in from the app first"); return
         end = datetime.now(IST).date(); start = end - timedelta(days=int(365.25 * years))
         syms = syms or _EXP3_SYMS
-        tag = "" if syms == _EXP3_SYMS else "_" + "_".join(s_.lower() for s_ in syms)
-        path = f"/tmp/protrader_index_{years}y{tag}.csv.gz"; n = 0
+        tag = "" if syms == _EXP3_SYMS else ("_stocks" if len(syms) > 8 else "_" + "_".join(s_.lower().replace("&", "") for s_ in syms))
+        ivl = "5m" if interval == "5minute" else "15m"
+        path = f"/tmp/protrader_index_{years}y{tag}{'' if ivl == '5m' else '_15m'}.csv.gz"; n = 0
         with gzip.open(path, "wt") as f:
             f.write("sym,interval,ts_ist,open,high,low,close,volume\n")
             for sym in syms:
@@ -5087,9 +5088,9 @@ def _export_index_history(years, syms=None):
                 c0 = start
                 while c0 <= end:
                     c1 = min(c0 + timedelta(days=94), end)
-                    _EXP3["progress"] = f"{sym} 5m {c0}..{c1}"
+                    _EXP3["progress"] = f"{sym} {ivl} {c0}..{c1} ({syms.index(sym) + 1}/{len(syms)})"
                     try:
-                        bars = _kite_hist_raw(tok, "5minute", c0, c1, key, token)
+                        bars = _kite_hist_raw(tok, interval, c0, c1, key, token)
                     except Exception as e:
                         _EXP3["log"].append(f"{sym} 5m {c0}..{c1}: {e}"); bars = []
                     chunks += 1
@@ -5097,7 +5098,7 @@ def _export_index_history(years, syms=None):
                     for b in bars:
                         ts = str(b[0])[:16].replace("T", " ")
                         if first is None: first = ts
-                        f.write(f"{sym},5m,{ts},{b[1]},{b[2]},{b[3]},{b[4]},{b[5] if len(b) > 5 else 0}\n"); n += 1
+                        f.write(f"{sym},{ivl},{ts},{b[1]},{b[2]},{b[3]},{b[4]},{b[5] if len(b) > 5 else 0}\n"); n += 1
                     c0 = c1 + timedelta(days=1)
                     time.sleep(0.4)                      # stay under 3 requests/second
                 try:
@@ -5309,9 +5310,16 @@ def export_index_history(_nocache=None):
     from flask import send_file
     years = max(1, min(5, int(request.args.get("years", "3") or 3)))
     want = [x.strip().upper() for x in (request.args.get("syms") or "").split(",") if x.strip()]
-    want = [x for x in want if x in _EXP3_SYMS or x in _EXP3_EXTRA_TOKENS] or None
-    if want and _EXP3.get("syms") != want:      # a different symbol set than the file on disk -> new job
-        _EXP3.update(status="idle", file=None)
+    # Nov 18: stocks too ("syms=STOCKS" = every F&O stock the app scans) for the stock backtest
+    if "STOCKS" in want:
+        want = [x for x in want if x != "STOCKS"] + [k for k, v in INSTRUMENTS.items()
+                                                     if not v.get("mcx") and k not in _EXP3_SYMS]
+    want = [x for x in want if x in _EXP3_SYMS or x in _EXP3_EXTRA_TOKENS
+            or (x in INSTRUMENTS and not INSTRUMENTS[x].get("mcx"))] or None
+    interval = request.args.get("interval", "5minute")
+    if interval not in ("5minute", "15minute"): interval = "5minute"
+    if (want and _EXP3.get("syms") != want) or _EXP3.get("interval", "5minute") != interval:
+        _EXP3.update(status="idle", file=None)      # a different request than the file on disk -> new job
     if _EXP3["status"] == "done" and _EXP3.get("file") and os.path.exists(_EXP3["file"]) and request.args.get("refresh") != "1":
         return send_file(_EXP3["file"], as_attachment=True, download_name=os.path.basename(_EXP3["file"]),
                          mimetype="application/gzip")
@@ -5321,8 +5329,8 @@ def export_index_history(_nocache=None):
     if _EXP3["status"] == "error" and request.args.get("refresh") != "1":
         msg = _EXP3["error"]; _EXP3["status"] = "idle"
         return jsonify({"ok": False, "status": "error", "error": msg, "note": "open the link again to retry"})
-    _EXP3.update(status="running", started=time.time(), progress="starting", error=None, log=[], syms=want)
-    threading.Thread(target=_export_index_history, args=(years, want), daemon=True).start()
+    _EXP3.update(status="running", started=time.time(), progress="starting", error=None, log=[], syms=want, interval=interval)
+    threading.Thread(target=_export_index_history, args=(years, want, interval), daemon=True).start()
     return jsonify({"ok": True, "status": "started", "note": "about 1-2 minutes; open this link again to download"})
 
 @app.route("/export/candles")
