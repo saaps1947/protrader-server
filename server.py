@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-17-v7"
+SERVER_BUILD = "2026-11-19-v1"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -681,14 +681,32 @@ def _compute_strike_steps(csv):
         try: k = float(c[6])
         except Exception: continue
         by.setdefault(c[3].strip('"'), {}).setdefault(c[5], set()).add(k)
+    # Nov 19 (live): INFY came out as a 2-rupee gap ("1078 PE"), most likely from a few odd,
+    # corporate-action-adjusted strikes in the list. Now: the LARGEST standard gap that at least
+    # 70 % of the strikes near the middle of the chain are multiples of.
+    CAND = (0.5, 1, 2, 2.5, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000)
+    def gap_of(ks):
+        ks = sorted(ks)
+        if len(ks) < 4: return None
+        med = ks[len(ks) // 2]
+        near = [k for k in ks if abs(k - med) <= 0.15 * med] or ks
+        best = None
+        for cnd in CAND:
+            if sum(1 for k in near if abs(k / cnd - round(k / cnd)) < 1e-6) >= 0.7 * len(near): best = cnd
+        return best
     out = {}
     for name, exps in by.items():
-        ks = sorted(exps[min(exps)])
-        if len(ks) < 4: continue
-        diffs = Counter(round(b - a, 2) for a, b in zip(ks, ks[1:]) if b > a)
-        top = max(diffs.values())
-        step = min(d for d, n in diffs.items() if n == top)
-        out[name] = int(step) if float(step).is_integer() else step
+        # vote across expiries: later expiries are listed after any corporate action, so they are clean
+        votes = [g for e in sorted(exps) for g in [gap_of(exps[e])] if g]
+        if votes:
+            cnt = Counter(votes); top = max(cnt.values())
+            best = [g for g in reversed(votes) if cnt[g] == top][0]
+        else:
+            ks = sorted(exps[min(exps)])
+            if len(ks) < 4: continue
+            diffs = Counter(round(b - a, 2) for a, b in zip(ks, ks[1:]) if b > a)
+            top = max(diffs.values()); best = min(d for d, n in diffs.items() if n == top)
+        out[name] = int(best) if float(best).is_integer() else best
     return out
 
 @app.route("/strike_steps")
