@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-19-v3"
+SERVER_BUILD = "2026-11-19-v4"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -886,14 +886,19 @@ def upsert_journal_entry(entry: dict):
             # OPEN in Supabase from weeks ago (nothing ever closed trades at
             # end of day) blocked every NEW journal row for that symbol+bias
             # forever. Only today's session can hold a live intraday position.
+            # Nov 19: trades are now held overnight (until stop/target/expiry), so a live row from an
+            # earlier day still counts — bounded to 35 days so a truly stuck row can't block forever.
+            # Paper trades (source "paper") never block real ones and vice versa.
             existing = (SB.table("journal")
-                        .select("id,status")
+                        .select("id,status,source")
                         .eq("sym", entry.get("sym"))
                         .eq("bias", entry.get("bias"))
                         .in_("status", ["OPEN", "T1_HIT"])
-                        .gte("created_at", _ist_session_start_iso())
+                        .gte("created_at", (datetime.now(timezone.utc) - timedelta(days=35)).isoformat())
                         .execute())
-            dupes = [r for r in (existing.data or []) if r.get("id") != entry.get("id")]
+            _paper = entry.get("source") == "paper"
+            dupes = [r for r in (existing.data or []) if r.get("id") != entry.get("id")
+                     and (r.get("source") == "paper") == _paper]
             if dupes:
                 print(f"[Supabase] Duplicate journal entry blocked: {entry.get('sym')} "
                       f"{entry.get('bias')} already open as {dupes[0]['id']} "
@@ -1244,8 +1249,9 @@ def _risk_state(exclude_id=None, exclude_fresh=None):
     if not SB:
         st["ok"] = False; return st
     try:
-        rows = (SB.table("journal").select("id,sym,bias,status,outcome,pnl,exit_time,updated_at,created_at")
+        rows = (SB.table("journal").select("id,sym,bias,status,outcome,pnl,exit_time,updated_at,created_at,source")
                 .gte("created_at", _ist_session_start_iso()).execute()).data or []
+        rows = [r for r in rows if r.get("source") != "paper"]     # Nov 19: paper trades never count toward daily limits
     except Exception as e:
         print(f"[RiskGate] journal read failed — gate open: {e}")
         st["ok"] = False; return st
