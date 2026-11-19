@@ -31,7 +31,7 @@ sys.stdout.reconfigure(line_buffering=True)
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests, time, threading, re, os, hmac, json
+import requests, time, threading, re, os, hmac, json, math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from pywebpush import webpush, WebPushException
@@ -40,7 +40,7 @@ import builtins as _builtins, collections as _collections
 # /health support (Oct 23): keep the last few hundred IMPORTANT log lines in
 # memory so /health can show them without anyone digging through Render logs.
 # Only lines with these markers are kept; no tokens are ever printed by them.
-SERVER_BUILD = "2026-11-19-v1"
+SERVER_BUILD = "2026-11-19-v3"
 _SERVER_STARTED = time.time()
 _LOG_RING = _collections.deque(maxlen=300)
 _LOG_KEYS = ("[Push]", "[Watchdog]", "[Premium-SLOW]", "[Premium] via ", "MARKET-SLOW", "Errno", "failed", "\u274c", "429", "[KiteCreds]",
@@ -263,13 +263,23 @@ def _push_stats():
     rows = _shared_tail("push", 5000)
     mine = {k: _PUSH_STATS.get(k) for k in ("sent_today", "last_ok", "last_error")}
     if _PUSH_STATS.get("day") != ist_today(): mine["sent_today"] = 0
-    if not rows: return mine
+    db = None
+    if SB:
+        try:
+            r = (SB.table("server_kv").select("value").eq("key", f"push_count_{ist_today()}").execute()).data or []
+            if r: db = json.loads(r[0]["value"])
+        except Exception: db = None
+    if not rows:
+        if db: return {"sent_today": max(mine["sent_today"] or 0, int(db.get("n", 0))), "last_ok": db.get("last_ok") or mine["last_ok"], "last_error": mine["last_error"]}
+        return mine
     sent_total, last_ok = 0, None
     for r in rows:
         try:
             a, b, rest = r.split("|", 2); sent_total += int(a)
             if int(a) > 0: last_ok = rest
         except Exception: continue
+    if db and int(db.get("n", 0)) > sent_total:
+        return {"sent_today": int(db.get("n", 0)), "last_ok": db.get("last_ok") or last_ok or mine["last_ok"], "last_error": mine["last_error"]}
     return {"sent_today": sent_total, "last_ok": last_ok or mine["last_ok"], "last_error": mine["last_error"]}
 def ist_today(): return datetime.now(IST).strftime("%Y-%m-%d")
 
@@ -372,6 +382,17 @@ def send_push_to_all(title: str, body: str, url: str = "/", tag: str = "protrade
     if sent: _PUSH_STATS["last_ok"] = f"{ist_str()} {title[:60]}"
     if sent and not failed: _PUSH_STATS["last_error"] = None   # audit: an old problem no longer shows after delivery works
     _shared_append("push", f"{sent}|{failed}|{ist_str()} {title[:60]}")
+    # Nov 19: /tmp is wiped by every deploy, so "notifications sent today" read 0 after an upload.
+    # Keep a per-day count + last delivery in Supabase too (one small write per notification).
+    if sent and SB:
+        try:
+            k = f"push_count_{ist_today()}"
+            r = (SB.table("server_kv").select("value").eq("key", k).execute()).data or []
+            prev = int(json.loads(r[0]["value"]).get("n", 0)) if r else 0
+            SB.table("server_kv").upsert({"key": k, "value": json.dumps({"n": prev + sent, "last_ok": f"{ist_str()} {title[:60]}"}),
+                                          "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
+        except Exception as _e:
+            print(f"[Push] could not save today's count: {_e}")
 
     if dedup_key and sent > 0:
         # FIX: same persistence fix as the check above — this must write to
@@ -563,7 +584,7 @@ def _option_index(csv, sym):
     _OPT_INDEX[k] = out
     return out
 
-def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: str):
+def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: str, want_exp: str = None):
     """
     Fetches the REAL, live premium for a specific option contract — the
     fix for the bug found in a real signal-report analysis: entry_px/
@@ -615,6 +636,12 @@ def get_option_premium(sym: str, strike: float, opt_type: str, key: str, token: 
             except Exception: continue
         if not best_exp:
             return {"ok": False, "error": f"no valid expiry found for {sym}"}
+        # Nov 19: trades now stay open overnight, so an open trade must keep pricing ITS OWN
+        # contract — after expiry rolls, "nearest expiry" would silently be a different option.
+        if want_exp:
+            if want_exp not in idx:
+                return {"ok": False, "error": f"expiry {want_exp} no longer listed for {sym} (expired)", "expired": True}
+            best_exp = want_exp
         strike_req = strike
         tradingsymbol = idx[best_exp].get((opt_type, int(strike)))
         if not tradingsymbol:
@@ -764,7 +791,9 @@ def option_premium():
     # evidence this session). TTL kept short (15s) — unlike OI, option
     # premiums move fast enough that a longer cache risks a genuinely
     # stale price influencing a real trading decision.
-    cache_key = f"premium_{sym}_{int(strike)}_{opt_type}"
+    want_exp = (request.args.get("expiry") or "").strip()[:10] or None
+    if want_exp and not re.match(r"^\d{4}-\d{2}-\d{2}$", want_exp): want_exp = None
+    cache_key = f"premium_{sym}_{int(strike)}_{opt_type}" + (f"_{want_exp}" if want_exp else "")
     PREMIUM_TTL = 15
     cached = CACHE.get_val(cache_key)
     age = CACHE.age(cache_key)
@@ -784,7 +813,7 @@ def option_premium():
         pass
 
     _t0 = time.time()
-    result = get_option_premium(sym, strike, opt_type, key, token)
+    result = get_option_premium(sym, strike, opt_type, key, token, want_exp)
     _dt = time.time() - _t0
     if _dt > 5:
         print(f"[Premium-SLOW] {sym} {int(strike)}{opt_type} took {_dt:.1f}s — {'ok' if result.get('ok') else result.get('error')}")
@@ -933,7 +962,7 @@ def upsert_journal_entry(entry: dict):
                     outcome = entry.get("outcome", "")
                     pnl = entry.get("pnl")
                     icon = {"SL_HIT": "🔴", "T1_HIT": "✅", "T2_HIT": "🏆", "TIME_EXIT": "⏰"}.get(new_status, "")
-                    label = {"SL_HIT": "SL Hit", "T1_HIT": "T1 Hit", "T2_HIT": "T2 Hit", "TIME_EXIT": "EOD Exit"}.get(new_status, new_status)
+                    label = {"SL_HIT": "SL Hit", "T1_HIT": "T1 Hit", "T2_HIT": "T2 Hit", "TIME_EXIT": "Expiry/Time Exit"}.get(new_status, new_status)
                     pnl_str = f" | P&L: ₹{pnl}" if pnl is not None else ""
                     title = f"{icon} {label} — {sym}"
                     body = f"{entry.get('trade','')}{pnl_str}" if outcome != "BREAKEVEN" else f"{entry.get('trade','')} | Breakeven stop{pnl_str}"
@@ -1499,9 +1528,19 @@ def journal_list():
         days = 30
     try:
         since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        r = (SB.table("journal").select("*").gte("created_at", since)
-             .order("created_at", desc=True).limit(1000).execute())
-        return jsonify({"ok": True, "rows": r.data or []})
+        # Nov 19: Supabase returns at most 1,000 rows per request — page through (up to 5,000),
+        # and always include trades still OPEN / T1_HIT however old (trades now stay open overnight).
+        rows, seen = [], set()
+        for off in range(0, 5000, 1000):
+            part = (SB.table("journal").select("*").gte("created_at", since)
+                    .order("created_at", desc=True).range(off, off + 999).execute()).data or []
+            for x in part:
+                if x.get("id") not in seen: seen.add(x.get("id")); rows.append(x)
+            if len(part) < 1000: break
+        live = (SB.table("journal").select("*").in_("status", ["OPEN", "T1_HIT"])
+                .order("created_at", desc=True).limit(500).execute()).data or []
+        rows += [x for x in live if x.get("id") not in seen]
+        return jsonify({"ok": True, "rows": rows})
     except Exception as e:
         print(f"[Journal] read-back failed: {e}")
         return jsonify({"ok": False, "error": str(e), "rows": []}), 500
@@ -6048,6 +6087,94 @@ def _poll_fill_price(order_id, hdrs, tries=6, delay=0.7):
     return None
 
 
+# ── ORDER HELPERS (Nov 19) ────────────────────────────────────────────────────
+# Zerodha rules (kite.trade/docs/kite/orders): market orders are disabled for STOCK options and
+# SL-M is blocked for INDEX options. So every option order here is a LIMIT at a price that
+# crosses the spread ("marketable limit"), and stops are stop-LIMIT orders. NRML positions are
+# held overnight, and a DAY stop would expire at 15:30 — their stop is a GTT instead (stays
+# until triggered or deleted).
+def _tick_up(x):   return round(math.ceil(round(x / 0.05, 6)) * 0.05, 2)
+def _tick_down(x): return max(0.05, round(math.floor(round(x / 0.05, 6)) * 0.05, 2))
+
+def _quote_one(exchange, tradingsymbol, hdrs):
+    try:
+        r = KITE_SESSION.get("https://api.kite.trade/quote", params={"i": f"{exchange}:{tradingsymbol}"}, headers=hdrs, timeout=10)
+        return ((r.json().get("data") or {}).get(f"{exchange}:{tradingsymbol}") or {}) if r.status_code == 200 else {}
+    except Exception:
+        return {}
+
+def _marketable_limit(exchange, tradingsymbol, side, hdrs):
+    """price that should fill now: BUY a little above the best offer, SELL a little below the best bid."""
+    q = _quote_one(exchange, tradingsymbol, hdrs); ltp = float(q.get("last_price") or 0)
+    dp = q.get("depth") or {}
+    if side == "BUY":
+        ask = float(((dp.get("sell") or [{}])[0] or {}).get("price") or 0) or ltp
+        return (_tick_up(min(max(ask, ltp) * 1.01, ltp * 1.05 if ltp else ask * 1.01)) if ask else 0.0), ltp
+    bid = float(((dp.get("buy") or [{}])[0] or {}).get("price") or 0) or ltp
+    return (_tick_down(max(min(bid, ltp) * 0.99, ltp * 0.95 if ltp else bid * 0.99)) if bid else 0.0), ltp
+
+def _order_state(order_id, hdrs):
+    try:
+        r = KITE_SESSION.get(f"https://api.kite.trade/orders/{order_id}", headers=hdrs, timeout=10)
+        legs = (r.json().get("data") or []) if r.status_code == 200 else []
+        if legs:
+            x = legs[-1]
+            return (x.get("status") or "").upper(), float(x.get("average_price") or 0), int(x.get("filled_quantity") or 0)
+    except Exception:
+        pass
+    return "", 0.0, 0
+
+def _wait_fill(order_id, hdrs, qty, secs=10):
+    """wait for a limit order to fill; cancel what's left after `secs`. -> (avg_price, filled_qty)"""
+    t_end = time.time() + secs; st, avg, fq = "", 0.0, 0
+    while time.time() < t_end:
+        st, avg, fq = _order_state(order_id, hdrs)
+        if st == "COMPLETE" and avg > 0: return avg, (fq or qty)
+        if st in ("REJECTED", "CANCELLED"): return (avg if fq else 0.0), fq
+        time.sleep(0.7)
+    try: KITE_SESSION.delete(f"https://api.kite.trade/orders/regular/{order_id}", headers=hdrs, timeout=10)
+    except Exception: pass
+    time.sleep(0.7)
+    st, avg, fq = _order_state(order_id, hdrs)
+    return (avg if fq else 0.0), fq
+
+def _place_stop(exchange, tradingsymbol, qty, product, trigger, ltp, hdrs):
+    """stop-limit SELL at `trigger` (limit 5 % below). NRML → GTT, otherwise a DAY SL order.
+    -> dict(placed, order_id, kind, reason)"""
+    limit = _tick_down(trigger * 0.95)
+    try:
+        if product == "NRML":
+            body = {"type": "single",
+                    "condition": json.dumps({"exchange": exchange, "tradingsymbol": tradingsymbol,
+                                             "trigger_values": [trigger], "last_price": ltp}),
+                    "orders": json.dumps([{"exchange": exchange, "tradingsymbol": tradingsymbol, "transaction_type": "SELL",
+                                           "quantity": qty, "order_type": "LIMIT", "product": "NRML", "price": limit}])}
+            r = KITE_SESSION.post("https://api.kite.trade/gtt/triggers", data=body, headers=hdrs, timeout=15)
+            d = r.json()
+            if r.status_code == 200 and d.get("status") == "success":
+                return {"placed": True, "order_id": f"gtt:{(d.get('data') or {}).get('trigger_id', '')}", "kind": "GTT", "reason": ""}
+            return {"placed": False, "order_id": "", "kind": "GTT", "reason": d.get("message", "GTT rejected")}
+        body = {"tradingsymbol": tradingsymbol, "exchange": exchange, "transaction_type": "SELL", "order_type": "SL",
+                "quantity": qty, "product": product, "validity": "DAY", "trigger_price": trigger, "price": limit}
+        r = KITE_SESSION.post("https://api.kite.trade/orders/regular", data=body, headers=hdrs, timeout=15)
+        d = r.json()
+        if r.status_code == 200 and d.get("status") == "success":
+            return {"placed": True, "order_id": (d.get("data") or {}).get("order_id", ""), "kind": "SL", "reason": ""}
+        return {"placed": False, "order_id": "", "kind": "SL", "reason": d.get("message", "SL order rejected")}
+    except Exception as e:
+        return {"placed": False, "order_id": "", "kind": "", "reason": str(e)[:160]}
+
+def _cancel_stop(stop_id, hdrs):
+    if not stop_id: return False
+    try:
+        if str(stop_id).startswith("gtt:"):
+            rc = KITE_SESSION.delete(f"https://api.kite.trade/gtt/triggers/{str(stop_id)[4:]}", headers=hdrs, timeout=10)
+        else:
+            rc = KITE_SESSION.delete(f"https://api.kite.trade/orders/regular/{stop_id}", headers=hdrs, timeout=10)
+        return rc.status_code == 200
+    except Exception:
+        return False
+
 @app.route("/exit_order", methods=["POST"])
 def exit_order():
     """
@@ -6065,7 +6192,8 @@ def exit_order():
         strike = int(data.get("strike",0))
         opt    = data.get("option_type","CE").upper()
         qty    = int(data.get("qty",0))
-        product= (data.get("product","MIS") or "MIS").upper()
+        product= (data.get("product","NRML") or "NRML").upper()
+        if product not in ("MIS","NRML"): product = "NRML"
         cancel_id = data.get("cancel_order_id","")
         key, token = _creds_strict(data)
 
@@ -6078,14 +6206,10 @@ def exit_order():
 
         # Pull the resting stop first, otherwise it becomes a naked short once
         # the long leg is gone.
-        cancelled = False
-        if cancel_id:
-            try:
-                rc = KITE_SESSION.delete(f"https://api.kite.trade/orders/regular/{cancel_id}",
-                                     headers=hdrs, timeout=10)
-                cancelled = (rc.status_code == 200)
-            except Exception:
-                cancelled = False
+        cancelled = _cancel_stop(cancel_id, hdrs) if cancel_id else False
+        # Nov 19: positions can now be held overnight — exit the EXACT contract that was bought
+        # (after an expiry, "nearest expiry" would be a different option).
+        ts_given = (data.get("tradingsymbol") or "").strip(); ex_given = (data.get("exchange") or "").strip().upper()
 
         if sym == "SENSEX":
             csv = fetch_kite_instruments_bfo(key, token); exchange = "BFO"
@@ -6123,7 +6247,9 @@ def exit_order():
             except: continue
 
         tradingsymbol = None
-        for line in csv.strip().split("\n")[1:]:
+        if ts_given and _is_contract_for(ts_given, sym):
+            tradingsymbol = ts_given; exchange = ex_given or exchange
+        for line in ([] if tradingsymbol else csv.strip().split("\n")[1:]):
             cols = line.split(",")
             if len(cols)<10 or not _is_contract_for(cols[2], sym): continue
             if cols[9]!=opt or cols[5]!=best_exp: continue
@@ -6134,9 +6260,12 @@ def exit_order():
         if not tradingsymbol:
             return jsonify({"ok":False,"error":f"Tradingsymbol not found for {sym} {strike} {opt}"})
 
+        px, _ltp = _marketable_limit(exchange, tradingsymbol, "SELL", hdrs)
+        if not px:
+            return jsonify({"ok":False,"error":f"No live price for {tradingsymbol} — exit it in Kite","stop_cancelled":cancelled})
         r = KITE_SESSION.post("https://api.kite.trade/orders/regular", headers=hdrs, timeout=15,
             data={"tradingsymbol":tradingsymbol,"exchange":exchange,
-                  "transaction_type":"SELL","order_type":"MARKET",
+                  "transaction_type":"SELL","order_type":"LIMIT","price":px,
                   "quantity":qty,"product":product,"validity":"DAY"})
         resp = r.json()
         if r.status_code==200 and resp.get("status")=="success":
@@ -6177,8 +6306,8 @@ def place_order():
         # Product: MIS = intraday with broker auto-square-off. This app is an
         # intraday engine, so NRML (carry-forward, full margin, no auto exit)
         # is the wrong default and was the previous behaviour.
-        product = (data.get("product","MIS") or "MIS").upper()
-        if product not in ("MIS","NRML"): product = "MIS"
+        product = (data.get("product","NRML") or "NRML").upper()      # Nov 19: positions are held overnight
+        if product not in ("MIS","NRML"): product = "NRML"
         # Protective stop on the option premium, as a % of the fill price.
         # 0 or None disables the stop leg.
         sl_pct  = float(data.get("sl_pct", 30) or 0)
@@ -6288,15 +6417,19 @@ def place_order():
         # Zerodha to auto-calculate the protection band per their own
         # guidelines — this is Kite's own documented default, matches their
         # official API example exactly, not a guess.
+        # Nov 19: marketable LIMIT, not MARKET (market orders are disabled for stock options).
+        entry_px, entry_ltp = _marketable_limit(exchange, tradingsymbol, action, hdrs)
+        if not entry_px:
+            return jsonify({"ok":False,"error":f"No live price for {tradingsymbol} — order not sent","tradingsymbol":tradingsymbol})
         order_payload = {
             "tradingsymbol": tradingsymbol,
             "exchange": exchange,
             "transaction_type": action,
-            "order_type": "MARKET",
+            "order_type": "LIMIT",
+            "price": entry_px,
             "quantity": qty,
             "product": product,
-            "validity": "DAY",
-            "market_protection": "-1"
+            "validity": "DAY"
         }
         r = KITE_SESSION.post("https://api.kite.trade/orders/regular",
             data=order_payload, headers=hdrs, timeout=15)
@@ -6315,48 +6448,23 @@ def place_order():
         # live positions sat in the market with no stop attached. We now read
         # back the actual fill price and put a real SL-M order on the exchange.
         stop = {"placed": False, "reason": "", "order_id": "", "trigger": 0}
+        fill_px, filled = _wait_fill(order_id, hdrs, qty)
+        if not filled:
+            print(f"[Order ⏹] {tradingsymbol}: limit {entry_px} not filled in 10s — cancelled, nothing bought")
+            return jsonify({"ok": False, "error": f"Not filled at ₹{entry_px} within 10 s — order cancelled, nothing was bought",
+                            "tradingsymbol": tradingsymbol, "order_id": order_id})
+        if filled < qty:
+            print(f"[Order ◐] {tradingsymbol}: partly filled {filled}/{qty} — rest cancelled")
+            qty = filled
         if action == "BUY" and sl_pct > 0:
-            fill_px = _poll_fill_price(order_id, hdrs)
-            if not fill_px:
-                stop["reason"] = "Could not read fill price — NO STOP IS ATTACHED, exit manually"
+            trigger = _tick_down(fill_px * (1 - sl_pct/100.0))
+            if trigger < 0.1:
+                stop["reason"] = "Computed trigger below tick size — no stop placed"
             else:
-                trigger = round(fill_px * (1 - sl_pct/100.0), 1)
-                if trigger < 0.05:
-                    stop["reason"] = "Computed trigger below tick size — no stop placed"
-                else:
-                    sl_payload = {
-                        "tradingsymbol": tradingsymbol,
-                        "exchange": exchange,
-                        "transaction_type": "SELL",   # exiting a long option
-                        "order_type": "SL-M",
-                        "quantity": qty,
-                        "product": product,
-                        "validity": "DAY",
-                        "trigger_price": trigger,
-                        # Genuinely unclear whether SL-M requires this — one
-                        # source explicitly says SL/Limit orders don't need
-                        # it, only true MARKET orders do. Included anyway:
-                        # Kite's API is generally tolerant of extra optional
-                        # params, and the cost of a wrongly-omitted required
-                        # field (order rejected, position left unprotected)
-                        # is far worse than an unneeded field being present.
-                        "market_protection": "-1"
-                    }
-                    try:
-                        r2 = KITE_SESSION.post("https://api.kite.trade/orders/regular",
-                            data=sl_payload, headers=hdrs, timeout=15)
-                        d2 = r2.json()
-                        if r2.status_code == 200 and d2.get("status") == "success":
-                            stop = {"placed": True, "reason": "",
-                                    "order_id": d2.get("data",{}).get("order_id",""),
-                                    "trigger": trigger, "fill_px": fill_px}
-                            print(f"[Stop ✅] SL-M {tradingsymbol} trigger:{trigger} (fill {fill_px})")
-                        else:
-                            stop["reason"] = d2.get("message","SL order rejected")
-                            print(f"[Stop ❌] {tradingsymbol}: {stop['reason']}")
-                    except Exception as se:
-                        stop["reason"] = str(se)
-                        print(f"[Stop ❌] {tradingsymbol}: {se}")
+                ps = _place_stop(exchange, tradingsymbol, qty, product, trigger, entry_ltp or fill_px, hdrs)
+                stop = {"placed": ps["placed"], "reason": ps["reason"], "order_id": ps["order_id"], "kind": ps["kind"],
+                        "trigger": trigger, "fill_px": fill_px}
+                print(f"[Stop {'✅' if ps['placed'] else '❌'}] {ps['kind']} {tradingsymbol} trigger:{trigger} (fill {fill_px}) {ps['reason']}")
 
         # FIX: flagged in an independent review, confirmed real. This used
         # to return ok:true unconditionally whenever the ENTRY succeeded,
@@ -6387,15 +6495,16 @@ def place_order():
             # in the response, never silently.
             auto_squareoff = {"attempted": True, "ok": False, "order_id": "", "error": ""}
             try:
+                sq_px, _ = _marketable_limit(exchange, tradingsymbol, "SELL", hdrs)
                 sq_payload = {
                     "tradingsymbol": tradingsymbol,
                     "exchange": exchange,
                     "transaction_type": "SELL",
-                    "order_type": "MARKET",
+                    "order_type": "LIMIT",
+                    "price": sq_px or _tick_down(fill_px * 0.9),
                     "quantity": qty,
                     "product": product,
-                    "validity": "DAY",
-                    "market_protection": "-1"
+                    "validity": "DAY"
                 }
                 r3 = KITE_SESSION.post("https://api.kite.trade/orders/regular",
                     data=sq_payload, headers=hdrs, timeout=15)
